@@ -399,10 +399,10 @@ Main work:
 - Build the twelve synthetic known-answer hunts and expected-evidence manifests defined in specification section 19.
 - Cover successful hunts, no-evidence hunts, missing data, timeouts, truncation, retryable failure, terminal failure, cancellation, restart recovery, and citation checks across the twelve hunts.
 - Implement the evidence-recovery scorer exactly as specified: expected evidence items recovered and correctly cited divided by the expected evidence items available to that hunt.
-- Run all twelve hunts against deterministic fake Splunk and model services on every automated test run.
+- Rehearse the same domain behaviors with deterministic fake Splunk and model services in the normal automated suite.
+- Run all twelve end-to-end acceptance hunts against a real local non-production Splunk deployment loaded with versioned synthetic fixtures, following the [Post-Implementation Local Splunk Validation Plan](./post-implementation-local-splunk-validation-plan.md).
 - Qualify OpenAI API and Bedrock configurations against the same known-answer hunts when non-production credentials are available. Keep these tests opt-in and record provider/model/version/settings.
 - Test the local-model adapter contract with a fake provider. Mark real local Gemma deployment qualification as deferred work, without weakening the other acceptance checks.
-- Run a non-production Splunk smoke test using only synthetic data.
 - Verify fresh installation, migration ownership, startup order, health checks, non-root containers, TLS verification, persistent volumes, restart recovery, logs, backups, and operator configuration.
 - Complete operator documentation for installation, configuration, model selection, Splunk permissions, backups, updates, recovery, retention, and known limitations.
 - Record the final acceptance results and any deferred item already permitted by the specification.
