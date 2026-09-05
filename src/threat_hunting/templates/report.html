@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Threat hunting report</title>
+  <style>
+    @page { size: A4; margin: 18mm 16mm 18mm; }
+    body { color: #1d2733; font-family: sans-serif; font-size: 10pt; line-height: 1.4; }
+    h1 { color: #102a43; font-size: 20pt; margin: 0 0 16pt; }
+    h2 { border-bottom: 1px solid #bcccdc; color: #243b53; font-size: 14pt; margin: 18pt 0 7pt; padding-bottom: 3pt; }
+    h3 { color: #334e68; font-size: 11pt; margin: 9pt 0 3pt; }
+    ul { margin-top: 3pt; padding-left: 18pt; }
+    li { margin: 2pt 0; }
+    pre { background: #f0f4f8; border: 1px solid #d9e2ec; padding: 6pt; white-space: pre-wrap; word-wrap: break-word; }
+    .query { page-break-inside: avoid; }
+    .label { color: #486581; font-weight: bold; }
+  </style>
+</head>
+<body>
+  <h1>Threat Hunting Report</h1>
+  <h2>Hunt hypothesis</h2>
+  {{HYPOTHESIS}}
+  <h2>Objective and scope</h2>
+  {{OBJECTIVE}}
+  <h2>Data sources used</h2>
+  {{SOURCES}}
+  <h2>Findings</h2>
+  {{FINDINGS}}
+  <h2>Selected evidence excerpts and counts</h2>
+  {{EVIDENCE}}
+  <h2>Entities</h2>
+  {{ENTITIES}}
+  <h2>Timeline</h2>
+  {{TIMELINE}}
+  <h2>Coverage and limitations</h2>
+  {{COVERAGE}}
+  <h2>Conclusion and disposition</h2>
+  {{CONCLUSION}}
+  <h2>Query appendix</h2>
+  {{APPENDIX}}
+</body>
+</html>

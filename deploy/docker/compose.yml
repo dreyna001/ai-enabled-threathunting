@@ -1,0 +1,211 @@
+name: threat-hunting
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-threat_hunting}
+      POSTGRES_USER: ${POSTGRES_USER:-threat_hunting}
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      PGDATA: /var/lib/postgresql/data/pgdata
+    secrets:
+      - postgres_password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+    networks:
+      - default
+      - mcp_internal
+
+  migrate:
+    image: ${THREAT_HUNTING_IMAGE:-threat-hunting-backend:0.1.0}
+    restart: "no"
+    command: ["python", "-m", "alembic", "upgrade", "head"]
+    environment:
+      THREAT_HUNTING_CONFIG: /etc/threat-hunting/runtime.yml
+      THREAT_HUNTING_DATABASE_URL_FILE: /run/secrets/database_url
+    secrets:
+      - postgres_password
+      - database_url
+    volumes:
+      - ${THREAT_HUNTING_CONFIG_FILE:-./config/runtime.yml}:/etc/threat-hunting/runtime.yml:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+  backend:
+    image: ${THREAT_HUNTING_IMAGE:-threat-hunting-backend:0.1.0}
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.backend
+    restart: unless-stopped
+    command:
+      - python
+      - -m
+      - uvicorn
+      - threat_hunting.main:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+    environment:
+      THREAT_HUNTING_CONFIG: /etc/threat-hunting/runtime.yml
+      THREAT_HUNTING_DATABASE_URL_FILE: /run/secrets/database_url
+      THREAT_HUNTING_PERSISTENT_DATA: /var/lib/threat-hunting
+      THREAT_HUNTING_TEMPORARY_DATA: /var/lib/threat-hunting-tmp
+    secrets:
+      - database_url
+    volumes:
+      - ${THREAT_HUNTING_CONFIG_FILE:-./config/runtime.yml}:/etc/threat-hunting/runtime.yml:ro
+      - application_data:/var/lib/threat-hunting
+      - temporary_data:/var/lib/threat-hunting-tmp
+    ports:
+      - "${THREAT_HUNTING_HTTP_PORT:-8000}:8000"
+      - "${THREAT_HUNTING_FRONTEND_PORT:-8080}:8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      # /health/live is process liveness; /health/ready also checks dependencies.
+      test:
+        - CMD-SHELL
+        - python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=3).read()"
+      interval: 15s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+
+  worker:
+    image: ${THREAT_HUNTING_IMAGE:-threat-hunting-backend:0.1.0}
+    restart: unless-stopped
+    command: ["python", "-m", "threat_hunting.worker.main"]
+    environment:
+      THREAT_HUNTING_CONFIG: /etc/threat-hunting/runtime.yml
+      THREAT_HUNTING_DATABASE_URL_FILE: /run/secrets/database_url
+      THREAT_HUNTING_PERSISTENT_DATA: /var/lib/threat-hunting
+      THREAT_HUNTING_TEMPORARY_DATA: /var/lib/threat-hunting-tmp
+      # Retain the direct Splunk credential boundary during Phase 6A.
+      THREAT_HUNTING_SPLUNK_TOKEN_FILE: /run/secrets/splunk_token
+    secrets:
+      - database_url
+      - splunk_token
+    volumes:
+      - ${THREAT_HUNTING_CONFIG_FILE:-./config/runtime.yml}:/etc/threat-hunting/runtime.yml:ro
+      - application_data:/var/lib/threat-hunting
+      - temporary_data:/var/lib/threat-hunting-tmp
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      backend:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      # The worker has no public listener; this verifies its process and DB reachability.
+      test: ["CMD", "python", "-m", "threat_hunting.worker.healthcheck"]
+      interval: 15s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+
+  # Phase 6A sidecar: no host port is published.  The worker remains on its
+  # explicit direct path until Phase 6B enables execution.mode=mcp after the
+  # internal network and authorization controls are qualified.
+  mcp:
+    image: ${THREAT_HUNTING_IMAGE:-threat-hunting-backend:0.1.0}
+    restart: unless-stopped
+    command: ["python", "-m", "threat_hunting.mcp.main"]
+    environment:
+      THREAT_HUNTING_CONFIG: /etc/threat-hunting/runtime.yml
+      THREAT_HUNTING_DATABASE_URL_FILE: /run/secrets/database_url
+      THREAT_HUNTING_MCP_SERVICE_SUBJECT_FILE: /run/secrets/mcp_service_subject
+      THREAT_HUNTING_MCP_TLS_CA_FILE: /run/secrets/mcp_tls_ca
+      THREAT_HUNTING_MCP_TLS_CLIENT_CERT_FILE: /run/secrets/mcp_tls_client_cert
+      THREAT_HUNTING_MCP_TLS_CLIENT_KEY_FILE: /run/secrets/mcp_tls_client_key
+      THREAT_HUNTING_SPLUNK_TOKEN_FILE: /run/secrets/splunk_token
+    secrets:
+      - database_url
+      - mcp_service_subject
+      - mcp_tls_ca
+      - mcp_tls_client_cert
+      - mcp_tls_client_key
+      - splunk_token
+    volumes:
+      - ${THREAT_HUNTING_CONFIG_FILE:-./config/runtime.yml}:/etc/threat-hunting/runtime.yml:ro
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    networks:
+      - mcp_internal
+      - mcp_egress
+    user: "10001:10001"
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+volumes:
+  postgres_data:
+    name: ${THREAT_HUNTING_POSTGRES_VOLUME:-threat-hunting-postgres}
+  application_data:
+    name: ${THREAT_HUNTING_APPLICATION_VOLUME:-threat-hunting-application}
+  temporary_data:
+    name: ${THREAT_HUNTING_TEMPORARY_VOLUME:-threat-hunting-temporary}
+
+networks:
+  # No application service is attached to this network; MCP reaches only the
+  # database and its separate outbound integration network.
+  mcp_internal:
+    internal: true
+  mcp_egress:
+
+secrets:
+  # Secret files are intentionally outside the image and ignored by Git.
+  postgres_password:
+    file: ${THREAT_HUNTING_POSTGRES_PASSWORD_FILE:-./secrets/postgres_password}
+  database_url:
+    file: ${THREAT_HUNTING_DATABASE_URL_FILE:-./secrets/database_url}
+  mcp_service_subject:
+    file: ${THREAT_HUNTING_MCP_SERVICE_SUBJECT_FILE:-./secrets/mcp_service_subject}
+  mcp_tls_ca:
+    file: ${THREAT_HUNTING_MCP_TLS_CA_FILE:-./secrets/mcp_tls_ca}
+  mcp_tls_client_cert:
+    file: ${THREAT_HUNTING_MCP_TLS_CLIENT_CERT_FILE:-./secrets/mcp_tls_client_cert}
+  mcp_tls_client_key:
+    file: ${THREAT_HUNTING_MCP_TLS_CLIENT_KEY_FILE:-./secrets/mcp_tls_client_key}
+  splunk_token:
+    file: ${THREAT_HUNTING_SPLUNK_TOKEN_FILE:-./secrets/splunk_token}

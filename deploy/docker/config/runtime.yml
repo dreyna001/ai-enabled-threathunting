@@ -1,0 +1,79 @@
+# Non-secret, deployment-specific defaults. Keep credentials in files under /run/secrets.
+# Mount a customer-owned copy of this file read-only for production deployments.
+environment: development
+image_version: 0.1.0
+
+# Phase 6A keeps the worker on the explicit direct Splunk path.  Phase 6B can
+# switch this immutable scope-bound setting to mcp after network separation,
+# TLS, and authorization qualification are complete.
+execution:
+  mode: direct
+  deployment_scope_id: local-development
+  mcp_url: null
+  mcp_tls_ca_path: null
+  mcp_tls_client_cert_path: null
+  mcp_tls_client_key_path: null
+  mcp_service_subject: null
+  provider_data_handling_approval_ref: null
+
+database:
+  connect_timeout_seconds: 5
+
+storage:
+  persistent_path: /var/lib/threat-hunting
+  temporary_path: /var/lib/threat-hunting-tmp
+  persistent_min_free_bytes: 1073741824
+  temporary_min_free_bytes: 2147483648
+
+splunk:
+  url: https://splunk.example.invalid:8089
+  app_namespace: search
+
+model:
+  provider: litellm
+  model_name: development
+  endpoint: https://model.example.invalid/v1
+
+hunt_limits:
+  query_start_cutoff_utc: "20:00:00"
+  hard_completion_minutes: 12
+  agent_cycles: 8
+  query_count: 12
+  per_hunt_query_concurrency: 2
+  search_job_timeout_seconds: 120
+  splunk_transport_timeout_seconds: 30
+  active_hunts_per_deployment: 1
+  deployment_query_concurrency: 2
+  per_query_row_limit: 10000
+  per_query_byte_limit: 262144000
+  per_hunt_row_limit: 50000
+  per_hunt_byte_limit: 1073741824
+  representative_event_limit: 100
+  targeted_event_limit: 500
+  model_calls: 12
+  model_call_timeout_seconds: 120
+  context_characters: 500000
+  input_tokens: 500000
+  output_tokens: 96000
+
+retention:
+  hunt_days: 90
+  temporary_result_hours: 24
+
+uploads:
+  file_count: 10
+  per_file_bytes: 26214400
+  total_bytes: 104857600
+  extracted_text_characters: 500000
+
+reports:
+  display_timezone: UTC
+  input_characters: 750000
+  evidence_excerpt_characters: 4000
+  page_count: 100
+  render_timeout_seconds: 120
+
+tls:
+  verify: true
+  ca_bundle_path: null
+  lab_only_allow_insecure: false
