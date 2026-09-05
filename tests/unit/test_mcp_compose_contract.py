@@ -21,6 +21,7 @@ def test_mcp_service_is_private_hardened_and_secret_backed() -> None:
     assert isinstance(services, dict)
     mcp = services["mcp"]
     assert isinstance(mcp, dict)
+    assert mcp["profiles"] == ["mcp"]
     assert "ports" not in mcp
     assert mcp["user"] == "10001:10001"
     assert mcp["read_only"] is True
@@ -50,3 +51,16 @@ def test_worker_keeps_direct_phase_6a_path() -> None:
     assert worker["command"] == ["python", "-m", "threat_hunting.worker.main"]
     assert "database_url" in worker["secrets"]
     assert "splunk_token" in worker["secrets"]
+
+
+def test_default_compose_keeps_backend_private_and_persists_uploads() -> None:
+    document = compose_document()
+    services = document["services"]
+    assert isinstance(services, dict)
+    backend = services["backend"]
+    worker = services["worker"]
+    assert isinstance(backend, dict) and isinstance(worker, dict)
+    assert "ports" not in backend
+    assert backend["environment"]["THREAT_HUNTING_UPLOAD_ROOT"] == "/var/lib/threat-hunting/uploads"
+    assert worker["environment"]["THREAT_HUNTING_UPLOAD_ROOT"] == "/var/lib/threat-hunting/uploads"
+    assert "mcp" in services and services["mcp"]["profiles"] == ["mcp"]

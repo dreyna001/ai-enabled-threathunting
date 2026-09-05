@@ -72,14 +72,13 @@ services:
       THREAT_HUNTING_DATABASE_URL_FILE: /run/secrets/database_url
       THREAT_HUNTING_PERSISTENT_DATA: /var/lib/threat-hunting
       THREAT_HUNTING_TEMPORARY_DATA: /var/lib/threat-hunting-tmp
+      THREAT_HUNTING_UPLOAD_ROOT: /var/lib/threat-hunting/uploads
     secrets:
       - database_url
     volumes:
       - ${THREAT_HUNTING_CONFIG_FILE:-./config/runtime.yml}:/etc/threat-hunting/runtime.yml:ro
       - application_data:/var/lib/threat-hunting
       - temporary_data:/var/lib/threat-hunting-tmp
-    ports:
-      - "${THREAT_HUNTING_HTTP_PORT:-8000}:8000"
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -136,6 +135,7 @@ services:
       THREAT_HUNTING_DATABASE_URL_FILE: /run/secrets/database_url
       THREAT_HUNTING_PERSISTENT_DATA: /var/lib/threat-hunting
       THREAT_HUNTING_TEMPORARY_DATA: /var/lib/threat-hunting-tmp
+      THREAT_HUNTING_UPLOAD_ROOT: /var/lib/threat-hunting/uploads
       # Retain the direct Splunk credential boundary during Phase 6A.
       THREAT_HUNTING_SPLUNK_TOKEN_FILE: /run/secrets/splunk_token
     secrets:
@@ -169,6 +169,7 @@ services:
   # explicit direct path until Phase 6B enables execution.mode=mcp after the
   # internal network and authorization controls are qualified.
   mcp:
+    profiles: ["mcp"]
     image: ${THREAT_HUNTING_IMAGE:-threat-hunting-backend:0.1.0}
     restart: unless-stopped
     command: ["python", "-m", "threat_hunting.mcp.main"]

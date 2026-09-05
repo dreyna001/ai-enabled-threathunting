@@ -4,7 +4,7 @@ This runbook owns one concern: deploying and validating the Docker Compose stack
 
 ## Prepare
 
-Install Docker Engine with Compose v2, copy `.env.example` to `.env`, and create the protected files listed in [`../deploy/docker/secrets/README.md`](../deploy/docker/secrets/README.md). The database URL must resolve the Compose service name `postgres`. Use an immutable `THREAT_HUNTING_IMAGE` and `THREAT_HUNTING_FRONTEND_IMAGE` tag for every release.
+Install Docker Engine with Compose v2, copy `.env.example` to `.env`, and create the three default protected files listed in [`../deploy/docker/secrets/README.md`](../deploy/docker/secrets/README.md): `postgres_password`, `database_url`, and `splunk_token`. The database URL must resolve the Compose service name `postgres`. Use an immutable `THREAT_HUNTING_IMAGE` and `THREAT_HUNTING_FRONTEND_IMAGE` tag for every release.
 
 ```bash
 chmod 700 runtime/secrets
@@ -23,7 +23,7 @@ docker compose --env-file .env -f deploy/docker/compose.yml ps
 docker compose --env-file .env -f deploy/docker/compose.yml logs --no-log-prefix --tail=100 migrate backend worker frontend
 ```
 
-Readiness must report the database, migration revision, storage, and configuration checks as passing. The migration job must have completed successfully before the API and worker are admitted. The frontend service is the only published browser origin; it proxies same-origin cookies and CSRF-protected API calls to the backend.
+Readiness must report the database, migration revision, storage, and configuration checks as passing. The migration job must have completed successfully before the API and worker are admitted. The frontend service is the only published browser origin; the backend has no host port and receives same-origin cookies and CSRF-protected API calls through the frontend proxy. Uploads persist under `/var/lib/threat-hunting/uploads`.
 
 ## Live smoke gate
 
