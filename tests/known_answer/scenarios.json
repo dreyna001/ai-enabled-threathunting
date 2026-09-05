@@ -1,0 +1,135 @@
+{
+  "fixture_version": "1.0",
+  "scenarios": [
+    {
+      "scenario_id": "ka-01-supported-process",
+      "category": "supported",
+      "hypothesis": "A suspicious process executed on a managed host.",
+      "events": [{"evidence_id": "ka01-e1", "host": "host-01", "process": "unsigned.exe", "_time": "2026-01-01T00:01:00Z"}],
+      "query_count": 1,
+      "model_calls": 2,
+      "model_input_tokens": 120,
+      "model_output_tokens": 60
+    },
+    {
+      "scenario_id": "ka-02-supported-auth",
+      "category": "supported",
+      "hypothesis": "An unusual authentication source was used.",
+      "events": [{"evidence_id": "ka02-e1", "user": "analyst", "src_ip": "198.51.100.20", "_time": "2026-01-01T00:02:00Z"}],
+      "query_count": 2,
+      "model_calls": 2,
+      "model_input_tokens": 140,
+      "model_output_tokens": 70
+    },
+    {
+      "scenario_id": "ka-03-supported-network",
+      "category": "supported",
+      "hypothesis": "A known command-and-control destination was contacted.",
+      "events": [{"evidence_id": "ka03-e1", "host": "host-03", "domain": "c2.example.test", "_time": "2026-01-01T00:03:00Z"}, {"evidence_id": "ka03-e2", "host": "host-04", "domain": "c2.example.test", "_time": "2026-01-01T00:04:00Z"}],
+      "query_count": 3,
+      "model_calls": 3,
+      "model_input_tokens": 210,
+      "model_output_tokens": 100
+    },
+    {
+      "scenario_id": "ka-04-not-supported-process",
+      "category": "not_supported",
+      "hypothesis": "The suspicious process executed in the approved scope.",
+      "events": [],
+      "query_count": 2,
+      "model_calls": 2,
+      "model_input_tokens": 130,
+      "model_output_tokens": 65
+    },
+    {
+      "scenario_id": "ka-05-not-supported-auth",
+      "category": "not_supported",
+      "hypothesis": "The suspected account was used from the external source.",
+      "events": [],
+      "query_count": 1,
+      "model_calls": 2,
+      "model_input_tokens": 115,
+      "model_output_tokens": 55
+    },
+    {
+      "scenario_id": "ka-06-incomplete-coverage",
+      "category": "incomplete",
+      "hypothesis": "The behavior occurred in all relevant telemetry.",
+      "events": [{"evidence_id": "ka06-e1", "host": "host-06", "_time": "2026-01-01T00:06:00Z"}],
+      "query_count": 1,
+      "model_calls": 2,
+      "model_input_tokens": 100,
+      "model_output_tokens": 50,
+      "coverage_limitation": "The approved sourcetype was unavailable for part of the time range."
+    },
+    {
+      "scenario_id": "ka-07-truncated-results",
+      "category": "truncated",
+      "hypothesis": "The scoped activity affected multiple hosts.",
+      "events": [{"evidence_id": "ka07-e1", "host": "host-07a", "_time": "2026-01-01T00:07:00Z"}, {"evidence_id": "ka07-e2", "host": "host-07b", "_time": "2026-01-01T00:08:00Z"}],
+      "retained_event_count": 1,
+      "query_count": 1,
+      "model_calls": 2,
+      "model_input_tokens": 125,
+      "model_output_tokens": 60,
+      "coverage_limitation": "The result-row limit truncated the available result set."
+    },
+    {
+      "scenario_id": "ka-08-query-timeout",
+      "category": "timeout",
+      "hypothesis": "The broad query should complete within the search-job limit.",
+      "events": [],
+      "query_count": 1,
+      "model_calls": 1,
+      "model_input_tokens": 80,
+      "model_output_tokens": 20,
+      "failure_code": "hard_timeout"
+    },
+    {
+      "scenario_id": "ka-09-model-repair",
+      "category": "model_repair",
+      "hypothesis": "A suspicious script was observed.",
+      "events": [{"evidence_id": "ka09-e1", "host": "host-09", "process": "script.ps1", "_time": "2026-01-01T00:09:00Z"}],
+      "query_count": 1,
+      "model_calls": 3,
+      "model_repair_attempts": 1,
+      "model_input_tokens": 170,
+      "model_output_tokens": 90
+    },
+    {
+      "scenario_id": "ka-10-restart-recovery",
+      "category": "restart_recovery",
+      "hypothesis": "The activity remains recoverable after a worker restart.",
+      "events": [{"evidence_id": "ka10-e1", "host": "host-10", "process": "loader.exe", "_time": "2026-01-01T00:10:00Z"}],
+      "query_count": 2,
+      "submitted_query_count": 2,
+      "model_calls": 2,
+      "model_input_tokens": 145,
+      "model_output_tokens": 65
+    },
+    {
+      "scenario_id": "ka-11-hard-budget",
+      "category": "hard_budget",
+      "hypothesis": "The investigation should stop at its configured query budget.",
+      "events": [{"evidence_id": "ka11-e1", "host": "host-11", "_time": "2026-01-01T00:11:00Z"}],
+      "retained_event_count": 0,
+      "query_count": 2,
+      "model_calls": 2,
+      "model_input_tokens": 160,
+      "model_output_tokens": 70,
+      "failure_code": "budget_exhausted"
+    },
+    {
+      "scenario_id": "ka-12-cancellation",
+      "category": "cancellation",
+      "hypothesis": "Cancellation prevents new work and preserves prior evidence.",
+      "events": [{"evidence_id": "ka12-e1", "host": "host-12", "_time": "2026-01-01T00:12:00Z"}],
+      "retained_event_count": 1,
+      "query_count": 1,
+      "model_calls": 1,
+      "model_input_tokens": 75,
+      "model_output_tokens": 20,
+      "failure_code": "cancelled"
+    }
+  ]
+}
