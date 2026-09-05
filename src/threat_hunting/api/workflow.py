@@ -215,14 +215,34 @@ def list_uploads(hunt_id: str, user_id: str = Depends(current_user_id), service:
         raise _translate(exc) from exc
 
 
+async def _read_bounded_upload(request: Request, max_bytes: int) -> bytes:
+    """Read a raw upload stream without trusting or requiring Content-Length."""
+    declared = request.headers.get("content-length")
+    if declared is not None:
+        try:
+            declared_size = int(declared)
+        except ValueError:
+            declared_size = None
+        if declared_size is not None and declared_size > max_bytes:
+            raise UploadError("upload exceeds the per-file size limit")
+    body = bytearray()
+    async for chunk in request.stream():
+        if not chunk:
+            continue
+        body.extend(chunk)
+        if len(body) > max_bytes:
+            raise UploadError("upload exceeds the per-file size limit")
+    return bytes(body)
+
+
 @router.post("/hunts/{hunt_id}/uploads", status_code=201)
 async def create_upload(hunt_id: str, request: Request, filename: str | None = None, user_id: str = Depends(current_user_id), service: WorkflowService = Depends(workflow_service), uploads: UploadService = Depends(upload_service)) -> dict[str, Any]:
     try:
         service.get_hunt(user_id, hunt_id)
-        body = await request.body()
         supplied_name = filename or request.headers.get("X-Filename")
         if not supplied_name:
             raise UploadError("filename is required")
+        body = await _read_bounded_upload(request, uploads.limits.per_file_bytes)
         return uploads.save(user_id, hunt_id, supplied_name, body, content_type=request.headers.get("content-type"))
     except Exception as exc:
         if isinstance(exc, UploadError):
