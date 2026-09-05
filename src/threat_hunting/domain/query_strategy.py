@@ -783,7 +783,9 @@ def rank_query_candidates(
             candidate_id=cid,
             proposal=proposal,
             approved_question_position=question_position,
-            shadow_rank=0,
+            # A provisional candidate must satisfy the public contract before
+            # the final stable rank is assigned after sorting below.
+            shadow_rank=1,
             score=score,
             score_components=components,
             selectivity=selectivity,

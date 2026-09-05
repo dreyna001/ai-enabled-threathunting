@@ -4,7 +4,7 @@ This repository implements the bounded threat-hunting workspace defined in the [
 
 ## Current status
 
-Implementation Block 1 is in progress: application foundation, deterministic contracts, runtime configuration, database migrations, health checks, frontend scaffold, and Docker Compose development setup.
+A thin, persisted vertical slice is implemented for login, hunt creation, deterministic local Splunk discovery, plan revision and approval, bounded execution, evidence review, editable reporting, and PDF finalization. Production Splunk and model-provider qualification remain integration work.
 
 ## Requirements
 
@@ -21,6 +21,21 @@ python -m pip install --upgrade pip
 python -m pip install -e '.[dev]'
 python -m pytest
 ```
+
+## Local vertical-slice demo
+
+The local demo uses deterministic synthetic Splunk and planning data. Every such response is labeled `deterministic_local_demo`; it verifies workflow and UI behavior only and is not production evidence or model-accuracy validation.
+
+```bash
+cd frontend && npm run build
+cd ..
+THREAT_HUNTING_DATABASE_URL=sqlite+pysqlite:///runtime/local-demo.db \
+THREAT_HUNTING_LOCAL_DEMO=1 \
+THREAT_HUNTING_DEMO_PASSWORD='<choose-a-local-secret>' \
+.venv/bin/uvicorn threat_hunting.main:app --host 127.0.0.1 --port 8000
+```
+
+Sign in with the local-only demo account `analyst` and the password you supplied in `THREAT_HUNTING_DEMO_PASSWORD`. Demo mode fails closed when that value is absent. Do not enable demo mode for production deployments. Verify the complete HTTP workflow with `.venv/bin/python -m pytest tests/e2e/test_vertical_slice.py -q`.
 
 ## Runtime configuration and secrets
 

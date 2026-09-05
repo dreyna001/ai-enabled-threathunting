@@ -12,7 +12,7 @@ from pydantic import SecretStr
 from sqlalchemy import Engine, create_engine, text
 from sqlalchemy.exc import SQLAlchemyError
 
-MIGRATION_HEAD = "0009_mcp_execution"
+MIGRATION_HEAD = "0010_vertical_slice"
 MAX_AUDIT_METADATA_BYTES = 32_768
 
 

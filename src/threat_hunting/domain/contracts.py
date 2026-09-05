@@ -101,6 +101,13 @@ class HuntScope(DomainModel):
         return self
 
 
+class ScopeEntity(DomainModel):
+    """An entity value pinned to the approved hunt scope."""
+
+    field: Identifier
+    value: Identifier
+
+
 class PlanDataSource(DomainModel):
     """A Splunk data source and its purpose in a plan."""
 

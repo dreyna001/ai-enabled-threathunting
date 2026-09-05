@@ -2,8 +2,8 @@ from threat_hunting.db import MIGRATION_HEAD, action_digest, deterministic_sid
 from threat_hunting.services.schema import audit_records, execution_authorization_revocations, mcp_tool_requests
 
 
-def test_mcp_migration_matches_runtime_expected_head() -> None:
-    assert MIGRATION_HEAD == "0009_mcp_execution"
+def test_vertical_slice_migration_matches_runtime_expected_head() -> None:
+    assert MIGRATION_HEAD == "0010_vertical_slice"
 
 
 def test_mcp_request_ledger_binds_authorization_without_raw_payload_columns() -> None:
