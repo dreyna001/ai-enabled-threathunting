@@ -106,6 +106,7 @@ def build_production_service(engine: Engine, settings: RuntimeSettings) -> Workf
             "endpoint": settings.model.endpoint or "configured_provider_default",
             "deployment_scope_id": settings.execution.deployment_scope_id,
             "splunk_app_namespace": settings.splunk.app_namespace,
+            "splunk_poll_interval_seconds": settings.hunt_limits.splunk_poll_interval_seconds,
             "hunt_limits": settings.hunt_limits.model_dump(mode="json"),
             "prompt_contract_version": "1.0",
             "spl_policy_version": "2026-01",

@@ -10,7 +10,7 @@ from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, PositiveInt, SecretStr, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PositiveFloat, PositiveInt, SecretStr, field_validator, model_validator
 
 
 CONFIG_ENV = "THREAT_HUNTING_CONFIG"
@@ -85,6 +85,7 @@ class HuntLimitSettings(StrictModel):
     query_count: PositiveInt = 12
     per_hunt_query_concurrency: PositiveInt = 2
     search_job_timeout_seconds: PositiveInt = 120
+    splunk_poll_interval_seconds: PositiveFloat = Field(default=1.0, gt=0, le=30)
     splunk_transport_timeout_seconds: PositiveInt = 30
     active_hunts_per_deployment: PositiveInt = 1
     deployment_query_concurrency: PositiveInt = 2

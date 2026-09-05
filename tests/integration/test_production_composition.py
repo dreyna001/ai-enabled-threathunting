@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+
+import pytest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -11,7 +13,7 @@ from threat_hunting.domain.budgets import BudgetLimits
 from threat_hunting.integrations.models.fake import FakeModelAdapter
 from threat_hunting.integrations.splunk import SplunkConnectionConfig, SplunkConnector
 from threat_hunting.services.jobs import metadata as jobs_metadata
-from threat_hunting.services.workflow import WorkflowService, workflow_metadata
+from threat_hunting.services.workflow import Conflict, WorkflowService, workflow_metadata
 
 
 NOW = datetime(2026, 1, 1, tzinfo=timezone.utc)
@@ -100,7 +102,7 @@ def test_injected_production_adapters_persist_discovery_snapshots_and_results() 
         splunk_connector=splunk,
         model_adapter=_model(),
         budget_limits=BudgetLimits(),
-        execution_config={"provider": "fake", "model_name": "test", "spl_policy_version": "1.0"},
+        execution_config={"provider": "fake", "model_name": "test", "spl_policy_version": "1.0", "splunk_poll_interval_seconds": 0.1},
     )
 
     hunt = service.create_hunt("owner-1", title="Production adapter", hypothesis="h", objective="o")
@@ -109,9 +111,20 @@ def test_injected_production_adapters_persist_discovery_snapshots_and_results() 
     assert discovered["discovery_snapshot"]["mode"] == "production"
     assert discovered["discovery_snapshot"]["execution_config_snapshot"]["sha256"]
     assert discovered["plan"]["execution_config_snapshot_id"]
+    assert discovered["discovery_snapshot"]["execution_config_snapshot"]["payload"]["budget_limits"]["max_model_calls"] == 12
+    assert service.splunk_poll_interval_seconds == 0.1
 
     approved = service.approve("owner-1", str(hunt["hunt_id"]), "reviewed")
     assert approved["approval"]["plan_sha256"]
+    assert approved["approval"]["execution_config_sha256"]
+    service.execution_config["model_name"] = "drifted"
+    with pytest.raises(Conflict):
+        service.execute("owner-1", str(hunt["hunt_id"]))
+    service.execution_config["model_name"] = "test"
+    service.budget_limits = BudgetLimits(max_model_calls=11)
+    with pytest.raises(Conflict):
+        service.execute("owner-1", str(hunt["hunt_id"]))
+    service.budget_limits = BudgetLimits()
     queued = service.execute("owner-1", str(hunt["hunt_id"]))
     assert queued["state"] == "queued"
     lease = service.jobs.claim("worker-1")
