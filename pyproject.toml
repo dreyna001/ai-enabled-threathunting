@@ -29,6 +29,7 @@ dev = [
 threat-hunting-api = "threat_hunting.main:run"
 threat-hunting-worker = "threat_hunting.worker.main:run"
 threat-hunting-worker-health = "threat_hunting.worker.healthcheck:run"
+threat-hunting-account = "threat_hunting.auth.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

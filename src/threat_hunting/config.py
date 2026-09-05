@@ -122,7 +122,7 @@ class UploadSettings(StrictModel):
     file_count: PositiveInt = 10
     per_file_bytes: PositiveInt = 26_214_400
     total_bytes: PositiveInt = 104_857_600
-    extracted_text_characters: PositiveInt = 500_000
+    extracted_text_characters: PositiveInt = 2_000_000
 
     @model_validator(mode="after")
     def total_must_fit_one_file(self) -> "UploadSettings":

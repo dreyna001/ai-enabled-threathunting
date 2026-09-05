@@ -31,6 +31,7 @@ sessions = Table(
     "workflow_sessions", workflow_metadata,
     Column("token_hash", String(64), primary_key=True),
     Column("user_id", String(36), ForeignKey("workflow_users.user_id"), nullable=False),
+    Column("csrf_hash", String(64), nullable=False, default=""),
     Column("expires_at_utc", DateTime(timezone=True), nullable=False),
 )
 hunts = Table(
@@ -149,6 +150,7 @@ class WorkflowService:
         self.local_demo = local_demo
         self.demo_password = demo_password
         self.password_hasher = PasswordHasher()
+        self.cookie_secure = not local_demo
 
     def initialize_demo(self) -> None:
         """Create local/test tables and the one documented demo principal."""
@@ -223,6 +225,16 @@ class WorkflowService:
         if row is None:
             raise NotFound("hunt not found")
         return self._public(row)
+
+    def cancel(self, owner_id: str, hunt_id: str) -> dict[str, Any]:
+        """Cancel one owned hunt atomically; repeated cancellation is idempotent."""
+        row = self._owned_row(owner_id, hunt_id)
+        if row["state"] == HuntState.CANCELLED.value:
+            return self.get_hunt(owner_id, hunt_id)
+        if row["state"] in {HuntState.FINALIZED.value, HuntState.FAILED.value}:
+            raise Conflict("terminal hunts cannot be cancelled")
+        self._update(owner_id, hunt_id, expected_state=str(row["state"]), state=HuntState.CANCELLED.value, updated_at_utc=_now())
+        return self.get_hunt(owner_id, hunt_id)
 
     def discover(self, owner_id: str, hunt_id: str) -> dict[str, Any]:
         if not self.local_demo:

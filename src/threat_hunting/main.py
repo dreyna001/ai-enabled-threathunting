@@ -17,7 +17,7 @@ from threat_hunting.services.workflow import WorkflowService
 
 
 def create_app(
-    engine: Engine | None = None, *, local_demo: bool | None = None, demo_password: str | None = None,
+    engine: Engine | None = None, *, local_demo: bool | None = None, demo_password: str | None = None, cookie_secure: bool | None = None,
 ) -> FastAPI:
     """Create the HTTP application without performing migrations or external calls."""
 
@@ -35,6 +35,13 @@ def create_app(
         return result
 
     configured_url = os.getenv("THREAT_HUNTING_DATABASE_URL")
+    if engine is None and not configured_url:
+        secret_path = os.getenv("THREAT_HUNTING_DATABASE_URL_FILE")
+        if secret_path:
+            try:
+                configured_url = Path(secret_path).read_text(encoding="utf-8").strip()
+            except (OSError, UnicodeError):
+                configured_url = None
     if engine is None and configured_url:
         engine = create_engine(configured_url, pool_pre_ping=True)
     if local_demo is None:
@@ -43,6 +50,8 @@ def create_app(
         demo_password = os.getenv("THREAT_HUNTING_DEMO_PASSWORD")
     if engine is not None:
         service = WorkflowService(engine, local_demo=local_demo, demo_password=demo_password)
+        if cookie_secure is not None:
+            service.cookie_secure = cookie_secure
         service.initialize_demo()
         configure_workflow_service(service)
         application.include_router(workflow_router)

@@ -2,16 +2,21 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Response, status
+from fastapi import APIRouter, Cookie, Depends, Header, HTTPException, Request, Response, status
 from pydantic import BaseModel, ConfigDict, Field
 
-from threat_hunting.services.workflow import Conflict, IntegrationUnavailable, NotFound, Validation, WorkflowService
+from threat_hunting.auth.service import AccountService, CSRF_COOKIE, SESSION_COOKIE
+from threat_hunting.services.uploads import UploadError, UploadService
+from threat_hunting.services.workflow import Conflict, IntegrationUnavailable, NotFound, Validation, WorkflowService, users as service_users
 
 
 router = APIRouter(prefix="/api", tags=["workflow"])
 _service: WorkflowService | None = None
+_auth: AccountService | None = None
+_uploads: UploadService | None = None
 
 
 class StrictRequest(BaseModel):
@@ -58,8 +63,12 @@ class FinalizeReportRequest(StrictRequest):
 
 
 def configure_workflow_service(service: WorkflowService) -> None:
-    global _service
+    global _service, _auth, _uploads
     _service = service
+    _auth = AccountService(service.engine)
+    from pathlib import Path
+    import os
+    _uploads = UploadService(service.engine, Path(os.getenv("THREAT_HUNTING_UPLOAD_ROOT", "runtime/uploads")))
 
 
 def workflow_service() -> WorkflowService:
@@ -80,29 +89,81 @@ def _translate(exc: Exception) -> HTTPException:
     return HTTPException(status_code=500, detail="workflow operation failed")
 
 
+def auth_service(service: WorkflowService = Depends(workflow_service)) -> AccountService:
+    global _auth
+    if _auth is None:
+        _auth = AccountService(service.engine)
+    return _auth
+
+
 def current_user_id(
+    request: Request,
     authorization: str | None = Header(default=None),
+    session_cookie: str | None = Cookie(default=None, alias=SESSION_COOKIE),
+    csrf_cookie: str | None = Cookie(default=None, alias=CSRF_COOKIE),
+    csrf_header: str | None = Header(default=None, alias="X-CSRF-Token"),
     service: WorkflowService = Depends(workflow_service),
 ) -> str:
-    if authorization is None or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Bearer authentication required")
-    token = authorization.removeprefix("Bearer ").strip()
+    token = session_cookie
+    bearer = False
+    if service.local_demo and authorization and authorization.startswith("Bearer "):
+        token = authorization.removeprefix("Bearer ").strip()
+        bearer = True
     if not token:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Bearer authentication required")
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="authentication required")
     try:
-        return service.authenticate(token)
-    except Validation as exc:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(exc)) from exc
+        if bearer:
+            return service.authenticate(token)
+        if request.method not in {"GET", "HEAD", "OPTIONS"}:
+            if not csrf_cookie or not csrf_header or csrf_cookie != csrf_header:
+                raise HTTPException(status_code=403, detail="CSRF validation failed")
+        return auth_service(service).authenticate(token, csrf_token=csrf_cookie if request.method not in {"GET", "HEAD", "OPTIONS"} else None)
+    except HTTPException:
+        raise
+    except (Validation, ValueError, PermissionError) as exc:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED if not isinstance(exc, PermissionError) else 403, detail=str(exc)) from exc
 
 
 @router.post("/auth/login")
-def login(request: LoginRequest, service: WorkflowService = Depends(workflow_service)) -> dict[str, Any]:
+def login(request: LoginRequest, response: Response, service: WorkflowService = Depends(workflow_service)) -> dict[str, Any]:
     try:
-        return service.login(request.username, request.password)
-    except Validation as exc:
+        session, user = auth_service(service).login(request.username, request.password)
+    except PermissionError as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
+    except (Validation, ValueError) as exc:
         raise HTTPException(status_code=401, detail=str(exc)) from exc
     except Exception as exc:
         raise _translate(exc) from exc
+    secure = bool(getattr(service, "cookie_secure", not service.local_demo))
+    max_age = max(1, int((session.expires_at - datetime.now(timezone.utc)).total_seconds()))
+    response.set_cookie(SESSION_COOKIE, session.token, httponly=True, secure=secure, samesite="lax", max_age=max_age, path="/")
+    response.set_cookie(CSRF_COOKIE, session.csrf_token, httponly=False, secure=secure, samesite="lax", max_age=max_age, path="/")
+    payload: dict[str, Any] = {"user": user, "csrf_token": session.csrf_token, "expires_at": session.expires_at.isoformat()}
+    if service.local_demo:
+        payload.update({"access_token": session.token, "token_type": "bearer"})
+    return payload
+
+
+@router.get("/auth/me")
+def me(user_id: str = Depends(current_user_id), csrf_cookie: str | None = Cookie(default=None, alias=CSRF_COOKIE), service: WorkflowService = Depends(workflow_service)) -> dict[str, Any]:
+    with service.engine.connect() as connection:
+        from sqlalchemy import select
+        row = connection.execute(select(service_users).where(service_users.c.user_id == user_id)).mappings().first()
+    if row is None:
+        raise HTTPException(status_code=401, detail="authentication required")
+    payload = {key: value for key, value in row.items() if key != "password_hash"}
+    if csrf_cookie:
+        payload["csrf_token"] = csrf_cookie
+    return payload
+
+
+@router.post("/auth/logout")
+def logout(response: Response, user_id: str = Depends(current_user_id), session_cookie: str | None = Cookie(default=None, alias=SESSION_COOKIE), service: WorkflowService = Depends(workflow_service)) -> dict[str, str]:
+    if session_cookie:
+        auth_service(service).logout(session_cookie)
+    response.delete_cookie(SESSION_COOKIE, path="/")
+    response.delete_cookie(CSRF_COOKIE, path="/")
+    return {"status": "logged_out"}
 
 
 @router.get("/hunts")
@@ -126,6 +187,58 @@ def get_hunt(hunt_id: str, user_id: str = Depends(current_user_id), service: Wor
     try:
         return service.get_hunt(user_id, hunt_id)
     except Exception as exc:
+        raise _translate(exc) from exc
+
+
+@router.post("/hunts/{hunt_id}/cancel")
+def cancel(hunt_id: str, user_id: str = Depends(current_user_id), service: WorkflowService = Depends(workflow_service)) -> dict[str, Any]:
+    try:
+        return service.cancel(user_id, hunt_id)
+    except Exception as exc:
+        raise _translate(exc) from exc
+
+
+def upload_service(service: WorkflowService = Depends(workflow_service)) -> UploadService:
+    global _uploads
+    if _uploads is None:
+        from pathlib import Path
+        _uploads = UploadService(service.engine, Path("runtime/uploads"))
+    return _uploads
+
+
+@router.get("/hunts/{hunt_id}/uploads")
+def list_uploads(hunt_id: str, user_id: str = Depends(current_user_id), service: WorkflowService = Depends(workflow_service), uploads: UploadService = Depends(upload_service)) -> list[dict[str, Any]]:
+    try:
+        service.get_hunt(user_id, hunt_id)
+        return uploads.list(user_id, hunt_id)
+    except Exception as exc:
+        raise _translate(exc) from exc
+
+
+@router.post("/hunts/{hunt_id}/uploads", status_code=201)
+async def create_upload(hunt_id: str, request: Request, filename: str | None = None, user_id: str = Depends(current_user_id), service: WorkflowService = Depends(workflow_service), uploads: UploadService = Depends(upload_service)) -> dict[str, Any]:
+    try:
+        service.get_hunt(user_id, hunt_id)
+        body = await request.body()
+        supplied_name = filename or request.headers.get("X-Filename")
+        if not supplied_name:
+            raise UploadError("filename is required")
+        return uploads.save(user_id, hunt_id, supplied_name, body, content_type=request.headers.get("content-type"))
+    except Exception as exc:
+        if isinstance(exc, UploadError):
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        raise _translate(exc) from exc
+
+
+@router.get("/hunts/{hunt_id}/uploads/{upload_id}")
+def download_upload(hunt_id: str, upload_id: str, user_id: str = Depends(current_user_id), service: WorkflowService = Depends(workflow_service), uploads: UploadService = Depends(upload_service)) -> Response:
+    try:
+        service.get_hunt(user_id, hunt_id)
+        path, filename = uploads.path_for(user_id, hunt_id, upload_id)
+        return Response(content=path.read_bytes(), media_type="application/octet-stream", headers={"Content-Disposition": f'attachment; filename="{filename.replace(chr(34), "_")}"'})
+    except Exception as exc:
+        if isinstance(exc, UploadError):
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
         raise _translate(exc) from exc
 
 
