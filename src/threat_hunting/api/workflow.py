@@ -68,7 +68,11 @@ def configure_workflow_service(service: WorkflowService) -> None:
     _auth = AccountService(service.engine)
     from pathlib import Path
     import os
-    _uploads = UploadService(service.engine, Path(os.getenv("THREAT_HUNTING_UPLOAD_ROOT", "runtime/uploads")))
+    _uploads = UploadService(
+        service.engine,
+        Path(os.getenv("THREAT_HUNTING_UPLOAD_ROOT", "runtime/uploads")),
+        limits=service.upload_limits,
+    )
 
 
 def workflow_service() -> WorkflowService:
@@ -202,7 +206,7 @@ def upload_service(service: WorkflowService = Depends(workflow_service)) -> Uplo
     global _uploads
     if _uploads is None:
         from pathlib import Path
-        _uploads = UploadService(service.engine, Path("runtime/uploads"))
+        _uploads = UploadService(service.engine, Path("runtime/uploads"), limits=service.upload_limits)
     return _uploads
 
 

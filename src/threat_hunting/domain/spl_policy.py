@@ -17,8 +17,9 @@ POLICY_VERSION = "1.0"
 BUILTIN_FIELDS = frozenset({"_time", "_raw", "host", "source", "sourcetype", "index"})
 _ALLOWED_COMMANDS = frozenset({"search", "where", "fields", "table", "stats", "timechart", "sort", "head", "dedup", "rename", "eval", "regex"})
 _COMMAND = re.compile(r"^\s*([A-Za-z][A-Za-z0-9_]*)\b(.*)$", re.DOTALL)
-_INDEX_VALUE = re.compile(r"(?i)(?:^|\s)index\s*=\s*[\"']?([A-Za-z0-9_.:-]+)")
-_SOURCETYPE_VALUE = re.compile(r"(?i)(?:^|\s)sourcetype\s*=\s*[\"']?([A-Za-z0-9_.:-]+)")
+_SCOPE_FIELD = re.compile(r"(?i)(?<![A-Za-z0-9_])(?P<field>index|sourcetype)\b")
+_SCOPE_PREDICATE = re.compile(r"(?i)(?P<field>index|sourcetype)\s*=\s*(?:\"(?P<double>[A-Za-z0-9_.:-]+)\"|'(?P<single>[A-Za-z0-9_.:-]+)'|(?P<bare>[A-Za-z0-9_.:-]+))(?=$|[\s|)])")
+_NEGATED_SCOPE = re.compile(r"(?i)(?:\bNOT\s*(?:\(\s*)*|(?<![A-Za-z0-9_])-\s*)(?P<field>index|sourcetype)\b")
 _INLINE_TIME = re.compile(r"(?i)(?:^|\s)(?:earliest|latest)\s*=")
 
 
@@ -57,6 +58,26 @@ def parse_spl(value: str) -> ParsedSPL:
         segments.append((command, args))
     normalized = " | ".join(f"{command} {args}".rstrip() for command, args in segments)
     return ParsedSPL(normalized=normalized, command_segments=tuple(segments))
+
+
+def _scope_values(value: str, field: str) -> tuple[set[str], bool]:
+    """Extract exact positive scope predicates and flag every other form."""
+
+    values: set[str] = set()
+    invalid = any(
+        match.group("field").casefold() == field
+        for match in _NEGATED_SCOPE.finditer(value)
+    )
+    for occurrence in _SCOPE_FIELD.finditer(value):
+        if occurrence.group("field").casefold() != field:
+            continue
+        predicate = _SCOPE_PREDICATE.match(value, occurrence.start())
+        if predicate is None:
+            invalid = True
+            continue
+        selected = predicate.group("double") or predicate.group("single") or predicate.group("bare")
+        values.add(selected)
+    return values, invalid
 
 
 class SPLPolicy:
@@ -98,11 +119,17 @@ class SPLPolicy:
         try:
             parsed = parse_spl(proposal.spl)
             normalized = parsed.normalized
+            scope_expression = parsed.command_segments[0][1]
         except ValueError:
             normalized = " ".join(proposal.spl.split()) or "invalid"
+            scope_expression = proposal.spl
             reasons.append("spl_not_allowed")
-        spl_indexes = set(_INDEX_VALUE.findall(proposal.spl))
-        spl_sourcetypes = set(_SOURCETYPE_VALUE.findall(proposal.spl))
+        spl_indexes, invalid_index_scope = _scope_values(scope_expression, "index")
+        spl_sourcetypes, invalid_sourcetype_scope = _scope_values(scope_expression, "sourcetype")
+        if invalid_index_scope:
+            reasons.append("index_scope_not_exact")
+        if invalid_sourcetype_scope:
+            reasons.append("sourcetype_scope_not_exact")
         if not proposal.indexes or not spl_indexes:
             reasons.append("index_scope_missing")
         elif spl_indexes != set(proposal.indexes):

@@ -259,6 +259,30 @@ def test_submit_and_fetch_keep_pre_action_cancellation() -> None:
     assert client.job.cancel_calls == 0
 
 
+def test_streamed_results_are_read_with_the_policy_byte_cap() -> None:
+    class OversizedResults:
+        requested_size: int | None = None
+
+        def read(self, size: int) -> bytes:
+            self.requested_size = size
+            return b"x" * size
+
+    response = OversizedResults()
+
+    class Job(CancellableJob):
+        def results(self, **_: object) -> OversizedResults:
+            return response
+
+    client = CancellableClient()
+    client.jobs["job-123"] = Job()
+
+    with pytest.raises(AdapterError) as caught:
+        make_connector(client).fetch_results("job-123", max_bytes=64)
+
+    assert caught.value.category is FailureCategory.BUDGET_EXHAUSTED
+    assert response.requested_size == 65
+
+
 def test_tls_and_endpoint_validation_rejects_unsafe_configuration() -> None:
     with pytest.raises(ValueError):
         SplunkConnectionConfig(endpoint="http://splunk.example", token="x")

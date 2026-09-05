@@ -344,6 +344,7 @@ class ProductionHuntExecutor:
                 job_id,
                 page=0,
                 limit=min(proposal.max_results, validation.enforced_limits.max_results),
+                max_bytes=validation.enforced_limits.max_bytes,
                 cancellation_token=self.cancellation_token,
             )
         except Exception:

@@ -2,6 +2,8 @@
 
 from datetime import datetime, timezone
 
+import pytest
+
 from threat_hunting.domain.contracts import QueryProposal, ResultMode
 from threat_hunting.domain.spl_policy import SPLPolicy
 
@@ -58,3 +60,28 @@ def test_spl_requires_explicit_scope_and_typed_time_authority() -> None:
 
     assert not result.allowed
     assert {"index_scope_missing", "inline_time_not_allowed"} <= set(result.reason_codes)
+
+
+@pytest.mark.parametrize(
+    "spl",
+    [
+        "search index=main OR index=* sourcetype=sysmon | head 100",
+        "search index=main sourcetype=sysmon OR NOT index=main | head 100",
+        "search index=main* sourcetype=sysmon | head 100",
+        "search index=main sourcetype=sysmon OR sourcetype!=sysmon | head 100",
+    ],
+)
+def test_spl_rejects_non_exact_or_negated_scope_predicates(spl: str) -> None:
+    result = _policy().validate(_proposal(spl))
+
+    assert not result.allowed
+    assert {"index_scope_not_exact", "sourcetype_scope_not_exact"}.intersection(result.reason_codes)
+
+
+def test_spl_allows_scope_fields_in_post_search_aggregation() -> None:
+    result = _policy().validate(
+        _proposal("search index=main sourcetype=sysmon | stats count by index sourcetype")
+    )
+
+    assert result.allowed
+    assert result.reason_codes == []

@@ -17,6 +17,7 @@ from threat_hunting.domain.budgets import BudgetLimits
 from threat_hunting.integrations.models.factory import ModelConfiguration, ModelFactory
 from threat_hunting.integrations.splunk import SplunkConnectionConfig, SplunkConnector
 from threat_hunting.services.jobs import JobLease
+from threat_hunting.services.uploads import UploadLimits
 from threat_hunting.services.workflow import IntegrationUnavailable, WorkflowService
 
 
@@ -100,6 +101,12 @@ def build_production_service(engine: Engine, settings: RuntimeSettings) -> Workf
         splunk_connector=splunk,
         model_adapter=model,
         budget_limits=budget_limits_from_settings(settings),
+        upload_limits=UploadLimits(
+            per_file_bytes=settings.uploads.per_file_bytes,
+            file_count=settings.uploads.file_count,
+            total_bytes=settings.uploads.total_bytes,
+            extracted_text_characters=settings.uploads.extracted_text_characters,
+        ),
         execution_config={
             "provider": settings.model.provider,
             "model_name": settings.model.model_name,

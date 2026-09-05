@@ -32,6 +32,7 @@ from threat_hunting.services.orchestration import (
     sha256_json,
 )
 from threat_hunting.services.jobs import JobConflict, JobService
+from threat_hunting.services.uploads import UploadLimits
 
 
 workflow_metadata = MetaData()
@@ -195,6 +196,7 @@ class WorkflowService:
         splunk_connector: SplunkConnector | None = None,
         model_adapter: ModelAdapter | None = None,
         budget_limits: BudgetLimits | None = None,
+        upload_limits: UploadLimits | None = None,
         execution_config: Mapping[str, Any] | None = None,
     ) -> None:
         self.engine = engine
@@ -205,6 +207,7 @@ class WorkflowService:
         self.splunk_connector = splunk_connector
         self.model_adapter = model_adapter
         self.budget_limits = budget_limits or BudgetLimits()
+        self.upload_limits = upload_limits or UploadLimits()
         self.execution_config = _json_copy(execution_config or {})
         raw_poll_interval = self.execution_config.get("splunk_poll_interval_seconds", 1.0)
         if isinstance(raw_poll_interval, bool):

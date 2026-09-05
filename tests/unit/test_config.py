@@ -3,8 +3,10 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from sqlalchemy import create_engine
 
 from threat_hunting.config import ConfigurationError, RuntimeSettings, load_database_url
+from threat_hunting.services import runtime
 
 
 def valid_config(tmp_path: Path) -> dict[str, object]:
@@ -161,3 +163,20 @@ def test_empty_database_secret_fails_without_secret_content(tmp_path: Path, monk
     monkeypatch.setenv("THREAT_HUNTING_DATABASE_URL_FILE", str(secret_path))
     with pytest.raises(ConfigurationError, match="empty"):
         load_database_url()
+
+
+def test_production_service_uses_configured_upload_limits(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    value = valid_config(tmp_path)
+    value["uploads"] = {"per_file_bytes": 10, "file_count": 2, "total_bytes": 20, "extracted_text_characters": 30}
+    settings = RuntimeSettings.model_validate(value)
+    monkeypatch.setattr(
+        runtime,
+        "build_production_adapters",
+        lambda _settings: (object(), object()),
+    )
+    service = runtime.build_production_service(create_engine("sqlite+pysqlite://"), settings)
+
+    assert service.upload_limits.per_file_bytes == 10
+    assert service.upload_limits.file_count == 2
+    assert service.upload_limits.total_bytes == 20
+    assert service.upload_limits.extracted_text_characters == 30

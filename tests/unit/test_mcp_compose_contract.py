@@ -6,6 +6,7 @@ import yaml
 
 
 COMPOSE_PATH = Path(__file__).parents[2] / "deploy" / "docker" / "compose.yml"
+NGINX_PATH = Path(__file__).parents[2] / "deploy" / "docker" / "nginx.conf"
 
 
 def compose_document() -> dict[str, object]:
@@ -69,3 +70,15 @@ def test_default_compose_keeps_backend_private_and_persists_uploads() -> None:
     assert {"database_url", "splunk_token", "model_api_key"} <= set(backend["secrets"])
     assert {"database_url", "splunk_token", "model_api_key"} <= set(worker["secrets"])
     assert "mcp" in services and services["mcp"]["profiles"] == ["mcp"]
+
+
+def test_frontend_defaults_to_loopback_and_accepts_allowed_upload_size() -> None:
+    document = compose_document()
+    services = document["services"]
+    assert isinstance(services, dict)
+    frontend = services["frontend"]
+    assert isinstance(frontend, dict)
+    assert frontend["ports"] == [
+        "${THREAT_HUNTING_FRONTEND_BIND:-127.0.0.1}:${THREAT_HUNTING_FRONTEND_PORT:-8080}:8080"
+    ]
+    assert "client_max_body_size 25m;" in NGINX_PATH.read_text(encoding="utf-8")

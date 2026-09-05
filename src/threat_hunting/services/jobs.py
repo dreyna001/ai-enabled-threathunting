@@ -145,7 +145,7 @@ class JobService:
             raise ValueError("invalid terminal job status")
         now = now or _now()
         with self.engine.begin() as connection:
-            result = connection.execute(update(execution_jobs).where(execution_jobs.c.job_id == lease.job_id, execution_jobs.c.worker_id == lease.worker_id, execution_jobs.c.status == "claimed", execution_jobs.c.attempts == lease.generation, execution_jobs.c.deployment_scope_id == lease.deployment_scope_id).values(status=status, worker_id=None, lease_expires_at_utc=None, heartbeat_at_utc=None, last_error=error, updated_at_utc=now))
+            result = connection.execute(update(execution_jobs).where(execution_jobs.c.job_id == lease.job_id, execution_jobs.c.worker_id == lease.worker_id, execution_jobs.c.status == "claimed", execution_jobs.c.cancel_requested.is_(False), execution_jobs.c.attempts == lease.generation, execution_jobs.c.deployment_scope_id == lease.deployment_scope_id, execution_jobs.c.lease_expires_at_utc > now).values(status=status, worker_id=None, lease_expires_at_utc=None, heartbeat_at_utc=None, last_error=error, updated_at_utc=now))
         if result.rowcount != 1:
             raise JobConflict("job is no longer owned by this worker")
 

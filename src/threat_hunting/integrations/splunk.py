@@ -418,12 +418,18 @@ class SplunkConnector:
                 nested = value.get(key)
                 if nested is not None and not isinstance(nested, (str, bytes)):
                     return SplunkConnector._records(nested, limit=limit, max_bytes=max_bytes)
-            return [value]
-        try:
-            items = islice(value, limit) if limit is not None else iter(value)
-            return [item if isinstance(item, Mapping) else {"value": item} for item in items]
-        except TypeError:
-            return [{"value": value}]
+            records = [value]
+        else:
+            try:
+                items = islice(value, limit) if limit is not None else iter(value)
+                records = [item if isinstance(item, Mapping) else {"value": item} for item in items]
+            except TypeError:
+                records = [{"value": value}]
+        if max_bytes is not None:
+            encoded = json.dumps(records, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8")
+            if len(encoded) > max_bytes:
+                raise ValueError("Splunk response exceeds the configured byte limit")
+        return records
 
     def _collection(
         self,
@@ -711,9 +717,19 @@ class SplunkConnector:
         content = getattr(job, "content", job)
         return dict(content) if isinstance(content, Mapping) else {"status": str(content)}
 
-    def fetch_results(self, job_id: str, page: int = 0, limit: int = 100, *, cancellation_token: Any = None) -> list[Mapping[str, Any]]:
+    def fetch_results(
+        self,
+        job_id: str,
+        page: int = 0,
+        limit: int = 100,
+        *,
+        max_bytes: int | None = None,
+        cancellation_token: Any = None,
+    ) -> list[Mapping[str, Any]]:
         if page < 0 or limit <= 0 or limit > 10_000:
             raise AdapterError(FailureCategory.VALIDATION_FAILURE, "invalid result page or limit", operation="fetch_results")
+        if max_bytes is not None and max_bytes <= 0:
+            raise AdapterError(FailureCategory.VALIDATION_FAILURE, "invalid result byte limit", operation="fetch_results")
         job = self._invoke("fetch_results", lambda: self._job(job_id), cancellation_token=cancellation_token)
 
         def fetch() -> Any:
@@ -722,7 +738,18 @@ class SplunkConnector:
                 raise RuntimeError("Splunk job does not expose results")
             return results(offset=page * limit, count=limit)
 
-        return self._records(self._invoke("fetch_results", fetch, cancellation_token=cancellation_token))[:limit]
+        try:
+            return self._records(
+                self._invoke("fetch_results", fetch, cancellation_token=cancellation_token),
+                limit=limit,
+                max_bytes=max_bytes,
+            )[:limit]
+        except ValueError as exc:
+            raise AdapterError(
+                FailureCategory.BUDGET_EXHAUSTED,
+                "Splunk result exceeded the configured byte limit",
+                operation="fetch_results",
+            ) from exc
 
     def cancel(self, job_id: str, *, cancellation_token: Any = None) -> bool:
         # Cancellation is best effort: once a hunt is being cancelled, the

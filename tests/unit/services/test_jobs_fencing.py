@@ -45,6 +45,17 @@ def test_long_handler_renews_lease_before_completion() -> None:
     assert status is not None and status["status"] == "completed"
 
 
+def test_expired_lease_cannot_complete_job() -> None:
+    service = _service(lease_seconds=1)
+    service.enqueue("owner", "hunt", idempotency_key="expired-complete")
+    now = datetime.now(timezone.utc)
+    lease = service.claim("worker", now=now)
+    assert lease is not None
+
+    with pytest.raises(JobConflict, match="no longer owned"):
+        service.complete(lease, now=now + timedelta(seconds=2))
+
+
 def test_active_hunt_cap_blocks_second_claim_in_scope() -> None:
     service = _service(lease_seconds=10)
     service.max_active_hunts = 1
