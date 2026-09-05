@@ -5,13 +5,47 @@ from __future__ import annotations
 import logging
 import signal
 import threading
+from collections.abc import Callable
+from datetime import datetime
+
+from sqlalchemy.exc import SQLAlchemyError
 
 from threat_hunting.config import RuntimeSettings, load_database_url
 from threat_hunting.db import Database
 from threat_hunting.health import worker_id_from_environment
+from threat_hunting.services.jobs import JobLease, JobService
 
 LOGGER = logging.getLogger(__name__)
 HEARTBEAT_INTERVAL_SECONDS = 15
+JOB_POLL_INTERVAL_SECONDS = 0.5
+
+
+def process_one(
+    job_service: JobService,
+    worker_id: str,
+    *,
+    handler: Callable[[JobLease], None] | None = None,
+    now: datetime | None = None,
+) -> bool:
+    """Claim and process one durable execution job.
+
+    A missing production adapter fails the job explicitly; it never pretends an
+    execution completed. Tests and deployments can inject the bounded handler
+    selected by the immutable execution configuration.
+    """
+    job_service.recover_expired(now=now)
+    lease = job_service.claim(worker_id, now=now)
+    if lease is None:
+        return False
+    try:
+        if handler is None:
+            raise RuntimeError("production execution adapter is not configured")
+        handler(lease)
+    except Exception as exc:
+        job_service.complete(lease, status="failed", error=str(exc)[:500], now=now)
+    else:
+        job_service.complete(lease, status="completed", now=now)
+    return True
 
 
 def run() -> None:
@@ -35,9 +69,16 @@ def run() -> None:
     try:
         database.require_current_migration()
         LOGGER.info("worker started", extra={"worker_id": worker_id})
+        jobs = JobService(database.engine)
         while not stop.is_set():
             database.publish_worker_heartbeat(worker_id)
-            stop.wait(HEARTBEAT_INTERVAL_SECONDS)
+            try:
+                process_one(jobs, worker_id)
+            except SQLAlchemyError:
+                # A worker remains healthy while a deployment is rolling out
+                # the queue migration; readiness still reports migration state.
+                LOGGER.exception("durable job poll failed", extra={"worker_id": worker_id})
+            stop.wait(JOB_POLL_INTERVAL_SECONDS)
     finally:
         database.dispose()
         LOGGER.info("worker stopped", extra={"worker_id": worker_id})

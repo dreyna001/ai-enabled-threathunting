@@ -290,6 +290,14 @@ def execute(hunt_id: str, user_id: str = Depends(current_user_id), service: Work
         raise _translate(exc) from exc
 
 
+@router.get("/hunts/{hunt_id}/job")
+def job_status(hunt_id: str, user_id: str = Depends(current_user_id), service: WorkflowService = Depends(workflow_service)) -> dict[str, Any]:
+    try:
+        return service.job_status(user_id, hunt_id)
+    except Exception as exc:
+        raise _translate(exc) from exc
+
+
 @router.get("/hunts/{hunt_id}/results")
 def results(hunt_id: str, user_id: str = Depends(current_user_id), service: WorkflowService = Depends(workflow_service)) -> dict[str, Any]:
     try:

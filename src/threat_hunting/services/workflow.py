@@ -15,6 +15,7 @@ from sqlalchemy import JSON, Boolean, Column, DateTime, ForeignKey, Integer, Lar
 from sqlalchemy.engine import Engine
 
 from threat_hunting.domain.state import HuntState
+from threat_hunting.services.jobs import JobService
 
 
 workflow_metadata = MetaData()
@@ -151,6 +152,7 @@ class WorkflowService:
         self.demo_password = demo_password
         self.password_hasher = PasswordHasher()
         self.cookie_secure = not local_demo
+        self.jobs = JobService(engine)
 
     def initialize_demo(self) -> None:
         """Create local/test tables and the one documented demo principal."""
@@ -234,7 +236,16 @@ class WorkflowService:
         if row["state"] in {HuntState.FINALIZED.value, HuntState.FAILED.value}:
             raise Conflict("terminal hunts cannot be cancelled")
         self._update(owner_id, hunt_id, expected_state=str(row["state"]), state=HuntState.CANCELLED.value, updated_at_utc=_now())
+        if not self.local_demo:
+            self.jobs.request_cancel(owner_id, hunt_id)
         return self.get_hunt(owner_id, hunt_id)
+
+    def job_status(self, owner_id: str, hunt_id: str) -> dict[str, Any]:
+        self._owned_row(owner_id, hunt_id)
+        job = self.jobs.get_for_owner(owner_id, hunt_id)
+        if job is None:
+            raise NotFound("execution job not found")
+        return {key: value for key, value in job.items() if key != "payload"}
 
     def discover(self, owner_id: str, hunt_id: str) -> dict[str, Any]:
         if not self.local_demo:
@@ -297,7 +308,10 @@ class WorkflowService:
         if row["approval"]["plan_version"] != row["plan_version"]:
             raise Conflict("approved plan version no longer matches the current plan")
         if not self.local_demo:
-            raise IntegrationUnavailable("Splunk execution adapter is not configured")
+            now = _now()
+            job = self.jobs.enqueue(owner_id, hunt_id, idempotency_key=f"hunt:{hunt_id}:execution", payload={"hunt_id": hunt_id, "plan_version": row["plan_version"]})
+            self._update(owner_id, hunt_id, expected_state=HuntState.APPROVED.value, state=HuntState.QUEUED.value, updated_at_utc=now)
+            return self.get_hunt(owner_id, hunt_id) | {"job": {key: value for key, value in job.items() if key not in {"payload"}}}
         now, query_id, evidence_id, finding_id = _now(), str(uuid4()), str(uuid4()), str(uuid4())
         evidence = {"evidence_id": evidence_id, "query_id": query_id, "source": "deterministic_local_demo", "event_time_utc": _rfc3339(now - timedelta(minutes=14)), "selected_result": {"host": "demo-workstation-17", "user": "demo\\analyst", "src_ip": "192.0.2.17", "EventCode": "4624"}, "disclaimer": "Deterministic local demo evidence; not a production observation."}
         results = {"findings": [{"finding_id": finding_id, "title": "Local demo authentication lead", "classification": "hunt_lead", "statement": "The deterministic demo dataset contains one scoped authentication event for analyst review.", "confidence": "low", "evidence_ids": [evidence_id], "query_ids": [query_id], "inference": "Local demonstration only."}], "evidence": [evidence], "entities": [{"entity_id": str(uuid4()), "entity_type": "host", "value": "demo-workstation-17", "evidence_ids": [evidence_id]}, {"entity_id": str(uuid4()), "entity_type": "ip", "value": "192.0.2.17", "evidence_ids": [evidence_id]}], "timeline": [{"timestamp_utc": evidence["event_time_utc"], "summary": "Local demo authentication event", "evidence_ids": [evidence_id]}], "queries": [{"query_id": query_id, "purpose": "Answer q1", "spl": "index=security sourcetype=WinEventLog:Security EventCode=4624 | head 100", "status": "completed", "result_count": 1}], "mode": "deterministic_local_demo"}

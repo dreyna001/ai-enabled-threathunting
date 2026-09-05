@@ -95,6 +95,12 @@ class JobService:
         if result.rowcount != 1:
             raise JobConflict("job is no longer owned by this worker")
 
+    def get_for_owner(self, owner_id: str, hunt_id: str) -> dict[str, object] | None:
+        """Return the newest owned job for a hunt without exposing other owners."""
+        with self.engine.connect() as connection:
+            row = connection.execute(select(execution_jobs).where(execution_jobs.c.owner_id == owner_id, execution_jobs.c.hunt_id == hunt_id).order_by(execution_jobs.c.created_at_utc.desc()).limit(1)).mappings().first()
+        return None if row is None else dict(row)
+
     def request_cancel(self, owner_id: str, hunt_id: str, *, now: datetime | None = None) -> int:
         now = now or _now()
         with self.engine.begin() as connection:
