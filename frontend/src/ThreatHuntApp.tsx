@@ -118,7 +118,7 @@ function IntakeField({ id, label, value, onChange, onError }: IntakeFieldProps) 
   );
 }
 
-function CreateHuntForm({ token, onCreated }: { token: string; onCreated: (hunt: Hunt) => void }) {
+function CreateHuntForm({ token, onCreated }: { token: string | undefined; onCreated: (hunt: Hunt) => void }) {
   const [form, setForm] = useState<CreateHuntInput>(EMPTY_HUNT);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
@@ -233,6 +233,7 @@ function Workspace({ session, initial, onBack }: { session: Session; initial: Hu
 
   const editable = ["plan_draft", "awaiting_plan_review"].includes(hunt.state);
   const isDemo = hunt.mode === "deterministic_local_demo" || hunt.discovery_snapshot?.mode === "deterministic_local_demo" || results?.mode === "deterministic_local_demo";
+  const canCancel = ["discovering", "queued", "running", "synthesizing"].includes(hunt.state);
 
   return (
     <main className="vs-workspace" aria-busy={Boolean(busy)}>
@@ -244,7 +245,7 @@ function Workspace({ session, initial, onBack }: { session: Session; initial: Hu
       <div className="vs-grid">
         <section className="vs-card"><p className="vs-eyebrow">Data source</p><h2>Splunk discovery</h2>{hunt.discovery_snapshot ? <pre>{dump(hunt.discovery_snapshot)}</pre> : <p className="vs-empty">No metadata discovered.</p>}<button disabled={Boolean(busy) || hunt.state !== "created"} onClick={() => void act("discover", () => workflowApi.discover(session.access_token, hunt.hunt_id))}>{busy === "discover" ? "Discovering…" : "Run discovery"}</button></section>
         <section className="vs-card"><header><div><p className="vs-eyebrow">Analyst gate</p><h2>Plan review</h2></div><span>v{hunt.plan_version ?? 1}</span></header>{hunt.plan ? <><label>Plan JSON<textarea className="vs-code" rows={15} readOnly={!editable} value={planBody} onChange={(event) => setPlanBody(event.target.value)} /></label>{editable && <><button disabled={Boolean(busy)} onClick={savePlan}>Save edits</button><label>Revision instruction<textarea value={instruction} onChange={(event) => setInstruction(event.target.value)} /></label><button className="vs-secondary" disabled={Boolean(busy) || !instruction.trim()} onClick={() => void act("revise", () => workflowApi.revisePlan(session.access_token, hunt.hunt_id, instruction))}>Request revision</button><label>Analyst note<textarea value={note} onChange={(event) => setNote(event.target.value)} /></label><div className="vs-actions"><button disabled={Boolean(busy)} onClick={() => void act("approve", () => workflowApi.approvePlan(session.access_token, hunt.hunt_id, note))}>Approve plan</button><button className="vs-danger" disabled={Boolean(busy) || !note.trim()} onClick={() => void act("reject", () => workflowApi.rejectPlan(session.access_token, hunt.hunt_id, note))}>Reject plan</button></div></>}</> : <p className="vs-empty">Run discovery to generate a plan.</p>}</section>
-        <section className="vs-card vs-span"><p className="vs-eyebrow">Bounded action</p><h2>Execution</h2><p className="vs-muted">Uses only the approved, locked plan and limits.</p><button disabled={Boolean(busy) || hunt.state !== "approved"} onClick={() => void act("execute", () => workflowApi.execute(session.access_token, hunt.hunt_id))}>{busy === "execute" ? "Executing…" : "Execute approved hunt"}</button></section>
+        <section className="vs-card vs-span"><p className="vs-eyebrow">Bounded action</p><h2>Execution</h2><p className="vs-muted">Uses only the approved, locked plan and limits.</p><div className="vs-actions"><button disabled={Boolean(busy) || hunt.state !== "approved"} onClick={() => void act("execute", () => workflowApi.execute(session.access_token, hunt.hunt_id))}>{busy === "execute" ? "Executing…" : "Execute approved hunt"}</button>{canCancel && <button className="vs-danger" disabled={Boolean(busy)} onClick={() => void act("cancel", () => workflowApi.cancel(session.access_token, hunt.hunt_id))}>{busy === "cancel" ? "Cancelling…" : "Cancel hunt"}</button>}</div></section>
         {results && <div className="vs-results vs-span">{(["findings", "evidence", "entities", "timeline"] as const).map((key) => <ResultCard key={key} title={key[0].toUpperCase() + key.slice(1)} items={results[key]} />)}</div>}
         {report && <section className="vs-card vs-span"><header><div><p className="vs-eyebrow">Final product</p><h2>Editable report</h2></div><span>{report.state} · v{report.version}</span></header><label>Structured report content<textarea className="vs-code" rows={20} readOnly={report.state === "finalized"} value={reportBody} onChange={(event) => setReportBody(event.target.value)} /></label><div className="vs-actions">{report.state !== "finalized" ? <><button disabled={Boolean(busy)} onClick={() => void saveReport(false)}>Save draft</button><button className="vs-secondary" disabled={Boolean(busy)} onClick={() => void saveReport(true)}>Save and finalize PDF</button></> : <button onClick={() => void workflowApi.downloadPdf(session.access_token, hunt.hunt_id).catch((error) => setError(errorMessage(error)))}>Download PDF</button>}</div></section>}
       </div>
@@ -276,5 +277,7 @@ export default function ThreatHuntApp() {
   const [selected, setSelected] = useState<Hunt | null>(null);
   if (!session) return <Login onLogin={setSession} />;
   if (selected) return <Workspace session={session} initial={selected} onBack={() => setSelected(null)} />;
-  return <Dashboard session={session} onSelect={setSelected} onSignOut={() => setSession(null)} />;
+  return <Dashboard session={session} onSelect={setSelected} onSignOut={() => {
+    void workflowApi.logout().finally(() => setSession(null));
+  }} />;
 }

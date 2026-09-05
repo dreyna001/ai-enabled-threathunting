@@ -7,8 +7,10 @@ export interface User {
 }
 
 export interface Session {
-  access_token: string;
-  token_type: string;
+  /** Browser authentication uses an HttpOnly same-origin session cookie. */
+  access_token?: string;
+  token_type?: string;
+  csrf_token?: string;
   user: User;
 }
 
@@ -85,17 +87,37 @@ function errorDetail(body: unknown, fallback: string): string {
   return typeof value === "string" ? value : JSON.stringify(value);
 }
 
-async function request<T>(path: string, token?: string, init: RequestInit = {}): Promise<T> {
+let csrfToken: string | null = null;
+
+function readCookie(name: string): string | null {
+  if (typeof document === "undefined") return null;
+  const prefix = `${encodeURIComponent(name)}=`;
+  const value = document.cookie.split(";").map((cookie) => cookie.trim()).find((cookie) => cookie.startsWith(prefix));
+  return value ? decodeURIComponent(value.slice(prefix.length)) : null;
+}
+
+function rememberCsrf(response: Response, body: unknown): void {
+  const header = response.headers.get("X-CSRF-Token") ?? response.headers.get("X-CSRFToken");
+  const bodyToken = typeof body === "object" && body !== null && "csrf_token" in body
+    ? (body as { csrf_token?: unknown }).csrf_token
+    : undefined;
+  const token = header ?? (typeof bodyToken === "string" ? bodyToken : null) ?? readCookie("csrf_token");
+  if (token) csrfToken = token;
+}
+
+function isMutation(method: string): boolean {
+  return !["GET", "HEAD", "OPTIONS"].includes(method.toUpperCase());
+}
+
+async function request<T>(path: string, _legacyToken?: string, init: RequestInit = {}): Promise<T> {
   let response: Response;
+  const method = init.method ?? "GET";
+  const headers = new Headers(init.headers);
+  if (init.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
+  const token = csrfToken ?? readCookie("csrf_token");
+  if (isMutation(method) && token) headers.set("X-CSRF-Token", token);
   try {
-    response = await fetch(path, {
-      ...init,
-      headers: {
-        ...(init.body ? { "Content-Type": "application/json" } : {}),
-        ...(token ? { Authorization: `Bearer ${token}` } : {}),
-        ...init.headers,
-      },
-    });
+    response = await fetch(path, { ...init, credentials: "include", headers });
   } catch {
     throw new ApiError(
       "The API could not be reached. Confirm the backend is running and try again.",
@@ -105,62 +127,72 @@ async function request<T>(path: string, token?: string, init: RequestInit = {}):
 
   if (!response.ok) {
     const body = await response.json().catch(() => null);
+    rememberCsrf(response, body);
     throw new ApiError(errorDetail(body, `Request failed (${response.status}).`), response.status);
   }
   if (response.status === 204) return undefined as T;
-  return response.json() as Promise<T>;
+  const body = await response.json();
+  rememberCsrf(response, body);
+  return body as T;
 }
 
 export const workflowApi = {
-  login: (username: string, password: string) =>
-    request<Session>("/api/auth/login", undefined, {
+  login: async (username: string, password: string) => {
+    csrfToken = null;
+    const session = await request<Session>("/api/auth/login", undefined, {
       method: "POST",
       body: JSON.stringify({ username, password }),
-    }),
-  listHunts: (token: string) => request<Hunt[]>("/api/hunts", token),
-  createHunt: (token: string, body: CreateHuntInput) =>
+    });
+    csrfToken = session.csrf_token ?? csrfToken ?? readCookie("csrf_token");
+    return session;
+  },
+  logout: () => request<void>("/api/auth/logout", undefined, { method: "POST" }),
+  listHunts: (token: string | undefined) => request<Hunt[]>("/api/hunts", token),
+  createHunt: (token: string | undefined, body: CreateHuntInput) =>
     request<Hunt>("/api/hunts", token, { method: "POST", body: JSON.stringify(body) }),
-  discover: (token: string, id: string) =>
+  discover: (token: string | undefined, id: string) =>
     request<Hunt>(`/api/hunts/${id}/discover`, token, { method: "POST" }),
-  savePlan: (token: string, id: string, expectedVersion: number, plan: HuntPlan) =>
+  savePlan: (token: string | undefined, id: string, expectedVersion: number, plan: HuntPlan) =>
     request<Hunt>(`/api/hunts/${id}/plan`, token, {
       method: "PUT",
       body: JSON.stringify({ expected_version: expectedVersion, plan }),
     }),
-  revisePlan: (token: string, id: string, instruction: string) =>
+  revisePlan: (token: string | undefined, id: string, instruction: string) =>
     request<Hunt>(`/api/hunts/${id}/plan/revise`, token, {
       method: "POST",
       body: JSON.stringify({ instruction }),
     }),
-  approvePlan: (token: string, id: string, analystNote?: string) =>
+  approvePlan: (token: string | undefined, id: string, analystNote?: string) =>
     request<Hunt>(`/api/hunts/${id}/plan/approve`, token, {
       method: "POST",
       body: JSON.stringify({ analyst_note: analystNote || null }),
     }),
-  rejectPlan: (token: string, id: string, analystNote: string) =>
+  rejectPlan: (token: string | undefined, id: string, analystNote: string) =>
     request<Hunt>(`/api/hunts/${id}/plan/reject`, token, {
       method: "POST",
       body: JSON.stringify({ analyst_note: analystNote }),
     }),
-  execute: (token: string, id: string) =>
+  execute: (token: string | undefined, id: string) =>
     request<Hunt>(`/api/hunts/${id}/execute`, token, { method: "POST" }),
-  results: (token: string, id: string) =>
+  cancel: (token: string | undefined, id: string) =>
+    request<Hunt>(`/api/hunts/${id}/cancel`, token, { method: "POST" }),
+  results: (token: string | undefined, id: string) =>
     request<HuntResults>(`/api/hunts/${id}/results`, token),
-  report: (token: string, id: string) =>
+  report: (token: string | undefined, id: string) =>
     request<ReportPreview>(`/api/hunts/${id}/report`, token),
-  saveReport: (token: string, id: string, expectedVersion: number, content: JsonObject) =>
+  saveReport: (token: string | undefined, id: string, expectedVersion: number, content: JsonObject) =>
     request<ReportPreview>(`/api/hunts/${id}/report`, token, {
       method: "PUT",
       body: JSON.stringify({ expected_version: expectedVersion, content }),
     }),
-  finalizeReport: (token: string, id: string, expectedVersion: number) =>
+  finalizeReport: (token: string | undefined, id: string, expectedVersion: number) =>
     request<ReportPreview>(`/api/hunts/${id}/report/finalize`, token, {
       method: "POST",
       body: JSON.stringify({ expected_version: expectedVersion }),
     }),
-  downloadPdf: async (token: string, id: string) => {
+  downloadPdf: async (token: string | undefined, id: string) => {
     const response = await fetch(`/api/hunts/${id}/report/pdf`, {
-      headers: { Authorization: `Bearer ${token}` },
+      credentials: "include",
     });
     if (!response.ok) {
       const body = await response.json().catch(() => null);

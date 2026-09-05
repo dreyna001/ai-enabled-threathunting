@@ -1,82 +1,70 @@
-# AI-Enabled Threat Hunting MVP
+# AI-Enabled Threat Hunting
 
-This repository implements the bounded threat-hunting workspace defined in the [MVP specification](docs/threat-hunting-mvp-spec.md). The [implementation plan](docs/implementation-plan.md) is the build and acceptance tracker.
+This repository provides a bounded threat-hunting workspace: an analyst supplies a hypothesis and scoped inputs, reviews a generated plan, explicitly approves it, and receives grounded findings and an editable report. The application does not provide autonomous production access, cross-tenant collaboration, detection export, or unbounded search.
 
-## Current status
+The operator journey is deliberately three paths. Complete one path in order and stop at its validation command.
 
-A thin, persisted vertical slice is implemented for login, hunt creation, deterministic local Splunk discovery, plan revision and approval, bounded execution, evidence review, editable reporting, and PDF finalization. Production Splunk and model-provider qualification remain integration work.
+## Path A — local deterministic verification
 
-## Requirements
-
-- Python 3.12
-- Node.js 22 and npm
-- Docker Engine with Docker Compose
-
-## Local Python setup
+Use this path to verify the workflow and UI without Docker, Splunk, or an external model. It is synthetic data only and must not receive production evidence.
 
 ```bash
 python3.12 -m venv .venv
 . .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -e '.[dev]'
-python -m pytest
-```
-
-## Local vertical-slice demo
-
-The local demo uses deterministic synthetic Splunk and planning data. Every such response is labeled `deterministic_local_demo`; it verifies workflow and UI behavior only and is not production evidence or model-accuracy validation.
-
-```bash
-cd frontend && npm run build
-cd ..
+python -m pip install -e ".[dev]"
 THREAT_HUNTING_DATABASE_URL=sqlite+pysqlite:///runtime/local-demo.db \
 THREAT_HUNTING_LOCAL_DEMO=1 \
-THREAT_HUNTING_DEMO_PASSWORD='<choose-a-local-secret>' \
+THREAT_HUNTING_DEMO_PASSWORD="<choose-a-local-secret>" \
 .venv/bin/uvicorn threat_hunting.main:app --host 127.0.0.1 --port 8000
 ```
 
-Sign in with the local-only demo account `analyst` and the password you supplied in `THREAT_HUNTING_DEMO_PASSWORD`. Demo mode fails closed when that value is absent. Do not enable demo mode for production deployments. Verify the complete HTTP workflow with `.venv/bin/python -m pytest tests/e2e/test_vertical_slice.py -q`.
-
-## Runtime configuration and secrets
-
-Non-secret settings live in a read-only YAML file. Start with `deploy/docker/config/runtime.yml`.
-
-Secrets are separate files. Never put secret values in the YAML file, `.env`, command-line arguments, images, or Git. For local Docker development, create the paths named in `.env.example` and place only the corresponding secret value in each file.
-
-The database URL secret uses a SQLAlchemy-compatible PostgreSQL URL, for example:
-
-```text
-postgresql+psycopg://threat_hunting:<password>@postgres:5432/threat_hunting
-```
-
-## Database migration
+In a second terminal, run the workflow contract and frontend checks:
 
 ```bash
-THREAT_HUNTING_CONFIG=/path/to/runtime.yml \
-THREAT_HUNTING_DATABASE_URL_FILE=/path/to/database_url \
-python -m alembic upgrade head
+.venv/bin/python -m pytest -q
+npm --prefix frontend run test:unit
+npm --prefix frontend run typecheck
+npm --prefix frontend run build
 ```
 
-Migrations run as an explicit deployment step. The API and worker never apply migrations themselves.
+Open `http://127.0.0.1:8000`, sign in as `analyst` with the password supplied above, create a hunt, run discovery, review and approve the plan, execute it, and finalize the report. The UI labels deterministic responses as non-production evidence.
 
-## Health endpoints
+## Path B — on-prem Docker Compose
 
-- `GET /health/live` checks that the API process can answer.
-- `GET /health/ready` checks configuration, PostgreSQL, migration revision, writable storage, and minimum free space.
-
-The containerized API serves the built frontend on the same origin. Docker Compose
-publishes that service on both the configured frontend and API host ports so browser
-requests to `/health/*` do not require cross-origin configuration.
-
-The worker publishes a heartbeat to PostgreSQL. Its container health check uses the same configuration, migration, storage, and database checks.
-
-## Docker development deployment
-
-Copy `.env.example` to `.env`, create the local secret files, then validate and build:
+Use this path for a customer-controlled host with PostgreSQL and file-backed secrets. Copy `.env.example` to `.env`, create the secret files described in [`deploy/docker/secrets/README.md`](deploy/docker/secrets/README.md), then validate and build:
 
 ```bash
-docker compose -f deploy/docker/compose.yml config
-docker compose -f deploy/docker/compose.yml build
+cp .env.example .env
+mkdir -p runtime/secrets
+chmod 700 runtime/secrets
+# Write postgres_password and database_url with permissions 0600.
+docker compose --env-file .env -f deploy/docker/compose.yml config
+docker compose --env-file .env -f deploy/docker/compose.yml build
+docker compose --env-file .env -f deploy/docker/compose.yml up -d
+curl --fail http://127.0.0.1:${THREAT_HUNTING_FRONTEND_PORT:-8080}/health/live
+curl --fail http://127.0.0.1:${THREAT_HUNTING_FRONTEND_PORT:-8080}/health/ready
 ```
 
-Do not run this deployment with placeholder secrets or production data.
+The frontend is the browser origin on port 8080 and proxies `/api` and `/health` to the backend. The API, worker, migration job, and PostgreSQL use private service wiring; containers run read-only, without added capabilities, and as non-root users. Browser authentication uses an HttpOnly session cookie and CSRF header; no bearer token is stored in browser storage.
+
+Path B is complete when the two health checks pass, the migration job exits successfully, and the frontend loads. Rollback means pinning the previous immutable image tag and running the documented migration rollback procedure; `docker compose down -v` is teardown and destroys persistent data, so it is not a rollback.
+
+## Path C — live Splunk/OpenAI qualification
+
+Use this path only after Path B passes and an operator has approved a non-production pilot. Mount the approved Splunk token and model-provider secret through protected files; never place credentials in YAML, `.env`, command arguments, images, or Git. Configure `splunk.url`, `model.provider`, `model.model_name`, and the provider endpoint in a customer-owned runtime file.
+
+```bash
+docker compose --env-file .env -f deploy/docker/compose.yml up -d
+curl --fail http://127.0.0.1:${THREAT_HUNTING_FRONTEND_PORT:-8080}/health/ready
+docker compose --env-file .env -f deploy/docker/compose.yml logs --no-log-prefix --tail=100 backend worker
+```
+
+Then run a synthetic-data hunt against the approved Splunk instance, verify the query ledger, cancellation, budget enforcement, evidence grounding, and PDF output, and retain the run identifiers for the pilot record.
+
+If Docker is unavailable, Path B is blocked by the host runtime. If Splunk is unavailable or its TLS/token setup is not approved, Path C is blocked at live discovery/execution; Path A remains valid. If the application-specific model secret is absent or the provider is not qualified, Path C is blocked at plan generation/synthesis; Codex or another interactive connection does not supply an application credential.
+
+## Configuration and safety boundaries
+
+Non-secret settings live in [`deploy/docker/config/runtime.yml`](deploy/docker/config/runtime.yml). Secret-file names and permissions are documented in [`deploy/docker/secrets/README.md`](deploy/docker/secrets/README.md). Health endpoints are `/health/live` and `/health/ready`. Migrations run as an explicit deployment step; the API and worker do not apply migrations on startup.
+
+The threat-hunting MVP contract is [`docs/threat-hunting-mvp-spec.md`](docs/threat-hunting-mvp-spec.md). The implementation tracker is [`docs/implementation-plan.md`](docs/implementation-plan.md). Deployment, rollback, live smoke, and blocker handling are in [`docs/operator-runbook.md`](docs/operator-runbook.md). The complete documentation map is [`docs/README.md`](docs/README.md).
