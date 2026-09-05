@@ -77,6 +77,18 @@ class JobService:
                 return None
         return JobLease(str(row["job_id"]), str(row["hunt_id"]), worker_id, expiry)
 
+    def require_lease(self, job_id: str, worker_id: str, *, now: datetime | None = None) -> dict[str, object]:
+        """Require a live claim owned by one worker before mutating hunt state."""
+        now = now or _now()
+        with self.engine.connect() as connection:
+            row = connection.execute(select(execution_jobs).where(execution_jobs.c.job_id == job_id)).mappings().first()
+        if row is None or row["status"] != "claimed" or row["worker_id"] != worker_id or row["cancel_requested"]:
+            raise JobConflict("job lease is missing or owned by another worker")
+        expiry = row["lease_expires_at_utc"]
+        if expiry is None or (expiry.replace(tzinfo=timezone.utc) if expiry.tzinfo is None else expiry) <= now:
+            raise JobConflict("job lease has expired")
+        return dict(row)
+
     def heartbeat(self, lease: JobLease, *, now: datetime | None = None) -> JobLease:
         now = now or _now()
         expiry = now + timedelta(seconds=self.lease_seconds)

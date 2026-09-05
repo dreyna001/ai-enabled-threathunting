@@ -13,7 +13,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from threat_hunting.config import RuntimeSettings, load_database_url
 from threat_hunting.db import Database
 from threat_hunting.health import worker_id_from_environment
-from threat_hunting.services.jobs import JobLease, JobService
+from threat_hunting.services.jobs import JobConflict, JobLease, JobService
 
 LOGGER = logging.getLogger(__name__)
 HEARTBEAT_INTERVAL_SECONDS = 15
@@ -42,9 +42,17 @@ def process_one(
             raise RuntimeError("production execution adapter is not configured")
         handler(lease)
     except Exception as exc:
-        job_service.complete(lease, status="failed", error=str(exc)[:500], now=now)
+        try:
+            job_service.complete(lease, status="failed", error=str(exc)[:500], now=now)
+        except JobConflict:
+            # Cancellation or lease recovery won the race; late worker output
+            # must not overwrite the authoritative terminal state.
+            pass
     else:
-        job_service.complete(lease, status="completed", now=now)
+        try:
+            job_service.complete(lease, status="completed", now=now)
+        except JobConflict:
+            pass
     return True
 
 
