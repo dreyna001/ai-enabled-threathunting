@@ -15,6 +15,8 @@ from pydantic import BaseModel, ConfigDict, Field, PositiveInt, SecretStr, field
 
 CONFIG_ENV = "THREAT_HUNTING_CONFIG"
 DATABASE_URL_FILE_ENV = "THREAT_HUNTING_DATABASE_URL_FILE"
+SPLUNK_TOKEN_FILE_ENV = "THREAT_HUNTING_SPLUNK_TOKEN_FILE"
+MODEL_API_KEY_FILE_ENV = "THREAT_HUNTING_MODEL_API_KEY_FILE"
 
 
 class ConfigurationError(RuntimeError):
@@ -365,3 +367,21 @@ def load_database_url() -> SecretStr:
     if not raw_path:
         raise ConfigurationError(f"{DATABASE_URL_FILE_ENV} must name the database URL secret file")
     return read_secret_file(Path(raw_path), label="database URL")
+
+
+def load_optional_secret_file(env_name: str, *, label: str) -> SecretStr | None:
+    """Load an optional provider secret from the path named by ``env_name``."""
+
+    raw_path = os.environ.get(env_name)
+    if not raw_path:
+        return None
+    return read_secret_file(Path(raw_path), label=label)
+
+
+def load_splunk_token() -> SecretStr:
+    """Load the production Splunk bearer token from its secret file."""
+
+    raw_path = os.environ.get(SPLUNK_TOKEN_FILE_ENV)
+    if not raw_path:
+        raise ConfigurationError(f"{SPLUNK_TOKEN_FILE_ENV} must name the Splunk token secret file")
+    return read_secret_file(Path(raw_path), label="Splunk token")

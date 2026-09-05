@@ -338,7 +338,6 @@ class WorkflowService:
             snapshot["input_context"] = context["analyst_supplied_context"]
             snapshot["mode"] = "production"
             plan_payload = plan.model_dump(mode="json")
-            plan_payload["input_context"] = context["analyst_supplied_context"]
             self._update(owner_id, hunt_id, expected_state=HuntState.DISCOVERING.value, state=HuntState.PLAN_DRAFT.value, discovery_snapshot=snapshot, plan=plan_payload, plan_version=1, updated_at_utc=now)
             self._update(owner_id, hunt_id, expected_state=HuntState.PLAN_DRAFT.value, state=HuntState.AWAITING_PLAN_REVIEW.value, updated_at_utc=_now())
             return self.get_hunt(owner_id, hunt_id)
@@ -466,7 +465,7 @@ class WorkflowService:
             raise IntegrationUnavailable("demo executions are handled synchronously")
         if self.splunk_connector is None or self.model_adapter is None:
             raise IntegrationUnavailable("production Splunk and model adapters are not configured")
-        row = self._owned_row(lease.owner_id if hasattr(lease, "owner_id") else "", lease.hunt_id)
+        row = self._owned_row(lease.owner_id, lease.hunt_id)
         if row["state"] == HuntState.CANCELLED.value:
             return
         if row["state"] != HuntState.QUEUED.value:

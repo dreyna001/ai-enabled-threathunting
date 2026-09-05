@@ -11,8 +11,10 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy import Engine, create_engine
 
 from threat_hunting import __version__
+from threat_hunting.config import CONFIG_ENV, ConfigurationError, RuntimeSettings
 from threat_hunting.api.workflow import configure_workflow_service, router as workflow_router
 from threat_hunting.health import HealthResponse, check_readiness
+from threat_hunting.services.runtime import build_production_service
 from threat_hunting.services.workflow import WorkflowService
 
 
@@ -49,7 +51,13 @@ def create_app(
     if demo_password is None:
         demo_password = os.getenv("THREAT_HUNTING_DEMO_PASSWORD")
     if engine is not None:
-        service = WorkflowService(engine, local_demo=local_demo, demo_password=demo_password)
+        if not local_demo and os.getenv(CONFIG_ENV):
+            # Production composition is explicit and fail-closed.  A missing
+            # or invalid provider secret must prevent a misleading demo path.
+            settings = RuntimeSettings.load()
+            service = build_production_service(engine, settings)
+        else:
+            service = WorkflowService(engine, local_demo=local_demo, demo_password=demo_password)
         if cookie_secure is not None:
             service.cookie_secure = cookie_secure
         service.initialize_demo()

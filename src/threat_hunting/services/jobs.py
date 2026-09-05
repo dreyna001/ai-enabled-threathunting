@@ -42,6 +42,7 @@ def _now() -> datetime:
 class JobLease:
     job_id: str
     hunt_id: str
+    owner_id: str
     worker_id: str
     expires_at: datetime
 
@@ -75,7 +76,7 @@ class JobService:
             changed = connection.execute(update(execution_jobs).where(execution_jobs.c.job_id == row["job_id"], execution_jobs.c.status == "queued", execution_jobs.c.cancel_requested.is_(False)).values(status="claimed", worker_id=worker_id, lease_expires_at_utc=expiry, heartbeat_at_utc=now, attempts=int(row["attempts"]) + 1, updated_at_utc=now))
             if changed.rowcount != 1:
                 return None
-        return JobLease(str(row["job_id"]), str(row["hunt_id"]), worker_id, expiry)
+        return JobLease(str(row["job_id"]), str(row["hunt_id"]), str(row["owner_id"]), worker_id, expiry)
 
     def require_lease(self, job_id: str, worker_id: str, *, now: datetime | None = None) -> dict[str, object]:
         """Require a live claim owned by one worker before mutating hunt state."""
@@ -96,7 +97,7 @@ class JobService:
             result = connection.execute(update(execution_jobs).where(execution_jobs.c.job_id == lease.job_id, execution_jobs.c.worker_id == lease.worker_id, execution_jobs.c.status == "claimed", execution_jobs.c.cancel_requested.is_(False), execution_jobs.c.lease_expires_at_utc > now).values(lease_expires_at_utc=expiry, heartbeat_at_utc=now, updated_at_utc=now))
         if result.rowcount != 1:
             raise JobConflict("job lease is missing, expired, or cancelled")
-        return JobLease(lease.job_id, lease.hunt_id, lease.worker_id, expiry)
+        return JobLease(lease.job_id, lease.hunt_id, lease.owner_id, lease.worker_id, expiry)
 
     def complete(self, lease: JobLease, *, status: str = "completed", error: str | None = None, now: datetime | None = None) -> None:
         if status not in {"completed", "failed", "cancelled"}:

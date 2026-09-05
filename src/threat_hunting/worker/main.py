@@ -77,11 +77,13 @@ def run() -> None:
     try:
         database.require_current_migration()
         LOGGER.info("worker started", extra={"worker_id": worker_id})
-        jobs = JobService(database.engine)
+        service = build_production_service(database.engine, settings)
+        handler = build_worker_handler(service)
+        jobs = service.jobs
         while not stop.is_set():
             database.publish_worker_heartbeat(worker_id)
             try:
-                process_one(jobs, worker_id)
+                process_one(jobs, worker_id, handler=handler)
             except SQLAlchemyError:
                 # A worker remains healthy while a deployment is rolling out
                 # the queue migration; readiness still reports migration state.
