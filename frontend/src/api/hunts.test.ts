@@ -30,6 +30,16 @@ describe("workflow API session transport", () => {
     expect(headers.get("Authorization")).toBeNull();
   });
 
+  it("signals session expiry on an unauthorized API response", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({ detail: "authentication required" }), { status: 401 }));
+    const onExpired = vi.fn();
+    Object.defineProperty(globalThis, "window", { value: { dispatchEvent: onExpired }, configurable: true });
+    await expect(workflowApi.listHunts(undefined)).rejects.toMatchObject({ status: 401 });
+    expect(onExpired).toHaveBeenCalledTimes(1);
+    delete (globalThis as { window?: unknown }).window;
+    fetchMock.mockRestore();
+  });
+
   it("provides an explicit logout request", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 204 }));
     await workflowApi.logout();

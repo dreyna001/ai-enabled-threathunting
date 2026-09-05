@@ -73,6 +73,15 @@ export interface ReportPreview {
   html?: string;
 }
 
+export interface JobStatus {
+  job_id: string;
+  hunt_id: string;
+  status: "queued" | "claimed" | "completed" | "failed" | "cancelled" | string;
+  attempts?: number;
+  last_error?: string | null;
+  updated_at_utc?: string;
+}
+
 export class ApiError extends Error {
   constructor(message: string, readonly status: number) {
     super(message);
@@ -101,7 +110,7 @@ function rememberCsrf(response: Response, body: unknown): void {
   const bodyToken = typeof body === "object" && body !== null && "csrf_token" in body
     ? (body as { csrf_token?: unknown }).csrf_token
     : undefined;
-  const token = header ?? (typeof bodyToken === "string" ? bodyToken : null) ?? readCookie("csrf_token");
+  const token = header ?? (typeof bodyToken === "string" ? bodyToken : null) ?? readCookie("threat_hunting_csrf") ?? readCookie("csrf_token");
   if (token) csrfToken = token;
 }
 
@@ -114,7 +123,7 @@ async function request<T>(path: string, _legacyToken?: string, init: RequestInit
   const method = init.method ?? "GET";
   const headers = new Headers(init.headers);
   if (init.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
-  const token = csrfToken ?? readCookie("csrf_token");
+  const token = csrfToken ?? readCookie("threat_hunting_csrf") ?? readCookie("csrf_token");
   if (isMutation(method) && token) headers.set("X-CSRF-Token", token);
   try {
     response = await fetch(path, { ...init, credentials: "include", headers });
@@ -126,6 +135,9 @@ async function request<T>(path: string, _legacyToken?: string, init: RequestInit
   }
 
   if (!response.ok) {
+    if (response.status === 401 && typeof window !== "undefined") {
+      window.dispatchEvent(new Event("threat-hunt-auth-expired"));
+    }
     const body = await response.json().catch(() => null);
     rememberCsrf(response, body);
     throw new ApiError(errorDetail(body, `Request failed (${response.status}).`), response.status);
@@ -143,11 +155,15 @@ export const workflowApi = {
       method: "POST",
       body: JSON.stringify({ username, password }),
     });
-    csrfToken = session.csrf_token ?? csrfToken ?? readCookie("csrf_token");
+    csrfToken = session.csrf_token ?? csrfToken ?? readCookie("threat_hunting_csrf") ?? readCookie("csrf_token");
     return session;
   },
   logout: () => request<void>("/api/auth/logout", undefined, { method: "POST" }),
   listHunts: (token: string | undefined) => request<Hunt[]>("/api/hunts", token),
+  getHunt: (token: string | undefined, id: string) =>
+    request<Hunt>(`/api/hunts/${id}`, token),
+  jobStatus: (token: string | undefined, id: string) =>
+    request<JobStatus>(`/api/hunts/${id}/job`, token),
   createHunt: (token: string | undefined, body: CreateHuntInput) =>
     request<Hunt>("/api/hunts", token, { method: "POST", body: JSON.stringify(body) }),
   discover: (token: string | undefined, id: string) =>
@@ -195,6 +211,9 @@ export const workflowApi = {
       credentials: "include",
     });
     if (!response.ok) {
+      if (response.status === 401 && typeof window !== "undefined") {
+        window.dispatchEvent(new Event("threat-hunt-auth-expired"));
+      }
       const body = await response.json().catch(() => null);
       throw new ApiError(errorDetail(body, "PDF download failed."), response.status);
     }

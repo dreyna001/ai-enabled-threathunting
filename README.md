@@ -32,7 +32,7 @@ Open `http://127.0.0.1:8000`, sign in as `analyst` with the password supplied ab
 
 ## Path B — on-prem Docker Compose
 
-Use this path for a customer-controlled host with PostgreSQL and file-backed secrets. Copy `.env.example` to `.env`, create the three default secret files described in [`deploy/docker/secrets/README.md`](deploy/docker/secrets/README.md) (`postgres_password`, `database_url`, and `splunk_token`), then validate and build:
+Use this path for a customer-controlled host with PostgreSQL and file-backed secrets. Copy `.env.example` to `.env`, create the four default secret files described in [`deploy/docker/secrets/README.md`](deploy/docker/secrets/README.md) (`postgres_password`, `database_url`, `splunk_token`, and `model_api_key`), then validate and build:
 
 ```bash
 cp .env.example .env
@@ -46,7 +46,7 @@ curl --fail http://127.0.0.1:${THREAT_HUNTING_FRONTEND_PORT:-8080}/health/live
 curl --fail http://127.0.0.1:${THREAT_HUNTING_FRONTEND_PORT:-8080}/health/ready
 ```
 
-The frontend is the sole published browser origin on port 8080 and proxies `/api` and `/health` to the private backend. The API, worker, migration job, and PostgreSQL use private service wiring; uploads persist under `/var/lib/threat-hunting/uploads`; containers run read-only, without added capabilities, and as non-root users. Browser authentication uses an HttpOnly session cookie and CSRF header; no bearer token is stored in browser storage.
+The frontend is the sole published browser origin on port 8080 and proxies `/api` and `/health` to the private backend. Put that origin behind an approved HTTPS reverse proxy before interactive use; production session cookies are Secure, so plain HTTP is suitable only for health/build checks. The API, worker, migration job, and PostgreSQL use private service wiring; uploads persist under `/var/lib/threat-hunting/uploads`; containers run read-only, without added capabilities, and as non-root users. Browser authentication uses an HttpOnly session cookie and CSRF header; no bearer token is stored in browser storage.
 
 Path B is complete when the two health checks pass, the migration job exits successfully, and the frontend loads. Rollback means pinning the previous immutable image tag and running the documented migration rollback procedure; `docker compose down -v` is teardown and destroys persistent data, so it is not a rollback.
 

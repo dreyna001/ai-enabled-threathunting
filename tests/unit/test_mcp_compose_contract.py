@@ -63,4 +63,9 @@ def test_default_compose_keeps_backend_private_and_persists_uploads() -> None:
     assert "ports" not in backend
     assert backend["environment"]["THREAT_HUNTING_UPLOAD_ROOT"] == "/var/lib/threat-hunting/uploads"
     assert worker["environment"]["THREAT_HUNTING_UPLOAD_ROOT"] == "/var/lib/threat-hunting/uploads"
+    assert backend["environment"]["THREAT_HUNTING_SPLUNK_TOKEN_FILE"] == "/run/secrets/splunk_token"
+    assert backend["environment"]["THREAT_HUNTING_MODEL_API_KEY_FILE"] == "/run/secrets/model_api_key"
+    assert worker["environment"]["THREAT_HUNTING_MODEL_API_KEY_FILE"] == "/run/secrets/model_api_key"
+    assert {"database_url", "splunk_token", "model_api_key"} <= set(backend["secrets"])
+    assert {"database_url", "splunk_token", "model_api_key"} <= set(worker["secrets"])
     assert "mcp" in services and services["mcp"]["profiles"] == ["mcp"]

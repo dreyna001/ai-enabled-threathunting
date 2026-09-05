@@ -4,6 +4,7 @@ import {
   Hunt,
   HuntPlan,
   HuntResults,
+  JobStatus,
   JsonObject,
   ReportPreview,
   Session,
@@ -170,6 +171,7 @@ function Workspace({ session, initial, onBack }: { session: Session; initial: Hu
   const [hunt, setHunt] = useState(initial);
   const [results, setResults] = useState<HuntResults | null>(null);
   const [report, setReport] = useState<ReportPreview | null>(null);
+  const [job, setJob] = useState<JobStatus | null>(null);
   const [planBody, setPlanBody] = useState(dump(initial.plan));
   const [reportBody, setReportBody] = useState("");
   const [instruction, setInstruction] = useState("");
@@ -180,26 +182,54 @@ function Workspace({ session, initial, onBack }: { session: Session; initial: Hu
   useEffect(() => setPlanBody(dump(hunt.plan)), [hunt.plan]);
   useEffect(() => { if (report) setReportBody(dump(report.content)); }, [report]);
 
+  async function loadArtifacts(next: Hunt) {
+    if (!["report_draft", "finalized", "budget_exhausted"].includes(next.state)) return;
+    const [nextResults, nextReport] = await Promise.all([
+      workflowApi.results(session.access_token, next.hunt_id),
+      workflowApi.report(session.access_token, next.hunt_id),
+    ]);
+    setResults(nextResults);
+    setReport(nextReport);
+  }
+
   async function act(name: string, task: () => Promise<Hunt>) {
     setBusy(name);
     setError("");
     try {
       const next = await task();
       setHunt(next);
-      if (["report_draft", "finalized", "budget_exhausted"].includes(next.state)) {
-        const [nextResults, nextReport] = await Promise.all([
-          workflowApi.results(session.access_token, next.hunt_id),
-          workflowApi.report(session.access_token, next.hunt_id),
-        ]);
-        setResults(nextResults);
-        setReport(nextReport);
-      }
+      await loadArtifacts(next);
     } catch (error) {
       setError(errorMessage(error));
     } finally {
       setBusy("");
     }
   }
+
+  useEffect(() => {
+    if (!["queued", "running", "synthesizing"].includes(hunt.state)) return;
+    let active = true;
+    const poll = async () => {
+      try {
+        const [nextJob, nextHunt] = await Promise.all([
+          workflowApi.jobStatus(session.access_token, hunt.hunt_id),
+          workflowApi.getHunt(session.access_token, hunt.hunt_id),
+        ]);
+        if (!active) return;
+        setJob(nextJob);
+        setHunt(nextHunt);
+        await loadArtifacts(nextHunt);
+      } catch (error) {
+        if (active) setError(errorMessage(error));
+      }
+    };
+    void poll();
+    const timer = window.setInterval(() => void poll(), 2500);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [hunt.state, hunt.hunt_id, session.access_token]);
 
   function savePlan() {
     try {
@@ -245,7 +275,7 @@ function Workspace({ session, initial, onBack }: { session: Session; initial: Hu
       <div className="vs-grid">
         <section className="vs-card"><p className="vs-eyebrow">Data source</p><h2>Splunk discovery</h2>{hunt.discovery_snapshot ? <pre>{dump(hunt.discovery_snapshot)}</pre> : <p className="vs-empty">No metadata discovered.</p>}<button disabled={Boolean(busy) || hunt.state !== "created"} onClick={() => void act("discover", () => workflowApi.discover(session.access_token, hunt.hunt_id))}>{busy === "discover" ? "Discovering…" : "Run discovery"}</button></section>
         <section className="vs-card"><header><div><p className="vs-eyebrow">Analyst gate</p><h2>Plan review</h2></div><span>v{hunt.plan_version ?? 1}</span></header>{hunt.plan ? <><label>Plan JSON<textarea className="vs-code" rows={15} readOnly={!editable} value={planBody} onChange={(event) => setPlanBody(event.target.value)} /></label>{editable && <><button disabled={Boolean(busy)} onClick={savePlan}>Save edits</button><label>Revision instruction<textarea value={instruction} onChange={(event) => setInstruction(event.target.value)} /></label><button className="vs-secondary" disabled={Boolean(busy) || !instruction.trim()} onClick={() => void act("revise", () => workflowApi.revisePlan(session.access_token, hunt.hunt_id, instruction))}>Request revision</button><label>Analyst note<textarea value={note} onChange={(event) => setNote(event.target.value)} /></label><div className="vs-actions"><button disabled={Boolean(busy)} onClick={() => void act("approve", () => workflowApi.approvePlan(session.access_token, hunt.hunt_id, note))}>Approve plan</button><button className="vs-danger" disabled={Boolean(busy) || !note.trim()} onClick={() => void act("reject", () => workflowApi.rejectPlan(session.access_token, hunt.hunt_id, note))}>Reject plan</button></div></>}</> : <p className="vs-empty">Run discovery to generate a plan.</p>}</section>
-        <section className="vs-card vs-span"><p className="vs-eyebrow">Bounded action</p><h2>Execution</h2><p className="vs-muted">Uses only the approved, locked plan and limits.</p><div className="vs-actions"><button disabled={Boolean(busy) || hunt.state !== "approved"} onClick={() => void act("execute", () => workflowApi.execute(session.access_token, hunt.hunt_id))}>{busy === "execute" ? "Executing…" : "Execute approved hunt"}</button>{canCancel && <button className="vs-danger" disabled={Boolean(busy)} onClick={() => void act("cancel", () => workflowApi.cancel(session.access_token, hunt.hunt_id))}>{busy === "cancel" ? "Cancelling…" : "Cancel hunt"}</button>}</div></section>
+        <section className="vs-card vs-span"><p className="vs-eyebrow">Bounded action</p><h2>Execution</h2><p className="vs-muted">Uses only the approved, locked plan and limits.</p>{job && <p className="vs-muted" role="status">Job <code>{job.job_id}</code> · {job.status}{job.attempts === undefined ? "" : ` · attempt ${job.attempts}`}{job.last_error ? ` · ${job.last_error}` : ""}</p>}<div className="vs-actions"><button disabled={Boolean(busy) || hunt.state !== "approved"} onClick={() => void act("execute", () => workflowApi.execute(session.access_token, hunt.hunt_id))}>{busy === "execute" ? "Executing…" : "Execute approved hunt"}</button>{canCancel && <button className="vs-danger" disabled={Boolean(busy)} onClick={() => void act("cancel", () => workflowApi.cancel(session.access_token, hunt.hunt_id))}>{busy === "cancel" ? "Cancelling…" : "Cancel hunt"}</button>}</div></section>
         {results && <div className="vs-results vs-span">{(["findings", "evidence", "entities", "timeline"] as const).map((key) => <ResultCard key={key} title={key[0].toUpperCase() + key.slice(1)} items={results[key]} />)}</div>}
         {report && <section className="vs-card vs-span"><header><div><p className="vs-eyebrow">Final product</p><h2>Editable report</h2></div><span>{report.state} · v{report.version}</span></header><label>Structured report content<textarea className="vs-code" rows={20} readOnly={report.state === "finalized"} value={reportBody} onChange={(event) => setReportBody(event.target.value)} /></label><div className="vs-actions">{report.state !== "finalized" ? <><button disabled={Boolean(busy)} onClick={() => void saveReport(false)}>Save draft</button><button className="vs-secondary" disabled={Boolean(busy)} onClick={() => void saveReport(true)}>Save and finalize PDF</button></> : <button onClick={() => void workflowApi.downloadPdf(session.access_token, hunt.hunt_id).catch((error) => setError(errorMessage(error)))}>Download PDF</button>}</div></section>}
       </div>
@@ -275,6 +305,15 @@ function Dashboard({ session, onSelect, onSignOut }: { session: Session; onSelec
 export default function ThreatHuntApp() {
   const [session, setSession] = useState<Session | null>(null);
   const [selected, setSelected] = useState<Hunt | null>(null);
+
+  useEffect(() => {
+    const handleExpiry = () => {
+      setSession(null);
+      setSelected(null);
+    };
+    window.addEventListener("threat-hunt-auth-expired", handleExpiry);
+    return () => window.removeEventListener("threat-hunt-auth-expired", handleExpiry);
+  }, []);
   if (!session) return <Login onLogin={setSession} />;
   if (selected) return <Workspace session={session} initial={selected} onBack={() => setSelected(null)} />;
   return <Dashboard session={session} onSelect={setSelected} onSignOut={() => {
