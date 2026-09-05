@@ -176,11 +176,12 @@ class WorkflowService:
         self.demo_password = demo_password
         self.password_hasher = PasswordHasher()
         self.cookie_secure = not local_demo
-        self.jobs = JobService(engine)
         self.splunk_connector = splunk_connector
         self.model_adapter = model_adapter
         self.budget_limits = budget_limits or BudgetLimits()
         self.execution_config = _json_copy(execution_config or {})
+        self.deployment_scope_id = str(self.execution_config.get("deployment_scope_id", "default"))
+        self.jobs = JobService(engine, deployment_scope_id=self.deployment_scope_id)
 
     def initialize_demo(self) -> None:
         """Create local/test tables and the one documented demo principal."""
@@ -395,7 +396,13 @@ class WorkflowService:
         if not self.local_demo:
             now = _now()
             job = self.jobs.enqueue(owner_id, hunt_id, idempotency_key=f"hunt:{hunt_id}:execution", payload={"hunt_id": hunt_id, "plan_version": row["plan_version"]})
-            self._update(owner_id, hunt_id, expected_state=HuntState.APPROVED.value, state=HuntState.QUEUED.value, updated_at_utc=now)
+            try:
+                self._update(owner_id, hunt_id, expected_state=HuntState.APPROVED.value, state=HuntState.QUEUED.value, updated_at_utc=now)
+            except Exception:
+                # If the state transition loses a race or the write fails, do
+                # not leave an executable orphan in the queue.
+                self.jobs.request_cancel(owner_id, hunt_id)
+                raise
             return self.get_hunt(owner_id, hunt_id) | {"job": {key: value for key, value in job.items() if key not in {"payload"}}}
         now, query_id, evidence_id, finding_id = _now(), str(uuid4()), str(uuid4()), str(uuid4())
         evidence = {"evidence_id": evidence_id, "query_id": query_id, "source": "deterministic_local_demo", "event_time_utc": _rfc3339(now - timedelta(minutes=14)), "selected_result": {"host": "demo-workstation-17", "user": "demo\\analyst", "src_ip": "192.0.2.17", "EventCode": "4624"}, "disclaimer": "Deterministic local demo evidence; not a production observation."}
@@ -465,6 +472,10 @@ class WorkflowService:
             raise IntegrationUnavailable("demo executions are handled synchronously")
         if self.splunk_connector is None or self.model_adapter is None:
             raise IntegrationUnavailable("production Splunk and model adapters are not configured")
+        try:
+            self.jobs.require_lease(lease.job_id, lease.worker_id, generation=lease.generation, deployment_scope_id=self.deployment_scope_id)
+        except JobConflict as exc:
+            raise Conflict(str(exc)) from exc
         row = self._owned_row(lease.owner_id, lease.hunt_id)
         if row["state"] == HuntState.CANCELLED.value:
             return
@@ -509,12 +520,20 @@ class WorkflowService:
                 current = self._owned_row(row["owner_id"], lease.hunt_id)
                 if current["state"] == HuntState.CANCELLED.value:
                     return
+                try:
+                    self.jobs.require_lease(lease.job_id, lease.worker_id, generation=lease.generation, deployment_scope_id=self.deployment_scope_id)
+                except JobConflict as exc:
+                    raise Conflict(str(exc)) from exc
                 execution = executor.execute_query(proposal)
                 evidence = executor.evidence_for_query(execution, hunt_id=UUID(lease.hunt_id), proposal=proposal)
                 evidence_records.extend(item.model_dump(mode="json") for item in evidence)
                 query_records.append({"query_id": str(execution.query_id), "purpose": proposal.purpose, "spl": proposal.spl, "status": "completed", "result_count": len(execution.rows), "result_bytes": execution.result_bytes, "truncated": execution.truncated})
             results = {"findings": [], "evidence": evidence_records, "entities": [], "timeline": [], "queries": query_records, "usage": counters.model_dump(mode="json"), "mode": "production"}
             content = {"hypothesis": row["hypothesis"], "objective_and_scope": row["objective"], "data_sources_used": ["Configured Splunk"], "findings": [], "selected_evidence": evidence_records, "entities": [], "timeline": [], "coverage_and_limitations": list(plan.coverage_limitations), "conclusion_and_disposition": "Evidence is retained for analyst review; findings require contract-grounded synthesis.", "query_appendix": query_records}
+            try:
+                self.jobs.require_lease(lease.job_id, lease.worker_id, generation=lease.generation, deployment_scope_id=self.deployment_scope_id)
+            except JobConflict as exc:
+                raise Conflict(str(exc)) from exc
             self._update(row["owner_id"], lease.hunt_id, expected_state=HuntState.RUNNING.value, state=HuntState.SYNTHESIZING.value, results=results, updated_at_utc=_now())
             self._update(row["owner_id"], lease.hunt_id, expected_state=HuntState.SYNTHESIZING.value, state=HuntState.REPORT_DRAFT.value, report_id=str(uuid4()), report_version=1, report_state=HuntState.REPORT_DRAFT.value, report_content=content, updated_at_utc=_now())
         except Exception:

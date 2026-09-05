@@ -1,0 +1,43 @@
+"""Lease fencing, renewal, and deployment-scope isolation tests."""
+
+import time
+from datetime import datetime, timedelta, timezone
+
+import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.pool import StaticPool
+
+from threat_hunting.services.jobs import JobConflict, JobService, metadata
+from threat_hunting.worker.main import process_one
+
+
+def _service(scope: str = "scope-a", lease_seconds: int = 1) -> JobService:
+    engine = create_engine("sqlite+pysqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    metadata.create_all(engine)
+    return JobService(engine, deployment_scope_id=scope, lease_seconds=lease_seconds)
+
+
+def test_scope_isolation_and_generation_fence_stale_completion() -> None:
+    service = _service()
+    service.enqueue("owner", "other", idempotency_key="other", deployment_scope_id="scope-b")
+    service.enqueue("owner", "hunt", idempotency_key="hunt")
+    first = service.claim("worker")
+    assert first is not None and first.hunt_id == "hunt"
+    service.enqueue("owner", "hunt2", idempotency_key="hunt2")
+    now = datetime.now(timezone.utc)
+    old = service.claim("worker", now=now)
+    assert old is not None
+    service.recover_expired(now=now + timedelta(seconds=2))
+    replacement = service.claim("replacement", now=now + timedelta(seconds=2))
+    assert replacement is not None
+    assert replacement.generation > old.generation
+    with pytest.raises(JobConflict):
+        service.complete(old)
+
+
+def test_long_handler_renews_lease_before_completion() -> None:
+    service = _service(lease_seconds=1)
+    service.enqueue("owner", "hunt", idempotency_key="hunt")
+    assert process_one(service, "worker", handler=lambda _lease: time.sleep(1.4))
+    status = service.get_for_owner("owner", "hunt")
+    assert status is not None and status["status"] == "completed"

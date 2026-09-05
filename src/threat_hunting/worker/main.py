@@ -28,32 +28,45 @@ def process_one(
     handler: Callable[[JobLease], None] | None = None,
     now: datetime | None = None,
 ) -> bool:
-    """Claim and process one durable execution job.
-
-    A missing production adapter fails the job explicitly; it never pretends an
-    execution completed. Tests and deployments can inject the bounded handler
-    selected by the immutable execution configuration.
-    """
+    """Claim and process one job while renewing its fenced lease."""
     job_service.recover_expired(now=now)
     lease = job_service.claim(worker_id, now=now)
     if lease is None:
         return False
+    outcome: dict[str, BaseException | None] = {"error": None}
+
+    def invoke() -> None:
+        try:
+            if handler is None:
+                raise RuntimeError("production execution adapter is not configured")
+            handler(lease)
+        except BaseException as exc:  # propagate into the controlled completion path
+            outcome["error"] = exc
+
+    thread = threading.Thread(target=invoke, name=f"hunt-job-{lease.job_id}", daemon=True)
+    thread.start()
+    fenced = False
+    interval = max(0.1, job_service.lease_seconds / 3)
+    while thread.is_alive():
+        thread.join(timeout=interval)
+        if not thread.is_alive():
+            break
+        try:
+            lease = job_service.heartbeat(lease)
+        except JobConflict:
+            fenced = True
+    thread.join()
+    if fenced:
+        return True
+    error = outcome["error"]
     try:
-        if handler is None:
-            raise RuntimeError("production execution adapter is not configured")
-        handler(lease)
-    except Exception as exc:
-        try:
-            job_service.complete(lease, status="failed", error=str(exc)[:500], now=now)
-        except JobConflict:
-            # Cancellation or lease recovery won the race; late worker output
-            # must not overwrite the authoritative terminal state.
-            pass
-    else:
-        try:
+        if error is not None:
+            job_service.complete(lease, status="failed", error=str(error)[:500], now=now)
+        else:
             job_service.complete(lease, status="completed", now=now)
-        except JobConflict:
-            pass
+    except JobConflict:
+        # Cancellation or a replacement worker won the race.
+        pass
     return True
 
 
