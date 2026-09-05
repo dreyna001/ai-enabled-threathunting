@@ -6,6 +6,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.pool import StaticPool
 
 from threat_hunting.services.jobs import JobService, execution_jobs, metadata
+from threat_hunting.worker import main as worker_main
 from threat_hunting.worker.main import process_one
 
 
@@ -33,3 +34,8 @@ def test_cancelled_queued_job_is_not_claimed() -> None:
     service.enqueue("owner", "hunt", idempotency_key="one")
     assert service.request_cancel("owner", "hunt") == 1
     assert service.claim("worker") is None
+
+
+def test_worker_resolves_production_composition_symbols() -> None:
+    assert callable(worker_main.build_production_service)
+    assert callable(worker_main.build_worker_handler)

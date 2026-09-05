@@ -14,6 +14,7 @@ from threat_hunting.config import RuntimeSettings, load_database_url
 from threat_hunting.db import Database
 from threat_hunting.health import worker_id_from_environment
 from threat_hunting.services.jobs import JobConflict, JobLease, JobService
+from threat_hunting.services.runtime import build_production_service, build_worker_handler
 
 LOGGER = logging.getLogger(__name__)
 HEARTBEAT_INTERVAL_SECONDS = 15
