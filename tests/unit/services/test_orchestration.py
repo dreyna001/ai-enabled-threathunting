@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 from uuid import uuid4
 
@@ -169,3 +169,53 @@ def test_production_executor_never_submits_policy_rejected_spl() -> None:
     assert error.value.category is FailureCategory.QUERY_POLICY_REJECTED
     assert executor.counters.splunk_queries == 0
 
+
+
+class PollingConnector:
+    def __init__(self, statuses: list[dict[str, object]]) -> None:
+        self.statuses = statuses
+        self.status_calls = 0
+        self.fetch_calls = 0
+        self.cancelled: list[str] = []
+
+    def submit(self, _query: str, **_: object) -> str:
+        return "sid-poll"
+
+    def status(self, _job_id: str, **_: object) -> dict[str, object]:
+        self.status_calls += 1
+        return self.statuses[min(self.status_calls - 1, len(self.statuses) - 1)]
+
+    def fetch_results(self, _job_id: str, **_: object) -> list[dict[str, object]]:
+        self.fetch_calls += 1
+        return [{"host": "host-poll", "event_id": "evt-poll"}]
+
+    def cancel(self, job_id: str, **_: object) -> bool:
+        self.cancelled.append(job_id)
+        return True
+
+
+def test_production_executor_polls_until_terminal_and_records_sid_before_poll() -> None:
+    connector = PollingConnector([{"isDone": "0"}, {"isDone": "1"}])
+    ledger: list[tuple[str, str]] = []
+    executor = ProductionHuntExecutor(
+        connector, _executor().policy,
+        on_submitted=lambda query_id, sid, _proposal: ledger.append((str(query_id), sid)),
+    )
+    execution = executor.execute_query(_proposal())
+    assert connector.status_calls == 2
+    assert connector.fetch_calls == 1
+    assert ledger == [(str(execution.query_id), "sid-poll")]
+    assert connector.cancelled == []
+
+
+def test_production_executor_cancels_sid_when_deadline_is_exceeded() -> None:
+    connector = PollingConnector([{"isDone": "0"}])
+    executor = ProductionHuntExecutor(
+        connector, _executor().policy,
+        deadline=NOW - timedelta(seconds=1),
+    )
+    with pytest.raises(AdapterError) as error:
+        executor.execute_query(_proposal())
+    assert error.value.category is FailureCategory.HARD_TIMEOUT
+    assert connector.cancelled == ["sid-poll"]
+    assert executor.counters.failed_splunk_queries == 1

@@ -18,6 +18,7 @@ from sqlalchemy.engine import Engine
 
 from threat_hunting.domain.budgets import BudgetCounters, BudgetLimits
 from threat_hunting.domain.contracts import HuntPlan, QueryProposal
+from threat_hunting.domain.errors import FailureCategory
 from threat_hunting.domain.spl_policy import SPLPolicy
 from threat_hunting.domain.state import HuntState
 from threat_hunting.integrations.errors import AdapterError
@@ -108,6 +109,27 @@ def _json_copy(value: Any) -> Any:
 
 def _rfc3339(value: datetime) -> str:
     return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+class _HuntCancellationToken:
+    """Cooperative token backed by the durable hunt and fenced job lease."""
+
+    def __init__(self, service: "WorkflowService", lease: Any) -> None:
+        self.service = service
+        self.lease = lease
+
+    def is_cancelled(self) -> bool:
+        try:
+            self.service.jobs.require_lease(
+                self.lease.job_id,
+                self.lease.worker_id,
+                generation=getattr(self.lease, "generation", None),
+                deployment_scope_id=getattr(self.lease, "deployment_scope_id", None),
+            )
+            row = self.service._owned_row(self.lease.owner_id, self.lease.hunt_id)
+            return row["state"] == HuntState.CANCELLED.value
+        except (JobConflict, NotFound):
+            return True
 
 
 def _validate_report_content(content: Mapping[str, Any], results: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -375,6 +397,11 @@ class WorkflowService:
             raise Conflict("only a plan awaiting review can be approved")
         canonical = json.dumps(row["plan"], sort_keys=True, separators=(",", ":")).encode()
         approval = {"approval_id": str(uuid4()), "plan_version": row["plan_version"], "plan_sha256": hashlib.sha256(canonical).hexdigest(), "approved_by_user_id": owner_id, "approved_at_utc": _rfc3339(_now()), "analyst_note": note or "unknown"}
+        snapshot = row.get("discovery_snapshot") or {}
+        config_snapshot = snapshot.get("execution_config_snapshot") if isinstance(snapshot, Mapping) else None
+        if isinstance(config_snapshot, Mapping):
+            approval["execution_config_snapshot_id"] = config_snapshot.get("snapshot_id")
+            approval["execution_config_sha256"] = config_snapshot.get("sha256")
         self._update(owner_id, hunt_id, expected_state=HuntState.AWAITING_PLAN_REVIEW.value, expected_plan_version=int(row["plan_version"]), state=HuntState.APPROVED.value, approval=approval, updated_at_utc=_now())
         return self.get_hunt(owner_id, hunt_id)
 
@@ -394,8 +421,12 @@ class WorkflowService:
         if row["approval"]["plan_version"] != row["plan_version"]:
             raise Conflict("approved plan version no longer matches the current plan")
         if not self.local_demo:
+            snapshot = row.get("discovery_snapshot") or {}
+            config_snapshot = snapshot.get("execution_config_snapshot") if isinstance(snapshot, Mapping) else None
+            if not isinstance(config_snapshot, Mapping) or row["approval"].get("execution_config_snapshot_id") != config_snapshot.get("snapshot_id") or row["approval"].get("execution_config_sha256") != config_snapshot.get("sha256"):
+                raise Conflict("approved execution configuration binding is invalid")
             now = _now()
-            job = self.jobs.enqueue(owner_id, hunt_id, idempotency_key=f"hunt:{hunt_id}:execution", payload={"hunt_id": hunt_id, "plan_version": row["plan_version"]})
+            job = self.jobs.enqueue(owner_id, hunt_id, idempotency_key=f"hunt:{hunt_id}:execution", payload={"hunt_id": hunt_id, "plan_version": row["plan_version"], "plan_sha256": row["approval"]["plan_sha256"], "execution_config_snapshot_id": row["approval"].get("execution_config_snapshot_id"), "execution_config_sha256": row["approval"].get("execution_config_sha256")})
             try:
                 self._update(owner_id, hunt_id, expected_state=HuntState.APPROVED.value, state=HuntState.QUEUED.value, updated_at_utc=now)
             except Exception:
@@ -473,7 +504,12 @@ class WorkflowService:
         if self.splunk_connector is None or self.model_adapter is None:
             raise IntegrationUnavailable("production Splunk and model adapters are not configured")
         try:
-            self.jobs.require_lease(lease.job_id, lease.worker_id, generation=lease.generation, deployment_scope_id=self.deployment_scope_id)
+            self.jobs.require_lease(
+                lease.job_id,
+                lease.worker_id,
+                generation=getattr(lease, "generation", None),
+                deployment_scope_id=getattr(lease, "deployment_scope_id", None),
+            )
         except JobConflict as exc:
             raise Conflict(str(exc)) from exc
         row = self._owned_row(lease.owner_id, lease.hunt_id)
@@ -485,61 +521,87 @@ class WorkflowService:
         canonical = json.dumps(row["plan"], sort_keys=True, separators=(",", ":")).encode()
         if approval.get("plan_sha256") != hashlib.sha256(canonical).hexdigest() or approval.get("plan_version") != row["plan_version"]:
             raise Conflict("approved plan binding is invalid")
-        self._update(row["owner_id"], lease.hunt_id, expected_state=HuntState.QUEUED.value, state=HuntState.RUNNING.value, updated_at_utc=_now())
-        counters = BudgetCounters()
+        snapshot = row["discovery_snapshot"] or {}
+        config_snapshot = snapshot.get("execution_config_snapshot") if isinstance(snapshot, Mapping) else None
+        if not isinstance(config_snapshot, Mapping):
+            raise Conflict("execution configuration snapshot is missing")
+        if approval.get("execution_config_snapshot_id") != config_snapshot.get("snapshot_id") or approval.get("execution_config_sha256") != config_snapshot.get("sha256"):
+            raise Conflict("approved execution configuration binding is invalid")
         try:
-            snapshot = row["discovery_snapshot"] or {}
+            self.jobs.require_lease(lease.job_id, lease.worker_id, generation=getattr(lease, "generation", None), deployment_scope_id=getattr(lease, "deployment_scope_id", None))
+            self._update(row["owner_id"], lease.hunt_id, expected_state=HuntState.QUEUED.value, state=HuntState.RUNNING.value, updated_at_utc=_now())
+        except JobConflict as exc:
+            raise Conflict(str(exc)) from exc
+        counters = BudgetCounters()
+        token = _HuntCancellationToken(self, lease)
+        deadline = _now() + timedelta(seconds=self.budget_limits.hard_hunt_seconds)
+        try:
             discovery = snapshot.get("payload", snapshot) if isinstance(snapshot, Mapping) else {}
             plan = HuntPlan.model_validate(row["plan"])
-            earliest = plan.scope.earliest_utc
-            latest = plan.scope.latest_utc
+            if str(plan.execution_config_snapshot_id) != str(config_snapshot.get("snapshot_id")):
+                raise Conflict("plan execution configuration binding is invalid")
             policy = SPLPolicy(
                 discovered_indexes=set(str(item) for item in discovery.get("indexes", [])),
                 discovered_sourcetypes=set(str(item) for item in discovery.get("sourcetypes", [])),
                 discovered_fields=set(str(item) for item in discovery.get("fields", [])),
                 approved_indexes=set(plan.scope.indexes),
                 approved_sourcetypes=set(plan.scope.sourcetypes),
-                approved_earliest_utc=earliest,
-                approved_latest_utc=latest,
+                approved_earliest_utc=plan.scope.earliest_utc,
+                approved_latest_utc=plan.scope.latest_utc,
                 connection_id=str(self.execution_config.get("deployment_scope_id", "configured")),
                 execution_config_snapshot_id=str(plan.execution_config_snapshot_id),
                 max_bytes=self.budget_limits.max_cached_bytes_per_query,
                 timeout_seconds=self.budget_limits.splunk_query_timeout_seconds,
             )
             query_contract = TypeAdapter(list[QueryProposal])
-            runner = StrictModelRunner(self.model_adapter, counters=counters, limits=self.budget_limits)
+            runner = StrictModelRunner(self.model_adapter, counters=counters, limits=self.budget_limits, deadline=deadline, cancellation_token=token)
             proposals = runner.run(
                 query_contract,
                 user_payload={"approved_plan": plan.model_dump(mode="json"), "remaining_budget": self.budget_limits.model_dump(mode="json")},
                 contract_name="QueryProposal[]",
             )
-            executor = ProductionHuntExecutor(self.splunk_connector, policy, counters=counters, limits=self.budget_limits)
             query_records: list[dict[str, Any]] = []
             evidence_records: list[dict[str, Any]] = []
-            for proposal in proposals:
+
+            def on_submitted(query_id: UUID, sid: str, proposal: QueryProposal) -> None:
+                if token.is_cancelled():
+                    raise AdapterError(FailureCategory.CANCELLED, "operation cancelled", operation="splunk.submit")
+                self.jobs.require_lease(lease.job_id, lease.worker_id, generation=getattr(lease, "generation", None), deployment_scope_id=getattr(lease, "deployment_scope_id", None))
                 current = self._owned_row(row["owner_id"], lease.hunt_id)
-                if current["state"] == HuntState.CANCELLED.value:
-                    return
-                try:
-                    self.jobs.require_lease(lease.job_id, lease.worker_id, generation=lease.generation, deployment_scope_id=self.deployment_scope_id)
-                except JobConflict as exc:
-                    raise Conflict(str(exc)) from exc
+                result_payload = dict(current["results"] or {}) if isinstance(current["results"], Mapping) else {}
+                ledger = list(result_payload.get("query_ledger", []))
+                ledger.append({"query_id": str(query_id), "splunk_job_id": sid, "purpose": proposal.purpose, "spl": proposal.spl, "status": "submitted", "submitted_at_utc": _rfc3339(_now())})
+                result_payload["query_ledger"] = ledger
+                result_payload["usage"] = counters.model_dump(mode="json")
+                result_payload["mode"] = "production"
+                self._update(row["owner_id"], lease.hunt_id, expected_state=HuntState.RUNNING.value, results=result_payload, updated_at_utc=_now())
+
+            executor = ProductionHuntExecutor(self.splunk_connector, policy, counters=counters, limits=self.budget_limits, cancellation_token=token, deadline=deadline, on_submitted=on_submitted)
+            for proposal in proposals:
+                if token.is_cancelled():
+                    raise AdapterError(FailureCategory.CANCELLED, "operation cancelled", operation="splunk.submit")
                 execution = executor.execute_query(proposal)
                 evidence = executor.evidence_for_query(execution, hunt_id=UUID(lease.hunt_id), proposal=proposal)
                 evidence_records.extend(item.model_dump(mode="json") for item in evidence)
-                query_records.append({"query_id": str(execution.query_id), "purpose": proposal.purpose, "spl": proposal.spl, "status": "completed", "result_count": len(execution.rows), "result_bytes": execution.result_bytes, "truncated": execution.truncated})
-            results = {"findings": [], "evidence": evidence_records, "entities": [], "timeline": [], "queries": query_records, "usage": counters.model_dump(mode="json"), "mode": "production"}
+                query_records.append({"query_id": str(execution.query_id), "splunk_job_id": execution.splunk_job_id, "purpose": proposal.purpose, "spl": proposal.spl, "status": "completed", "result_count": len(execution.rows), "result_bytes": execution.result_bytes, "truncated": execution.truncated})
+            if token.is_cancelled():
+                raise AdapterError(FailureCategory.CANCELLED, "operation cancelled", operation="execution.complete")
+            results = {"findings": [], "evidence": evidence_records, "entities": [], "timeline": [], "queries": query_records, "query_ledger": query_records, "usage": counters.model_dump(mode="json"), "mode": "production"}
             content = {"hypothesis": row["hypothesis"], "objective_and_scope": row["objective"], "data_sources_used": ["Configured Splunk"], "findings": [], "selected_evidence": evidence_records, "entities": [], "timeline": [], "coverage_and_limitations": list(plan.coverage_limitations), "conclusion_and_disposition": "Evidence is retained for analyst review; findings require contract-grounded synthesis.", "query_appendix": query_records}
-            try:
-                self.jobs.require_lease(lease.job_id, lease.worker_id, generation=lease.generation, deployment_scope_id=self.deployment_scope_id)
-            except JobConflict as exc:
-                raise Conflict(str(exc)) from exc
+            self.jobs.require_lease(lease.job_id, lease.worker_id, generation=getattr(lease, "generation", None), deployment_scope_id=getattr(lease, "deployment_scope_id", None))
             self._update(row["owner_id"], lease.hunt_id, expected_state=HuntState.RUNNING.value, state=HuntState.SYNTHESIZING.value, results=results, updated_at_utc=_now())
+            self.jobs.require_lease(lease.job_id, lease.worker_id, generation=getattr(lease, "generation", None), deployment_scope_id=getattr(lease, "deployment_scope_id", None))
             self._update(row["owner_id"], lease.hunt_id, expected_state=HuntState.SYNTHESIZING.value, state=HuntState.REPORT_DRAFT.value, report_id=str(uuid4()), report_version=1, report_state=HuntState.REPORT_DRAFT.value, report_content=content, updated_at_utc=_now())
         except Exception:
             try:
-                self._update(row["owner_id"], lease.hunt_id, expected_state=HuntState.RUNNING.value, state=HuntState.FAILED.value, results={"usage": counters.model_dump(mode="json"), "mode": "production"}, updated_at_utc=_now())
-            except Conflict:
+                self.jobs.require_lease(lease.job_id, lease.worker_id, generation=getattr(lease, "generation", None), deployment_scope_id=getattr(lease, "deployment_scope_id", None))
+                current = self._owned_row(row["owner_id"], lease.hunt_id)
+                if current["state"] == HuntState.RUNNING.value:
+                    failure_results = dict(current["results"] or {}) if isinstance(current["results"], Mapping) else {}
+                    failure_results["usage"] = counters.model_dump(mode="json")
+                    failure_results["mode"] = "production"
+                    self._update(row["owner_id"], lease.hunt_id, expected_state=HuntState.RUNNING.value, state=HuntState.FAILED.value, results=failure_results, updated_at_utc=_now())
+            except (Conflict, JobConflict):
                 pass
             raise
 
