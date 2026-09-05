@@ -30,7 +30,7 @@ Readiness must report the database, migration revision, storage, and configurati
 Run this only with written approval for a non-production pilot and a synthetic dataset.
 
 1. Confirm Splunk TLS verification, least-privilege token, URL, namespace, and network reachability.
-2. Confirm the model provider secret is mounted through the approved secret-file boundary and the configured model is qualified.
+2. Confirm the model provider secret is mounted through the approved secret-file boundary and the configured model is qualified. Set `model.data_boundary: external` and record `execution.provider_data_handling_approval_ref` for an external provider; use `local` only for a deployment-owned LiteLLM-compatible endpoint.
 3. Sign in, create a synthetic hunt, run discovery, approve the generated plan, and execute it.
 4. Confirm the query ledger contains only approved bounded searches, then exercise cancellation and budget exhaustion.
 5. Confirm findings cite retained evidence and the finalized report downloads as a PDF.

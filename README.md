@@ -52,7 +52,7 @@ Path B is complete when the two health checks pass, the migration job exits succ
 
 ## Path C — live Splunk/OpenAI qualification
 
-Use this path only after Path B passes and an operator has approved a non-production pilot. Mount the approved Splunk token and model-provider secret through protected files; never place credentials in YAML, `.env`, command arguments, images, or Git. Configure `splunk.url`, `model.provider`, `model.model_name`, and the provider endpoint in a customer-owned runtime file.
+Use this path only after Path B passes and an operator has approved a non-production pilot. Mount the approved Splunk token and model-provider secret through protected files; never place credentials in YAML, `.env`, command arguments, images, or Git. Configure `splunk.url`, `model.provider`, `model.model_name`, the provider endpoint, and `model.data_boundary` in a customer-owned runtime file. External providers also require `execution.provider_data_handling_approval_ref`; only an explicitly local `litellm` endpoint may omit it.
 
 ```bash
 docker compose --env-file .env -f deploy/docker/compose.yml up -d

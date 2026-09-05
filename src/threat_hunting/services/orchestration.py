@@ -297,8 +297,14 @@ class ProductionHuntExecutor:
         except Exception:
             pass
 
-    def execute_query(self, proposal: QueryProposal) -> QueryExecution:
-        """Validate and execute one query, enforcing result and byte limits."""
+    def execute_query(
+        self,
+        proposal: QueryProposal,
+        *,
+        query_id: UUID | None = None,
+        existing_job_id: str | None = None,
+    ) -> QueryExecution:
+        """Validate and execute or resume one query within fixed limits."""
 
         validation = self.policy.validate(proposal)
         if not validation.allowed:
@@ -307,23 +313,27 @@ class ProductionHuntExecutor:
                 "SPL query rejected by deterministic policy",
                 operation="splunk.validate_query",
             )
-        if not self.counters.can_start_query(self.limits):
-            raise AdapterError(
-                FailureCategory.BUDGET_EXHAUSTED,
-                "Splunk query budget exhausted",
-                operation="splunk.submit",
-            )
-        self.counters.record_splunk_query()
-        job_id: str | None = None
+        selected_query_id = query_id or validation.query_id
+        job_id = existing_job_id
+        if job_id is None:
+            if not self.counters.can_start_query(self.limits):
+                raise AdapterError(
+                    FailureCategory.BUDGET_EXHAUSTED,
+                    "Splunk query budget exhausted",
+                    operation="splunk.submit",
+                )
+            self.counters.record_splunk_query()
         try:
-            job_id = self.connector.submit(
-                validation.normalized_spl,
-                cancellation_token=self.cancellation_token,
-                earliest=proposal.earliest_utc,
-                latest=proposal.latest_utc,
-            )
-            if self.on_submitted is not None:
-                self.on_submitted(validation.query_id, job_id, proposal)
+            if job_id is None:
+                job_id = self.connector.submit(
+                    validation.normalized_spl,
+                    cancellation_token=self.cancellation_token,
+                    earliest=proposal.earliest_utc,
+                    latest=proposal.latest_utc,
+                    **({"id": str(selected_query_id)} if query_id is not None else {}),
+                )
+                if self.on_submitted is not None:
+                    self.on_submitted(selected_query_id, job_id, proposal)
             final_status: Mapping[str, Any] = {}
             deadline = self.deadline or (_utc_now() + timedelta(seconds=self.limits.splunk_query_timeout_seconds))
             while True:
@@ -350,9 +360,9 @@ class ProductionHuntExecutor:
         except Exception:
             if job_id is not None:
                 self._cancel_after_sid(job_id)
-            self.counters.failed_splunk_queries += 1
+            if self.counters.failed_splunk_queries < self.counters.splunk_queries:
+                self.counters.failed_splunk_queries += 1
             raise
-        status = final_status
         normalized_rows = tuple(dict(row) for row in rows)
         result_bytes = len(_canonical(normalized_rows))
         if result_bytes > validation.enforced_limits.max_bytes:
@@ -363,9 +373,9 @@ class ProductionHuntExecutor:
             )
         self.counters.record_result(rows=len(normalized_rows), bytes_=result_bytes)
         return QueryExecution(
-            query_id=validation.query_id,
+            query_id=selected_query_id,
             splunk_job_id=job_id,
-            status=status,
+            status=final_status,
             rows=normalized_rows,
             result_bytes=result_bytes,
             truncated=len(normalized_rows) >= proposal.max_results,

@@ -71,6 +71,7 @@ class ModelSettings(StrictModel):
     provider: Literal["openai", "bedrock", "litellm"]
     model_name: str = Field(min_length=1, max_length=200)
     endpoint: str | None = None
+    data_boundary: Literal["external", "local"] = "external"
 
 
 class SplunkSettings(StrictModel):
@@ -250,7 +251,6 @@ class ExecutionSettings(StrictModel):
             "mcp_client_cert_path": self.mcp_client_cert_path,
             "mcp_client_key_path": self.mcp_client_key_path,
             "mcp_service_subject": self.mcp_service_subject,
-            "provider_data_handling_approval_ref": self.provider_data_handling_approval_ref,
         }
         missing = ", ".join(name for name, item in required.items() if item in (None, ""))
         if missing:
@@ -313,6 +313,10 @@ class RuntimeSettings(StrictModel):
 
     @model_validator(mode="after")
     def production_cannot_disable_tls(self) -> "RuntimeSettings":
+        if self.model.data_boundary == "local" and self.model.provider != "litellm":
+            raise ValueError("the local model data boundary requires the litellm provider")
+        if self.model.data_boundary == "external" and self.execution.provider_data_handling_approval_ref is None:
+            raise ValueError("external model providers require provider_data_handling_approval_ref")
         if self.environment == "production" and not self.tls.verify:
             raise ValueError("TLS verification cannot be disabled in production")
         if self.environment == "production" and self.execution.mode == "mcp":

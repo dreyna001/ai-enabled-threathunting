@@ -16,9 +16,10 @@ from typing import Any
 from uuid import uuid4
 
 import yaml
-from sqlalchemy import JSON, Column, DateTime, Integer, MetaData, String, Table, Text, func, select
+from sqlalchemy import JSON, Column, DateTime, Integer, MetaData, String, Table, Text, select, update
 from sqlalchemy.engine import Engine
-
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 metadata = MetaData()
 uploads = Table(
@@ -39,13 +40,18 @@ uploads = Table(
     Column("extracted_text", Text, nullable=False, default=""),
     Column("metadata", JSON, nullable=True),
 )
+upload_quotas = Table(
+    "upload_quotas", metadata,
+    Column("owner_id", String(36), primary_key=True),
+    Column("hunt_id", String(36), primary_key=True),
+    Column("file_count", Integer, nullable=False, default=0),
+    Column("total_bytes", Integer, nullable=False, default=0),
+)
 
 SUPPORTED_TYPES = {".pdf": "application/pdf", ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document", ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", ".csv": "text/csv", ".tsv": "text/tab-separated-values", ".txt": "text/plain", ".md": "text/markdown", ".json": "application/json", ".yaml": "application/yaml", ".yml": "application/yaml"}
 
-
 class UploadError(ValueError):
     """A safe, user-facing upload rejection."""
-
 
 @dataclass(frozen=True, slots=True)
 class UploadLimits:
@@ -56,7 +62,6 @@ class UploadLimits:
     max_zip_entries: int = 2000
     max_uncompressed_bytes: int = 100 * 1024 * 1024
 
-
 class UploadService:
     """Persist uploads under generated IDs after complete bounded validation."""
 
@@ -66,6 +71,41 @@ class UploadService:
         self.limits = limits or UploadLimits()
         self.root.mkdir(parents=True, exist_ok=True)
 
+    @staticmethod
+    def _quota_insert(connection: Any):
+        if connection.dialect.name == "postgresql":
+            return postgresql_insert(upload_quotas)
+        if connection.dialect.name == "sqlite":
+            return sqlite_insert(upload_quotas)
+        raise RuntimeError("upload quotas require PostgreSQL or SQLite")
+
+    def _reserve_quota(self, connection: Any, owner_id: str, hunt_id: str, byte_size: int) -> None:
+        connection.execute(
+            self._quota_insert(connection)
+            .values(
+                owner_id=owner_id,
+                hunt_id=hunt_id,
+                file_count=0,
+                total_bytes=0,
+            )
+            .on_conflict_do_nothing(index_elements=[upload_quotas.c.owner_id, upload_quotas.c.hunt_id])
+        )
+        reserved = connection.execute(
+            update(upload_quotas)
+            .where(
+                upload_quotas.c.owner_id == owner_id,
+                upload_quotas.c.hunt_id == hunt_id,
+                upload_quotas.c.file_count < self.limits.file_count,
+                upload_quotas.c.total_bytes + byte_size <= self.limits.total_bytes,
+            )
+            .values(
+                file_count=upload_quotas.c.file_count + 1,
+                total_bytes=upload_quotas.c.total_bytes + byte_size,
+            )
+        )
+        if reserved.rowcount != 1:
+            raise UploadError("upload quota exceeded")
+
     def save(self, owner_id: str, hunt_id: str, filename: str, content: bytes, *, content_type: str | None = None) -> dict[str, Any]:
         suffix = Path(filename).suffix.casefold()
         self._validate_filename(filename, suffix)
@@ -73,12 +113,6 @@ class UploadService:
             raise UploadError("unsupported upload type")
         if len(content) > self.limits.per_file_bytes:
             raise UploadError("upload exceeds the per-file size limit")
-        with self.engine.connect() as connection:
-            count, total = connection.execute(select(func.count(), func.coalesce(func.sum(uploads.c.byte_size), 0)).where(uploads.c.owner_id == owner_id, uploads.c.hunt_id == hunt_id)).one()
-        if int(count) >= self.limits.file_count:
-            raise UploadError("upload file-count limit exceeded")
-        if int(total) + len(content) > self.limits.total_bytes:
-            raise UploadError("upload total-size limit exceeded")
         detected, text, metadata = self._extract(suffix, content, content_type)
         if len(text) > self.limits.extracted_text_characters:
             raise UploadError("extracted text exceeds the configured limit")
@@ -95,6 +129,7 @@ class UploadService:
                 os.fsync(handle.fileno())
             values = {"upload_id": upload_id, "owner_id": owner_id, "hunt_id": hunt_id, "original_filename": filename, "detected_type": detected, "byte_size": len(content), "sha256": hashlib.sha256(content).hexdigest(), "uploader_id": owner_id, "uploaded_at_utc": now, "parser_version": "builtin-1", "extraction_status": "complete", "extraction_error": None, "storage_path": relative, "extracted_text": text, "metadata": metadata}
             with self.engine.begin() as connection:
+                self._reserve_quota(connection, owner_id, hunt_id, len(content))
                 connection.execute(uploads.insert().values(**values))
         except Exception:
             target.unlink(missing_ok=True)
@@ -178,6 +213,5 @@ class UploadService:
         if not text.strip():
             raise UploadError("document contains no extractable text")
         return text
-
 
 __all__ = ["UploadError", "UploadLimits", "UploadService", "SUPPORTED_TYPES", "metadata", "uploads"]

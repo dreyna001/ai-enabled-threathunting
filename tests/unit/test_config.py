@@ -21,6 +21,7 @@ def valid_config(tmp_path: Path) -> dict[str, object]:
         },
         "splunk": {"url": "https://splunk.test:8089"},
         "model": {"provider": "openai", "model_name": "test-model"},
+        "execution": {"provider_data_handling_approval_ref": "approval-test"},
     }
 
 
@@ -51,6 +52,42 @@ def test_settings_reject_unknown_keys(tmp_path: Path) -> None:
     value = valid_config(tmp_path)
     value["unexpected"] = True
     with pytest.raises(ValueError):
+        RuntimeSettings.model_validate(value)
+
+
+def test_external_provider_requires_data_handling_approval(tmp_path: Path) -> None:
+    value = valid_config(tmp_path)
+    value["execution"] = {}
+
+    with pytest.raises(ValueError, match="provider_data_handling_approval_ref"):
+        RuntimeSettings.model_validate(value)
+
+
+def test_explicit_local_litellm_provider_does_not_require_external_approval(tmp_path: Path) -> None:
+    value = valid_config(tmp_path)
+    value["model"] = {
+        "provider": "litellm",
+        "model_name": "local-model",
+        "endpoint": "https://model.internal/v1",
+        "data_boundary": "local",
+    }
+    value["execution"] = {}
+
+    settings = RuntimeSettings.model_validate(value)
+
+    assert settings.model.data_boundary == "local"
+    assert settings.execution.provider_data_handling_approval_ref is None
+
+
+def test_local_boundary_rejects_external_provider_kind(tmp_path: Path) -> None:
+    value = valid_config(tmp_path)
+    value["model"] = {
+        "provider": "openai",
+        "model_name": "test-model",
+        "data_boundary": "local",
+    }
+
+    with pytest.raises(ValueError, match="local model data boundary"):
         RuntimeSettings.model_validate(value)
 
 
@@ -180,3 +217,5 @@ def test_production_service_uses_configured_upload_limits(tmp_path: Path, monkey
     assert service.upload_limits.file_count == 2
     assert service.upload_limits.total_bytes == 20
     assert service.upload_limits.extracted_text_characters == 30
+    assert service.execution_config["provider_data_boundary"] == "external"
+    assert service.execution_config["provider_data_handling_approval_ref"] == "approval-test"

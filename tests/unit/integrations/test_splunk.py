@@ -288,3 +288,25 @@ def test_tls_and_endpoint_validation_rejects_unsafe_configuration() -> None:
         SplunkConnectionConfig(endpoint="http://splunk.example", token="x")
     with pytest.raises(ValueError):
         SplunkConnectionConfig(endpoint="https://splunk.example", verify_tls=False, token="x")
+
+
+def test_submit_reuses_existing_requested_job_id() -> None:
+    class Job:
+        name = "query-1"
+
+    class Jobs(dict[str, Job]):
+        create_calls = 0
+
+        def create(self, _query: str, **_: object) -> Job:
+            self.create_calls += 1
+            raise AssertionError("an existing deterministic job must not be resubmitted")
+
+    class Client(FakeSplunkClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.jobs = Jobs({"query-1": Job()})
+
+    client = Client()
+
+    assert make_connector(client).submit("search index=main", id="query-1") == "query-1"
+    assert client.jobs.create_calls == 0

@@ -111,6 +111,8 @@ def build_production_service(engine: Engine, settings: RuntimeSettings) -> Workf
             "provider": settings.model.provider,
             "model_name": settings.model.model_name,
             "endpoint": settings.model.endpoint or "configured_provider_default",
+            "provider_data_boundary": settings.model.data_boundary,
+            "provider_data_handling_approval_ref": settings.execution.provider_data_handling_approval_ref,
             "deployment_scope_id": settings.execution.deployment_scope_id,
             "splunk_app_namespace": settings.splunk.app_namespace,
             "splunk_poll_interval_seconds": settings.hunt_limits.splunk_poll_interval_seconds,

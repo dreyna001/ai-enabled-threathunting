@@ -1,6 +1,7 @@
 """HTTP contract for the persisted threat-hunt vertical slice."""
 
 from __future__ import annotations
+import ipaddress
 
 from datetime import datetime, timezone
 from typing import Any
@@ -26,6 +27,20 @@ class StrictRequest(BaseModel):
 class LoginRequest(StrictRequest):
     username: str = Field(min_length=1, max_length=100)
     password: str = Field(min_length=1, max_length=200)
+
+
+def _login_client_key(request: Request) -> str:
+    """Return a validated proxy-supplied or direct client address."""
+
+    candidates = (request.headers.get("x-real-ip"), request.client.host if request.client else None)
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        try:
+            return ipaddress.ip_address(candidate.strip()).compressed
+        except ValueError:
+            continue
+    return "unknown"
 
 
 class CreateHuntRequest(StrictRequest):
@@ -129,9 +144,9 @@ def current_user_id(
 
 
 @router.post("/auth/login")
-def login(request: LoginRequest, response: Response, service: WorkflowService = Depends(workflow_service)) -> dict[str, Any]:
+def login(payload: LoginRequest, response: Response, http_request: Request, service: WorkflowService = Depends(workflow_service)) -> dict[str, Any]:
     try:
-        session, user = auth_service(service).login(request.username, request.password)
+        session, user = auth_service(service).login(payload.username, payload.password, client_key=_login_client_key(http_request))
     except PermissionError as exc:
         raise HTTPException(status_code=429, detail=str(exc)) from exc
     except (Validation, ValueError) as exc:

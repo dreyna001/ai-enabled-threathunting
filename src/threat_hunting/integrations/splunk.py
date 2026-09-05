@@ -678,10 +678,18 @@ class SplunkConnector:
     def submit(self, query: str, *, cancellation_token: Any = None, **kwargs: Any) -> str:
         query = self.validate_query(query)
         client = self._get_client()
+        requested_job_id = kwargs.get("id")
+        if requested_job_id is not None and (not isinstance(requested_job_id, str) or not requested_job_id):
+            raise AdapterError(FailureCategory.VALIDATION_FAILURE, "Splunk job id must be non-empty", operation="submit")
 
         def submit_job() -> Any:
             jobs = getattr(client, "jobs", None)
             if jobs is not None and hasattr(jobs, "create"):
+                if requested_job_id is not None:
+                    try:
+                        return jobs[requested_job_id]
+                    except (KeyError, TypeError):
+                        pass
                 return jobs.create(query, **kwargs)
             search = getattr(client, "search", None)
             if callable(search):
@@ -693,6 +701,11 @@ class SplunkConnector:
         if not isinstance(job_id, str) or not job_id:
             if isinstance(job, Mapping):
                 job_id = job.get("sid") or job.get("name")
+        if requested_job_id is not None and job_id != requested_job_id:
+            cancel = getattr(job, "cancel", None)
+            if callable(cancel):
+                cancel()
+            raise AdapterError(FailureCategory.UNKNOWN, "Splunk did not honor the requested job id", operation="submit")
         if not isinstance(job_id, str) or not job_id:
             raise AdapterError(FailureCategory.UNKNOWN, "Splunk did not return a job identifier", operation="submit")
         return job_id
