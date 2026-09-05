@@ -1,10 +1,12 @@
 """Lease fencing, renewal, and deployment-scope isolation tests."""
 
 import time
+import threading
 from datetime import datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy import create_engine
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.pool import StaticPool
 
 from threat_hunting.services.jobs import JobConflict, JobService, metadata
@@ -41,3 +43,31 @@ def test_long_handler_renews_lease_before_completion() -> None:
     assert process_one(service, "worker", handler=lambda _lease: time.sleep(1.4))
     status = service.get_for_owner("owner", "hunt")
     assert status is not None and status["status"] == "completed"
+
+
+def test_active_hunt_cap_blocks_second_claim_in_scope() -> None:
+    service = _service(lease_seconds=10)
+    service.max_active_hunts = 1
+    service.enqueue("owner", "hunt-1", idempotency_key="cap-1")
+    service.enqueue("owner", "hunt-2", idempotency_key="cap-2")
+    assert service.claim("worker-1") is not None
+    assert service.claim("worker-2") is None
+
+
+def test_heartbeat_database_failure_signals_handler_before_return() -> None:
+    service = _service(lease_seconds=1)
+    service.enqueue("owner", "hunt", idempotency_key="heartbeat")
+    finished = threading.Event()
+
+    def broken_heartbeat(_lease):
+        raise SQLAlchemyError("database unavailable")
+
+    service.heartbeat = broken_heartbeat  # type: ignore[method-assign]
+
+    def handler(lease):
+        while not lease.cancellation_token.is_cancelled():
+            time.sleep(0.01)
+        finished.set()
+
+    assert process_one(service, "worker", handler=handler)
+    assert finished.is_set()

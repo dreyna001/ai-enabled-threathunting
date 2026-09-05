@@ -29,6 +29,7 @@ from threat_hunting.services.orchestration import (
     ProductionHuntExecutor,
     ProductionOrchestrator,
     StrictModelRunner,
+    sha256_json,
 )
 from threat_hunting.services.jobs import JobConflict, JobService
 
@@ -119,6 +120,9 @@ class _HuntCancellationToken:
         self.lease = lease
 
     def is_cancelled(self) -> bool:
+        signal = getattr(self.lease, "cancellation_token", None)
+        if signal is not None and signal.is_cancelled():
+            return True
         try:
             self.service.jobs.require_lease(
                 self.lease.job_id,
@@ -202,8 +206,14 @@ class WorkflowService:
         self.model_adapter = model_adapter
         self.budget_limits = budget_limits or BudgetLimits()
         self.execution_config = _json_copy(execution_config or {})
+        raw_poll_interval = self.execution_config.get("splunk_poll_interval_seconds", 1.0)
+        if isinstance(raw_poll_interval, bool):
+            raise ValueError("splunk_poll_interval_seconds must be a positive number")
+        self.splunk_poll_interval_seconds = float(raw_poll_interval)
+        if not 0 < self.splunk_poll_interval_seconds <= 30:
+            raise ValueError("splunk_poll_interval_seconds must be greater than 0 and at most 30")
         self.deployment_scope_id = str(self.execution_config.get("deployment_scope_id", "default"))
-        self.jobs = JobService(engine, deployment_scope_id=self.deployment_scope_id)
+        self.jobs = JobService(engine, deployment_scope_id=self.deployment_scope_id, max_active_hunts=self.budget_limits.max_active_hunts)
 
     def initialize_demo(self) -> None:
         """Create local/test tables and the one documented demo principal."""
@@ -330,7 +340,7 @@ class WorkflowService:
         try:
             orchestrator = ProductionOrchestrator(self.splunk_connector, self.model_adapter, limits=self.budget_limits)
             discovery, discovery_snapshot = orchestrator.discover()
-            execution_snapshot = orchestrator.execution_snapshot(self.execution_config)
+            execution_snapshot = orchestrator.execution_snapshot(self._execution_binding_payload())
             plan_id, snapshot_id, config_id = uuid4(), discovery_snapshot.snapshot_id, execution_snapshot.snapshot_id
             context = {
                 "hunt_id": str(row["hunt_id"]),
@@ -425,6 +435,7 @@ class WorkflowService:
             config_snapshot = snapshot.get("execution_config_snapshot") if isinstance(snapshot, Mapping) else None
             if not isinstance(config_snapshot, Mapping) or row["approval"].get("execution_config_snapshot_id") != config_snapshot.get("snapshot_id") or row["approval"].get("execution_config_sha256") != config_snapshot.get("sha256"):
                 raise Conflict("approved execution configuration binding is invalid")
+            self._validate_execution_snapshot(config_snapshot)
             now = _now()
             job = self.jobs.enqueue(owner_id, hunt_id, idempotency_key=f"hunt:{hunt_id}:execution", payload={"hunt_id": hunt_id, "plan_version": row["plan_version"], "plan_sha256": row["approval"]["plan_sha256"], "execution_config_snapshot_id": row["approval"].get("execution_config_snapshot_id"), "execution_config_sha256": row["approval"].get("execution_config_sha256")})
             try:
@@ -527,6 +538,7 @@ class WorkflowService:
             raise Conflict("execution configuration snapshot is missing")
         if approval.get("execution_config_snapshot_id") != config_snapshot.get("snapshot_id") or approval.get("execution_config_sha256") != config_snapshot.get("sha256"):
             raise Conflict("approved execution configuration binding is invalid")
+        self._validate_execution_snapshot(config_snapshot)
         try:
             self.jobs.require_lease(lease.job_id, lease.worker_id, generation=getattr(lease, "generation", None), deployment_scope_id=getattr(lease, "deployment_scope_id", None))
             self._update(row["owner_id"], lease.hunt_id, expected_state=HuntState.QUEUED.value, state=HuntState.RUNNING.value, updated_at_utc=_now())
@@ -576,7 +588,7 @@ class WorkflowService:
                 result_payload["mode"] = "production"
                 self._update(row["owner_id"], lease.hunt_id, expected_state=HuntState.RUNNING.value, results=result_payload, updated_at_utc=_now())
 
-            executor = ProductionHuntExecutor(self.splunk_connector, policy, counters=counters, limits=self.budget_limits, cancellation_token=token, deadline=deadline, on_submitted=on_submitted)
+            executor = ProductionHuntExecutor(self.splunk_connector, policy, counters=counters, limits=self.budget_limits, cancellation_token=token, deadline=deadline, on_submitted=on_submitted, poll_interval_seconds=self.splunk_poll_interval_seconds)
             for proposal in proposals:
                 if token.is_cancelled():
                     raise AdapterError(FailureCategory.CANCELLED, "operation cancelled", operation="splunk.submit")
@@ -652,6 +664,22 @@ class WorkflowService:
         if not normalized["questions"] or not isinstance(normalized["scope"], dict):
             raise Validation("plan requires scope and at least one question")
         return normalized
+
+    def _execution_binding_payload(self) -> dict[str, Any]:
+        """Return the exact non-secret configuration and budget binding."""
+        return {
+            "execution_config": _json_copy(self.execution_config),
+            "budget_limits": self.budget_limits.model_dump(mode="json"),
+        }
+
+    def _validate_execution_snapshot(self, snapshot: Mapping[str, Any]) -> None:
+        """Fail closed when approved config or budget limits drift."""
+        expected_payload = self._execution_binding_payload()
+        if snapshot.get("payload") != expected_payload:
+            raise Conflict("approved execution configuration content no longer matches current settings")
+        expected_hash = sha256_json({"kind": "execution_configuration", "payload": expected_payload})
+        if snapshot.get("sha256") != expected_hash:
+            raise Conflict("approved execution configuration hash is invalid")
 
     def _owned_row(self, owner_id: str, hunt_id: str) -> Mapping[str, Any]:
         with self.engine.connect() as connection:

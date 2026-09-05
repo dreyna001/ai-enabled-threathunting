@@ -53,7 +53,10 @@ def process_one(
             break
         try:
             lease = job_service.heartbeat(lease)
-        except JobConflict:
+        except (JobConflict, SQLAlchemyError):
+            # Fence the handler and wait for it to stop before this worker
+            # returns to polling; no orphan thread may keep external work alive.
+            lease.cancellation_token.cancel()
             fenced = True
     thread.join()
     if fenced:

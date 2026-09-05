@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+import threading
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
@@ -34,6 +35,26 @@ class JobConflict(RuntimeError):
     """A job cannot be claimed or transitioned by the caller."""
 
 
+class LeaseCancellation:
+    """Process-local cooperative signal for a fenced or cancelled handler."""
+
+    def __init__(self) -> None:
+        self._event = threading.Event()
+
+    def cancel(self) -> None:
+        self._event.set()
+
+    def is_cancelled(self) -> bool:
+        return self._event.is_set()
+
+    @property
+    def cancelled(self) -> bool:
+        return self._event.is_set()
+
+    def is_set(self) -> bool:
+        return self._event.is_set()
+
+
 def _now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -47,19 +68,23 @@ class JobLease:
     worker_id: str
     generation: int
     expires_at: datetime
+    cancellation_token: LeaseCancellation = field(default_factory=LeaseCancellation, compare=False, repr=False)
 
 
 class JobService:
     """Persist queue state and ensure only one live worker lease owns a job."""
 
-    def __init__(self, engine: Engine, *, lease_seconds: int = 60, deployment_scope_id: str = "default") -> None:
+    def __init__(self, engine: Engine, *, lease_seconds: int = 60, deployment_scope_id: str = "default", max_active_hunts: int | None = None) -> None:
         if lease_seconds <= 0:
             raise ValueError("lease_seconds must be positive")
         if not deployment_scope_id or len(deployment_scope_id) > 200:
             raise ValueError("deployment_scope_id must contain 1 to 200 characters")
+        if max_active_hunts is not None and max_active_hunts <= 0:
+            raise ValueError("max_active_hunts must be positive")
         self.engine = engine
         self.lease_seconds = lease_seconds
         self.deployment_scope_id = deployment_scope_id
+        self.max_active_hunts = max_active_hunts
 
     def enqueue(self, owner_id: str, hunt_id: str, *, idempotency_key: str, payload: dict[str, object] | None = None, deployment_scope_id: str | None = None) -> dict[str, object]:
         now = _now()
@@ -77,6 +102,10 @@ class JobService:
         expiry = now + timedelta(seconds=self.lease_seconds)
         scope = deployment_scope_id or self.deployment_scope_id
         with self.engine.begin() as connection:
+            if self.max_active_hunts is not None:
+                active_rows = connection.execute(select(execution_jobs.c.hunt_id).where(execution_jobs.c.status == "claimed", execution_jobs.c.deployment_scope_id == scope).with_for_update()).all()
+                if len({str(item[0]) for item in active_rows}) >= self.max_active_hunts:
+                    return None
             row = connection.execute(select(execution_jobs).where(execution_jobs.c.status == "queued", execution_jobs.c.cancel_requested.is_(False), execution_jobs.c.deployment_scope_id == scope).order_by(execution_jobs.c.created_at_utc).limit(1).with_for_update(skip_locked=True)).mappings().first()
             if row is None:
                 return None
@@ -109,7 +138,7 @@ class JobService:
             result = connection.execute(update(execution_jobs).where(execution_jobs.c.job_id == lease.job_id, execution_jobs.c.worker_id == lease.worker_id, execution_jobs.c.status == "claimed", execution_jobs.c.cancel_requested.is_(False), execution_jobs.c.attempts == lease.generation, execution_jobs.c.deployment_scope_id == lease.deployment_scope_id, execution_jobs.c.lease_expires_at_utc > now).values(lease_expires_at_utc=expiry, heartbeat_at_utc=now, updated_at_utc=now))
         if result.rowcount != 1:
             raise JobConflict("job lease is missing, expired, or cancelled")
-        return JobLease(lease.job_id, lease.hunt_id, lease.owner_id, lease.deployment_scope_id, lease.worker_id, lease.generation, expiry)
+        return JobLease(lease.job_id, lease.hunt_id, lease.owner_id, lease.deployment_scope_id, lease.worker_id, lease.generation, expiry, lease.cancellation_token)
 
     def complete(self, lease: JobLease, *, status: str = "completed", error: str | None = None, now: datetime | None = None) -> None:
         if status not in {"completed", "failed", "cancelled"}:
@@ -139,4 +168,4 @@ class JobService:
         return int(result.rowcount or 0)
 
 
-__all__ = ["JobConflict", "JobLease", "JobService", "execution_jobs", "metadata"]
+__all__ = ["JobConflict", "JobLease", "JobService", "LeaseCancellation", "execution_jobs", "metadata"]
