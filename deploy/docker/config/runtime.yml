@@ -33,6 +33,9 @@ model:
   provider: litellm
   model_name: development
   endpoint: https://model.example.invalid/v1
+  # Change to external and set execution.provider_data_handling_approval_ref
+  # before any customer data is sent to a provider outside this deployment.
+  data_boundary: local
 
 hunt_limits:
   query_start_cutoff_utc: "20:00:00"

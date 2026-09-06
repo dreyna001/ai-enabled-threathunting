@@ -310,8 +310,8 @@ python -m pytest tests/unit tests/integration
 npm --prefix frontend run test:unit
 npm --prefix frontend run build
 docker compose -f deploy/docker/compose.yml config
-./.venv/bin/python scripts/run_known_answer_hunts.py --rehearsal
-./.venv/bin/python scripts/run_known_answer_hunts.py
+./.venv/bin/python scripts/run_known_answer_hunts.py --mode synthetic --json
+./.venv/bin/python scripts/run_known_answer_hunts.py --mode live --json
 ```
 
 Credential-dependent commands must be marked `NOT RUN` when credentials are unavailable. They must not silently pass through mocks.

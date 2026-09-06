@@ -818,12 +818,15 @@ class MCPConnector:
         page: int = 0,
         limit: int = 100,
         *,
+        max_bytes: int | None = None,
         cancellation_token: Any = None,
     ) -> list[Mapping[str, Any]]:
         """Fetch one bounded result page and account for its size."""
 
         if page < 0 or limit <= 0 or limit > 10_000:
             raise AdapterError(FailureCategory.VALIDATION_FAILURE, "invalid result page or limit", operation="fetch_results")
+        if max_bytes is not None and max_bytes <= 0:
+            raise AdapterError(FailureCategory.VALIDATION_FAILURE, "invalid result byte limit", operation="fetch_results")
         provider_job, record = self._resolve_job(job_id)
         value = _unwrap(self._call_transport(
             "fetch_results",
@@ -845,8 +848,10 @@ class MCPConnector:
             rows = [item if isinstance(item, Mapping) else {"value": item} for item in value[:limit]]
         else:
             rows = []
+        encoded = json.dumps(rows, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8")
+        if max_bytes is not None and len(encoded) > max_bytes:
+            raise AdapterError(FailureCategory.BUDGET_EXHAUSTED, "MCP result exceeded the configured byte limit", operation="fetch_results")
         if record:
-            encoded = json.dumps(rows, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
             self._write({"result_count": len(rows), "result_bytes": len(encoded), "result_truncated": truncated, "updated_at_utc": _utc(self._clock())}, request_id=record.request_id)
         return rows[:limit]
 

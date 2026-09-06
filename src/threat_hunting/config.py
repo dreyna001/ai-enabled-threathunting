@@ -10,11 +10,13 @@ from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, PositiveInt, SecretStr, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PositiveFloat, PositiveInt, SecretStr, field_validator, model_validator
 
 
 CONFIG_ENV = "THREAT_HUNTING_CONFIG"
 DATABASE_URL_FILE_ENV = "THREAT_HUNTING_DATABASE_URL_FILE"
+SPLUNK_TOKEN_FILE_ENV = "THREAT_HUNTING_SPLUNK_TOKEN_FILE"
+MODEL_API_KEY_FILE_ENV = "THREAT_HUNTING_MODEL_API_KEY_FILE"
 
 
 class ConfigurationError(RuntimeError):
@@ -69,6 +71,7 @@ class ModelSettings(StrictModel):
     provider: Literal["openai", "bedrock", "litellm"]
     model_name: str = Field(min_length=1, max_length=200)
     endpoint: str | None = None
+    data_boundary: Literal["external", "local"] = "external"
 
 
 class SplunkSettings(StrictModel):
@@ -83,6 +86,7 @@ class HuntLimitSettings(StrictModel):
     query_count: PositiveInt = 12
     per_hunt_query_concurrency: PositiveInt = 2
     search_job_timeout_seconds: PositiveInt = 120
+    splunk_poll_interval_seconds: PositiveFloat = Field(default=1.0, gt=0, le=30)
     splunk_transport_timeout_seconds: PositiveInt = 30
     active_hunts_per_deployment: PositiveInt = 1
     deployment_query_concurrency: PositiveInt = 2
@@ -122,7 +126,7 @@ class UploadSettings(StrictModel):
     file_count: PositiveInt = 10
     per_file_bytes: PositiveInt = 26_214_400
     total_bytes: PositiveInt = 104_857_600
-    extracted_text_characters: PositiveInt = 500_000
+    extracted_text_characters: PositiveInt = 2_000_000
 
     @model_validator(mode="after")
     def total_must_fit_one_file(self) -> "UploadSettings":
@@ -247,7 +251,6 @@ class ExecutionSettings(StrictModel):
             "mcp_client_cert_path": self.mcp_client_cert_path,
             "mcp_client_key_path": self.mcp_client_key_path,
             "mcp_service_subject": self.mcp_service_subject,
-            "provider_data_handling_approval_ref": self.provider_data_handling_approval_ref,
         }
         missing = ", ".join(name for name, item in required.items() if item in (None, ""))
         if missing:
@@ -310,6 +313,10 @@ class RuntimeSettings(StrictModel):
 
     @model_validator(mode="after")
     def production_cannot_disable_tls(self) -> "RuntimeSettings":
+        if self.model.data_boundary == "local" and self.model.provider != "litellm":
+            raise ValueError("the local model data boundary requires the litellm provider")
+        if self.model.data_boundary == "external" and self.execution.provider_data_handling_approval_ref is None:
+            raise ValueError("external model providers require provider_data_handling_approval_ref")
         if self.environment == "production" and not self.tls.verify:
             raise ValueError("TLS verification cannot be disabled in production")
         if self.environment == "production" and self.execution.mode == "mcp":
@@ -365,3 +372,21 @@ def load_database_url() -> SecretStr:
     if not raw_path:
         raise ConfigurationError(f"{DATABASE_URL_FILE_ENV} must name the database URL secret file")
     return read_secret_file(Path(raw_path), label="database URL")
+
+
+def load_optional_secret_file(env_name: str, *, label: str) -> SecretStr | None:
+    """Load an optional provider secret from the path named by ``env_name``."""
+
+    raw_path = os.environ.get(env_name)
+    if not raw_path:
+        return None
+    return read_secret_file(Path(raw_path), label=label)
+
+
+def load_splunk_token() -> SecretStr:
+    """Load the production Splunk bearer token from its secret file."""
+
+    raw_path = os.environ.get(SPLUNK_TOKEN_FILE_ENV)
+    if not raw_path:
+        raise ConfigurationError(f"{SPLUNK_TOKEN_FILE_ENV} must name the Splunk token secret file")
+    return read_secret_file(Path(raw_path), label="Splunk token")

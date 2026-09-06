@@ -18,6 +18,7 @@ TERMINAL_STATES = frozenset({"finalized", "cancelled", "failed"})
 ARTIFACTS: tuple[str, ...] = (
     "workspace",
     "uploads",
+    "upload_quotas",
     "intelligence_inputs",
     "evidence",
     "entities",
@@ -239,7 +240,7 @@ class SqlRetentionRepository:
 
     def delete_artifact(self, *, artifact: str, hunt_id: str, owner_id: str) -> None:
         table_by_artifact = {
-            "workspace": "workspace_artifacts", "uploads": "uploads", "intelligence_inputs": "intelligence_inputs",
+            "workspace": "workspace_artifacts", "uploads": "uploads", "upload_quotas": "upload_quotas", "intelligence_inputs": "intelligence_inputs",
             "evidence": "evidence_records", "entities": "entities", "entity_evidence": "entity_evidence",
             "pivots": "pivots", "findings": "findings", "notes": "hunt_notes", "query_ledger": "query_ledger",
             "reports": "reports", "snapshots": "hunt_snapshots", "audit": "audit_records", "hunt": "hunts",

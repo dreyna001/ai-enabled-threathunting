@@ -1,7 +1,7 @@
 """Persist MCP authorization outcomes and security audit metadata.
 
 Revision ID: 0009_mcp_execution
-Revises: 0008_execution
+Revises: 0001_foundation
 """
 
 from __future__ import annotations
@@ -11,7 +11,7 @@ import sqlalchemy as sa
 
 
 revision = "0009_mcp_execution"
-down_revision = "0008_execution"
+down_revision = "0001_foundation"
 branch_labels = None
 depends_on = None
 

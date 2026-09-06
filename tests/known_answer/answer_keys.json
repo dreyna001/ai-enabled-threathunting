@@ -1,0 +1,17 @@
+{
+  "answer_key_version": "1.0",
+  "answers": {
+    "ka-01-supported-process": {"disposition": "supported", "expected_evidence_ids": ["ka01-e1"]},
+    "ka-02-supported-auth": {"disposition": "supported", "expected_evidence_ids": ["ka02-e1"]},
+    "ka-03-supported-network": {"disposition": "supported", "expected_evidence_ids": ["ka03-e1", "ka03-e2"]},
+    "ka-04-not-supported-process": {"disposition": "not_supported_within_scope", "expected_evidence_ids": [], "required_limitation": "No matching evidence was observed."},
+    "ka-05-not-supported-auth": {"disposition": "not_supported_within_scope", "expected_evidence_ids": [], "required_limitation": "No matching evidence was observed."},
+    "ka-06-incomplete-coverage": {"disposition": "inconclusive", "expected_evidence_ids": [], "required_limitation": "The approved sourcetype was unavailable"},
+    "ka-07-truncated-results": {"disposition": "supported", "expected_evidence_ids": ["ka07-e1"], "required_limitation": "result-row limit truncated"},
+    "ka-08-query-timeout": {"disposition": "failed", "expected_evidence_ids": [], "required_limitation": "hard_timeout"},
+    "ka-09-model-repair": {"disposition": "supported", "expected_evidence_ids": ["ka09-e1"]},
+    "ka-10-restart-recovery": {"disposition": "supported", "expected_evidence_ids": ["ka10-e1"]},
+    "ka-11-hard-budget": {"disposition": "budget_exhausted", "expected_evidence_ids": [], "required_limitation": "budget_exhausted"},
+    "ka-12-cancellation": {"disposition": "cancelled", "expected_evidence_ids": ["ka12-e1"], "required_limitation": "cancelled"}
+  }
+}

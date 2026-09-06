@@ -418,12 +418,33 @@ class SplunkConnector:
                 nested = value.get(key)
                 if nested is not None and not isinstance(nested, (str, bytes)):
                     return SplunkConnector._records(nested, limit=limit, max_bytes=max_bytes)
-            return [value]
-        try:
-            items = islice(value, limit) if limit is not None else iter(value)
-            return [item if isinstance(item, Mapping) else {"value": item} for item in items]
-        except TypeError:
-            return [{"value": value}]
+            records = [value]
+        else:
+            try:
+                items = islice(value, limit) if limit is not None else iter(value)
+                records = []
+                for item in items:
+                    if isinstance(item, Mapping):
+                        records.append(item)
+                        continue
+                    name = getattr(item, "name", None)
+                    content = getattr(item, "content", None)
+                    if isinstance(content, Mapping):
+                        record: dict[str, Any] = {"content": content}
+                        if isinstance(name, str) and name:
+                            record["name"] = name
+                        records.append(record)
+                    elif isinstance(name, str) and name:
+                        records.append({"name": name})
+                    else:
+                        records.append({"value": item})
+            except TypeError:
+                records = [{"value": value}]
+        if max_bytes is not None:
+            encoded = json.dumps(records, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8")
+            if len(encoded) > max_bytes:
+                raise ValueError("Splunk response exceeds the configured byte limit")
+        return records
 
     def _collection(
         self,
@@ -526,6 +547,8 @@ class SplunkConnector:
                 self._invoke("healthcheck", lambda: info, cancellation_token=cancellation_token)
         except AdapterError as exc:
             return SplunkHealth(False, checked, exc.category)
+        except Exception as exc:  # noqa: BLE001 - normalize SDK property failures
+            return SplunkHealth(False, checked, self._normalize_error(exc, operation="healthcheck").failure.category)
         return SplunkHealth(True, checked)
 
     def discover(self, *, cancellation_token: Any = None) -> SplunkDiscovery:
@@ -672,10 +695,18 @@ class SplunkConnector:
     def submit(self, query: str, *, cancellation_token: Any = None, **kwargs: Any) -> str:
         query = self.validate_query(query)
         client = self._get_client()
+        requested_job_id = kwargs.get("id")
+        if requested_job_id is not None and (not isinstance(requested_job_id, str) or not requested_job_id):
+            raise AdapterError(FailureCategory.VALIDATION_FAILURE, "Splunk job id must be non-empty", operation="submit")
 
         def submit_job() -> Any:
             jobs = getattr(client, "jobs", None)
             if jobs is not None and hasattr(jobs, "create"):
+                if requested_job_id is not None:
+                    try:
+                        return jobs[requested_job_id]
+                    except (KeyError, TypeError):
+                        pass
                 return jobs.create(query, **kwargs)
             search = getattr(client, "search", None)
             if callable(search):
@@ -687,6 +718,11 @@ class SplunkConnector:
         if not isinstance(job_id, str) or not job_id:
             if isinstance(job, Mapping):
                 job_id = job.get("sid") or job.get("name")
+        if requested_job_id is not None and job_id != requested_job_id:
+            cancel = getattr(job, "cancel", None)
+            if callable(cancel):
+                cancel()
+            raise AdapterError(FailureCategory.UNKNOWN, "Splunk did not honor the requested job id", operation="submit")
         if not isinstance(job_id, str) or not job_id:
             raise AdapterError(FailureCategory.UNKNOWN, "Splunk did not return a job identifier", operation="submit")
         return job_id
@@ -711,9 +747,19 @@ class SplunkConnector:
         content = getattr(job, "content", job)
         return dict(content) if isinstance(content, Mapping) else {"status": str(content)}
 
-    def fetch_results(self, job_id: str, page: int = 0, limit: int = 100, *, cancellation_token: Any = None) -> list[Mapping[str, Any]]:
+    def fetch_results(
+        self,
+        job_id: str,
+        page: int = 0,
+        limit: int = 100,
+        *,
+        max_bytes: int | None = None,
+        cancellation_token: Any = None,
+    ) -> list[Mapping[str, Any]]:
         if page < 0 or limit <= 0 or limit > 10_000:
             raise AdapterError(FailureCategory.VALIDATION_FAILURE, "invalid result page or limit", operation="fetch_results")
+        if max_bytes is not None and max_bytes <= 0:
+            raise AdapterError(FailureCategory.VALIDATION_FAILURE, "invalid result byte limit", operation="fetch_results")
         job = self._invoke("fetch_results", lambda: self._job(job_id), cancellation_token=cancellation_token)
 
         def fetch() -> Any:
@@ -722,7 +768,18 @@ class SplunkConnector:
                 raise RuntimeError("Splunk job does not expose results")
             return results(offset=page * limit, count=limit)
 
-        return self._records(self._invoke("fetch_results", fetch, cancellation_token=cancellation_token))[:limit]
+        try:
+            return self._records(
+                self._invoke("fetch_results", fetch, cancellation_token=cancellation_token),
+                limit=limit,
+                max_bytes=max_bytes,
+            )[:limit]
+        except ValueError as exc:
+            raise AdapterError(
+                FailureCategory.BUDGET_EXHAUSTED,
+                "Splunk result exceeded the configured byte limit",
+                operation="fetch_results",
+            ) from exc
 
     def cancel(self, job_id: str, *, cancellation_token: Any = None) -> bool:
         # Cancellation is best effort: once a hunt is being cancelled, the

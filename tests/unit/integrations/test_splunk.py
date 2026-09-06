@@ -62,6 +62,26 @@ def test_discovery_uses_metadata_only_and_normalizes_catalog() -> None:
     assert "search/jobs" not in client.get_calls
 
 
+def test_discovery_normalizes_sdk_resource_objects() -> None:
+    class Resource:
+        def __init__(self, name: str, content: dict[str, object]) -> None:
+            self.name = name
+            self.content = content
+
+    class SDKClient(FakeSplunkClient):
+        indexes = [
+            Resource(
+                "main",
+                {"earliestTime": "2024-01-01T00:00:00Z", "latestTime": "2024-01-02T00:00:00Z"},
+            )
+        ]
+
+    result = make_connector(SDKClient()).discover()
+
+    assert result.indexes == ("main",)
+    assert result.time_coverage["main"]["earliest"].endswith("Z")
+
+
 def test_discovery_snapshot_is_deeply_immutable_and_serializes_as_before() -> None:
     result = make_connector(FakeSplunkClient()).discover()
 
@@ -215,6 +235,21 @@ def test_tls_certificate_errors_are_non_retryable_before_oserror() -> None:
     assert retry_classification(health.error_category) is RetryClassification.NON_RETRYABLE
 
 
+def test_healthcheck_normalizes_sdk_auth_property_failures() -> None:
+    class AuthenticationError(Exception):
+        pass
+
+    class AuthFailingClient:
+        @property
+        def info(self) -> object:
+            raise AuthenticationError("session is not logged in")
+
+    health = make_connector(AuthFailingClient()).healthcheck()
+
+    assert health.available is False
+    assert health.error_category is FailureCategory.INVALID_CREDENTIALS
+
+
 class CancellableJob:
     def __init__(self) -> None:
         self.cancel_calls = 0
@@ -259,8 +294,54 @@ def test_submit_and_fetch_keep_pre_action_cancellation() -> None:
     assert client.job.cancel_calls == 0
 
 
+def test_streamed_results_are_read_with_the_policy_byte_cap() -> None:
+    class OversizedResults:
+        requested_size: int | None = None
+
+        def read(self, size: int) -> bytes:
+            self.requested_size = size
+            return b"x" * size
+
+    response = OversizedResults()
+
+    class Job(CancellableJob):
+        def results(self, **_: object) -> OversizedResults:
+            return response
+
+    client = CancellableClient()
+    client.jobs["job-123"] = Job()
+
+    with pytest.raises(AdapterError) as caught:
+        make_connector(client).fetch_results("job-123", max_bytes=64)
+
+    assert caught.value.category is FailureCategory.BUDGET_EXHAUSTED
+    assert response.requested_size == 65
+
+
 def test_tls_and_endpoint_validation_rejects_unsafe_configuration() -> None:
     with pytest.raises(ValueError):
         SplunkConnectionConfig(endpoint="http://splunk.example", token="x")
     with pytest.raises(ValueError):
         SplunkConnectionConfig(endpoint="https://splunk.example", verify_tls=False, token="x")
+
+
+def test_submit_reuses_existing_requested_job_id() -> None:
+    class Job:
+        name = "query-1"
+
+    class Jobs(dict[str, Job]):
+        create_calls = 0
+
+        def create(self, _query: str, **_: object) -> Job:
+            self.create_calls += 1
+            raise AssertionError("an existing deterministic job must not be resubmitted")
+
+    class Client(FakeSplunkClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.jobs = Jobs({"query-1": Job()})
+
+    client = Client()
+
+    assert make_connector(client).submit("search index=main", id="query-1") == "query-1"
+    assert client.jobs.create_calls == 0

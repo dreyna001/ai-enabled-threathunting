@@ -1,0 +1,65 @@
+@import url("https://fonts.googleapis.com/css2?family=Public+Sans:wght@400;600;700;800&family=Roboto+Mono:wght@400;500&display=swap");
+
+:root {
+  color: #e6edf3;
+  background: #0d1117;
+  font-family: "Public Sans", "Source Sans Pro", system-ui, sans-serif;
+}
+
+* { box-sizing: border-box; }
+body { margin: 0; background: #0d1117; }
+button, input, textarea { border-radius: 2px; font: inherit; }
+button { padding: 0.65rem 0.9rem; border: 1px solid #1f6feb; background: #1f6feb; color: #fff; cursor: pointer; font-weight: 700; }
+button:disabled { cursor: not-allowed; opacity: 0.5; }
+button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 3px solid #8cbcff; outline-offset: 2px; }
+code, pre, .vs-code { font-family: "Roboto Mono", ui-monospace, monospace; }
+
+.vs-secondary { border-color: #30363d; background: #1c2129; }
+.vs-danger { border-color: #f85149; background: #b42318; }
+.vs-link { padding: 0; border: 0; background: transparent; color: #8cbcff; }
+.vs-login { display: grid; min-height: 100vh; padding: 1rem; place-items: center; }
+.vs-login .vs-card { width: 100%; max-width: 28rem; }
+.vs-top { display: flex; align-items: center; justify-content: space-between; padding: 1rem 3vw; border-bottom: 1px solid #30363d; background: #10141a; }
+.vs-top > div { display: flex; align-items: center; gap: 1rem; }
+.vs-dashboard, .vs-workspace { max-width: 80rem; margin: auto; padding: 2rem 3vw; }
+.vs-dashboard { display: grid; grid-template-columns: minmax(0, 2fr) minmax(20rem, 1fr); gap: 2rem; }
+.vs-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+.vs-span { grid-column: 1 / -1; }
+.vs-card { min-width: 0; padding: 1.25rem; border: 1px solid #30363d; border-radius: 2px; background: #161b22; }
+.vs-card header, .vs-hunt { display: flex; align-items: flex-start; justify-content: space-between; gap: 1rem; }
+.vs-hunt { margin: 1.5rem 0; }
+.vs-card h2, .vs-card h3 { margin-top: 0.25rem; }
+.vs-eyebrow { margin: 0; color: #8b949e; font-size: 0.72rem; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; }
+.vs-muted, .vs-empty { color: #8b949e; }
+.vs-card > label { display: grid; gap: 0.4rem; margin: 1rem 0; font-weight: 600; }
+.vs-card input, .vs-card textarea { width: 100%; padding: 0.65rem; border: 1px solid #30363d; background: #0d1117; color: #e6edf3; }
+.vs-code { font-size: 0.78rem; }
+pre { overflow: auto; padding: 0.75rem; border: 1px solid #30363d; background: #0d1117; white-space: pre-wrap; }
+.vs-actions { display: flex; flex-wrap: wrap; gap: 0.6rem; margin-top: 1rem; }
+.vs-badge, .vs-card header > span { padding: 0.35rem 0.55rem; border: 1px solid #30363d; background: #1c2129; color: #8cbcff; text-transform: capitalize; }
+.vs-error, .vs-warning { padding: 0.75rem; border: 1px solid; }
+.vs-error { border-color: #f85149; color: #ff8b85; }
+.vs-warning { border-color: #d29922; color: #e3b341; }
+.vs-steps { display: grid; grid-template-columns: repeat(6, 1fr); margin: 1.5rem 0; }
+.vs-steps span { padding: 0.6rem; border-bottom: 2px solid #1f6feb; text-align: center; }
+.vs-results { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+.vs-hunt-row { display: flex; width: 100%; align-items: center; justify-content: space-between; margin: 0.5rem 0; border-color: #30363d; background: #161b22; color: #e6edf3; text-align: left; }
+.vs-hunt-row small { display: block; margin-top: 0.25rem; color: #8b949e; }
+
+.vs-intake { margin: 1rem 0; padding: 0; border: 0; }
+.vs-intake legend { margin-bottom: 0.4rem; font-weight: 600; }
+.vs-intake legend span { color: #8b949e; font-weight: 400; }
+.vs-intake textarea { display: block; }
+.vs-field-meta { display: flex; justify-content: space-between; gap: 1rem; margin: 0.35rem 0 0.65rem; color: #8b949e; font-size: 0.75rem; line-height: 1.4; }
+.vs-field-meta span:last-child { flex: none; font-family: "Roboto Mono", ui-monospace, monospace; }
+.vs-file-label { display: inline-block; margin-bottom: 0.35rem; color: #e6edf3; font-size: 0.85rem; font-weight: 600; }
+.vs-card input.vs-file { padding: 0.45rem; color: #8b949e; }
+.vs-file::file-selector-button { margin-right: 0.7rem; padding: 0.4rem 0.6rem; border: 1px solid #30363d; border-radius: 2px; background: #1c2129; color: #e6edf3; cursor: pointer; font: inherit; font-weight: 600; }
+
+@media (max-width: 760px) {
+  .vs-dashboard, .vs-grid, .vs-results { grid-template-columns: 1fr; }
+  .vs-span { grid-column: auto; }
+  .vs-steps { grid-template-columns: repeat(3, 1fr); }
+  .vs-hunt { display: block; }
+  .vs-field-meta { flex-direction: column; gap: 0.25rem; }
+}

@@ -42,6 +42,7 @@ def settings(tmp_path: Path) -> RuntimeSettings:
             },
             "splunk": {"url": "https://splunk.test:8089"},
             "model": {"provider": "openai", "model_name": "test"},
+            "execution": {"provider_data_handling_approval_ref": "approval-test"},
         }
     )
 

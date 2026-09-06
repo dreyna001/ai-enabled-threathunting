@@ -6,6 +6,8 @@ import yaml
 
 
 COMPOSE_PATH = Path(__file__).parents[2] / "deploy" / "docker" / "compose.yml"
+NGINX_PATH = Path(__file__).parents[2] / "deploy" / "docker" / "nginx.conf"
+ENV_EXAMPLE_PATH = Path(__file__).parents[2] / ".env.example"
 
 
 def compose_document() -> dict[str, object]:
@@ -15,12 +17,22 @@ def compose_document() -> dict[str, object]:
     return value
 
 
+def env_example() -> dict[str, str]:
+    return {
+        key: value
+        for line in ENV_EXAMPLE_PATH.read_text(encoding="utf-8").splitlines()
+        if line and not line.startswith("#")
+        for key, value in [line.split("=", 1)]
+    }
+
+
 def test_mcp_service_is_private_hardened_and_secret_backed() -> None:
     document = compose_document()
     services = document["services"]
     assert isinstance(services, dict)
     mcp = services["mcp"]
     assert isinstance(mcp, dict)
+    assert mcp["profiles"] == ["mcp"]
     assert "ports" not in mcp
     assert mcp["user"] == "10001:10001"
     assert mcp["read_only"] is True
@@ -50,3 +62,42 @@ def test_worker_keeps_direct_phase_6a_path() -> None:
     assert worker["command"] == ["python", "-m", "threat_hunting.worker.main"]
     assert "database_url" in worker["secrets"]
     assert "splunk_token" in worker["secrets"]
+
+
+def test_default_compose_keeps_backend_private_and_persists_uploads() -> None:
+    document = compose_document()
+    services = document["services"]
+    assert isinstance(services, dict)
+    backend = services["backend"]
+    worker = services["worker"]
+    assert isinstance(backend, dict) and isinstance(worker, dict)
+    assert "ports" not in backend
+    assert backend["environment"]["THREAT_HUNTING_UPLOAD_ROOT"] == "/var/lib/threat-hunting/uploads"
+    assert worker["environment"]["THREAT_HUNTING_UPLOAD_ROOT"] == "/var/lib/threat-hunting/uploads"
+    assert backend["environment"]["THREAT_HUNTING_SPLUNK_TOKEN_FILE"] == "/run/secrets/splunk_token"
+    assert backend["environment"]["THREAT_HUNTING_MODEL_API_KEY_FILE"] == "/run/secrets/model_api_key"
+    assert worker["environment"]["THREAT_HUNTING_MODEL_API_KEY_FILE"] == "/run/secrets/model_api_key"
+    assert {"database_url", "splunk_token", "model_api_key"} <= set(backend["secrets"])
+    assert {"database_url", "splunk_token", "model_api_key"} <= set(worker["secrets"])
+    assert "mcp" in services and services["mcp"]["profiles"] == ["mcp"]
+
+
+def test_frontend_defaults_to_loopback_and_accepts_allowed_upload_size() -> None:
+    document = compose_document()
+    services = document["services"]
+    assert isinstance(services, dict)
+    frontend = services["frontend"]
+    assert isinstance(frontend, dict)
+    assert frontend["ports"] == [
+        "${THREAT_HUNTING_FRONTEND_BIND:-127.0.0.1}:${THREAT_HUNTING_FRONTEND_PORT:-8080}:8080"
+    ]
+    assert "client_max_body_size 25m;" in NGINX_PATH.read_text(encoding="utf-8")
+
+
+def test_root_env_example_paths_resolve_from_compose_directory() -> None:
+    values = env_example()
+    assert values["THREAT_HUNTING_CONFIG_FILE"] == "./config/runtime.yml"
+    assert values["THREAT_HUNTING_DATABASE_URL_FILE"] == "../../runtime/secrets/database_url"
+    assert values["THREAT_HUNTING_POSTGRES_PASSWORD_FILE"] == "../../runtime/secrets/postgres_password"
+    assert values["THREAT_HUNTING_SPLUNK_TOKEN_FILE"] == "../../runtime/secrets/splunk_token"
+    assert values["THREAT_HUNTING_MODEL_API_KEY_FILE"] == "../../runtime/secrets/model_api_key"

@@ -69,6 +69,18 @@ def test_openai_adapter_normalizes_structured_response_and_usage() -> None:
     assert "secret" not in repr(response)
 
 
+def test_openai_adapter_allows_explicit_lab_tls_override() -> None:
+    adapter = OpenAIModelAdapter(
+        "gpt-test",
+        api_key="secret",
+        verify_tls=False,
+        allow_insecure=True,
+        client=FakeOpenAIClient(),
+    )
+
+    assert adapter.verify_tls is False
+
+
 def test_model_request_rejects_caller_supplied_system_message() -> None:
     with pytest.raises(ValueError, match="system field"):
         ModelRequest(messages=[{"role": "system", "content": "untrusted"}])
@@ -104,6 +116,18 @@ def test_openai_payload_prepends_trusted_system_and_preserves_supported_roles() 
         {"role": "assistant", "content": "answer"},
         {"role": "tool", "content": "result", "tool_call_id": "call-1"},
     ]
+
+
+def test_openai_payload_uses_completion_token_field_for_newer_models() -> None:
+    model_request = ModelRequest(
+        messages=[{"role": "user", "content": "question"}],
+        max_output_tokens=32,
+    )
+
+    payload = OpenAIModelAdapter._request_payload(model_request, "gpt-5.5")
+
+    assert payload["max_completion_tokens"] == 32
+    assert "max_tokens" not in payload
 
 
 def test_bedrock_adapter_uses_converse_contract() -> None:
