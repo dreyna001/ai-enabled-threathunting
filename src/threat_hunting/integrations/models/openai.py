@@ -144,7 +144,8 @@ class OpenAIModelAdapter(BaseModelAdapter):
         if request.temperature is not None:
             payload["temperature"] = request.temperature
         if request.max_output_tokens is not None:
-            payload["max_tokens"] = request.max_output_tokens
+            token_field = "max_completion_tokens" if model_name.lower().startswith(("gpt-5", "gpt-6")) else "max_tokens"
+            payload[token_field] = request.max_output_tokens
         if request.response_format is not None:
             payload["response_format"] = dict(request.response_format)
         if request.tools:

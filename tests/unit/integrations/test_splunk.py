@@ -62,6 +62,26 @@ def test_discovery_uses_metadata_only_and_normalizes_catalog() -> None:
     assert "search/jobs" not in client.get_calls
 
 
+def test_discovery_normalizes_sdk_resource_objects() -> None:
+    class Resource:
+        def __init__(self, name: str, content: dict[str, object]) -> None:
+            self.name = name
+            self.content = content
+
+    class SDKClient(FakeSplunkClient):
+        indexes = [
+            Resource(
+                "main",
+                {"earliestTime": "2024-01-01T00:00:00Z", "latestTime": "2024-01-02T00:00:00Z"},
+            )
+        ]
+
+    result = make_connector(SDKClient()).discover()
+
+    assert result.indexes == ("main",)
+    assert result.time_coverage["main"]["earliest"].endswith("Z")
+
+
 def test_discovery_snapshot_is_deeply_immutable_and_serializes_as_before() -> None:
     result = make_connector(FakeSplunkClient()).discover()
 
@@ -213,6 +233,21 @@ def test_tls_certificate_errors_are_non_retryable_before_oserror() -> None:
     assert health.available is False
     assert health.error_category is FailureCategory.TLS_CERTIFICATE_FAILURE
     assert retry_classification(health.error_category) is RetryClassification.NON_RETRYABLE
+
+
+def test_healthcheck_normalizes_sdk_auth_property_failures() -> None:
+    class AuthenticationError(Exception):
+        pass
+
+    class AuthFailingClient:
+        @property
+        def info(self) -> object:
+            raise AuthenticationError("session is not logged in")
+
+    health = make_connector(AuthFailingClient()).healthcheck()
+
+    assert health.available is False
+    assert health.error_category is FailureCategory.INVALID_CREDENTIALS
 
 
 class CancellableJob:

@@ -422,7 +422,22 @@ class SplunkConnector:
         else:
             try:
                 items = islice(value, limit) if limit is not None else iter(value)
-                records = [item if isinstance(item, Mapping) else {"value": item} for item in items]
+                records = []
+                for item in items:
+                    if isinstance(item, Mapping):
+                        records.append(item)
+                        continue
+                    name = getattr(item, "name", None)
+                    content = getattr(item, "content", None)
+                    if isinstance(content, Mapping):
+                        record: dict[str, Any] = {"content": content}
+                        if isinstance(name, str) and name:
+                            record["name"] = name
+                        records.append(record)
+                    elif isinstance(name, str) and name:
+                        records.append({"name": name})
+                    else:
+                        records.append({"value": item})
             except TypeError:
                 records = [{"value": value}]
         if max_bytes is not None:
@@ -532,6 +547,8 @@ class SplunkConnector:
                 self._invoke("healthcheck", lambda: info, cancellation_token=cancellation_token)
         except AdapterError as exc:
             return SplunkHealth(False, checked, exc.category)
+        except Exception as exc:  # noqa: BLE001 - normalize SDK property failures
+            return SplunkHealth(False, checked, self._normalize_error(exc, operation="healthcheck").failure.category)
         return SplunkHealth(True, checked)
 
     def discover(self, *, cancellation_token: Any = None) -> SplunkDiscovery:

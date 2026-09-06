@@ -118,6 +118,18 @@ def test_openai_payload_prepends_trusted_system_and_preserves_supported_roles() 
     ]
 
 
+def test_openai_payload_uses_completion_token_field_for_newer_models() -> None:
+    model_request = ModelRequest(
+        messages=[{"role": "user", "content": "question"}],
+        max_output_tokens=32,
+    )
+
+    payload = OpenAIModelAdapter._request_payload(model_request, "gpt-5.5")
+
+    assert payload["max_completion_tokens"] == 32
+    assert "max_tokens" not in payload
+
+
 def test_bedrock_adapter_uses_converse_contract() -> None:
     client = FakeBedrockClient()
     response = BedrockModelAdapter("anthropic.test", region_name="us-east-1", client=client).complete(request())

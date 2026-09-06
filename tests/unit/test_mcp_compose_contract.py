@@ -7,6 +7,7 @@ import yaml
 
 COMPOSE_PATH = Path(__file__).parents[2] / "deploy" / "docker" / "compose.yml"
 NGINX_PATH = Path(__file__).parents[2] / "deploy" / "docker" / "nginx.conf"
+ENV_EXAMPLE_PATH = Path(__file__).parents[2] / ".env.example"
 
 
 def compose_document() -> dict[str, object]:
@@ -14,6 +15,15 @@ def compose_document() -> dict[str, object]:
         value = yaml.safe_load(stream)
     assert isinstance(value, dict)
     return value
+
+
+def env_example() -> dict[str, str]:
+    return {
+        key: value
+        for line in ENV_EXAMPLE_PATH.read_text(encoding="utf-8").splitlines()
+        if line and not line.startswith("#")
+        for key, value in [line.split("=", 1)]
+    }
 
 
 def test_mcp_service_is_private_hardened_and_secret_backed() -> None:
@@ -82,3 +92,12 @@ def test_frontend_defaults_to_loopback_and_accepts_allowed_upload_size() -> None
         "${THREAT_HUNTING_FRONTEND_BIND:-127.0.0.1}:${THREAT_HUNTING_FRONTEND_PORT:-8080}:8080"
     ]
     assert "client_max_body_size 25m;" in NGINX_PATH.read_text(encoding="utf-8")
+
+
+def test_root_env_example_paths_resolve_from_compose_directory() -> None:
+    values = env_example()
+    assert values["THREAT_HUNTING_CONFIG_FILE"] == "./config/runtime.yml"
+    assert values["THREAT_HUNTING_DATABASE_URL_FILE"] == "../../runtime/secrets/database_url"
+    assert values["THREAT_HUNTING_POSTGRES_PASSWORD_FILE"] == "../../runtime/secrets/postgres_password"
+    assert values["THREAT_HUNTING_SPLUNK_TOKEN_FILE"] == "../../runtime/secrets/splunk_token"
+    assert values["THREAT_HUNTING_MODEL_API_KEY_FILE"] == "../../runtime/secrets/model_api_key"
