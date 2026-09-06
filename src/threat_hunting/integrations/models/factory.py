@@ -23,6 +23,7 @@ class ModelConfiguration:
     region_name: str | None = None
     verify_tls: bool = True
     ca_bundle_path: Path | None = None
+    allow_insecure: bool = False
     timeout_seconds: float = 120.0
 
     def __post_init__(self) -> None:
@@ -63,6 +64,7 @@ class ModelFactory:
                 endpoint=config.endpoint,
                 verify_tls=config.verify_tls,
                 ca_bundle_path=config.ca_bundle_path,
+                allow_insecure=config.allow_insecure,
                 timeout_seconds=config.timeout_seconds,
                 client=client,
             )
@@ -73,6 +75,7 @@ class ModelFactory:
                 endpoint=config.endpoint,
                 verify_tls=config.verify_tls,
                 ca_bundle_path=config.ca_bundle_path,
+                allow_insecure=config.allow_insecure,
                 timeout_seconds=config.timeout_seconds,
                 client=client,
             )
@@ -106,7 +109,7 @@ class ModelFactory:
         values = {
             "provider": getattr(configuration, "provider", None),
             "model_name": getattr(configuration, "model_name", None),
-            "endpoint": getattr(configuration, "endpoint", None),
+                "endpoint": getattr(configuration, "endpoint", None),
         }
         if not values["provider"] or not values["model_name"]:
             raise ValueError("model configuration must provide provider and model_name")

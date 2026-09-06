@@ -85,6 +85,7 @@ def build_production_adapters(settings: RuntimeSettings) -> tuple[SplunkConnecto
             api_key=api_key,
             verify_tls=settings.tls.verify,
             ca_bundle_path=settings.tls.ca_bundle_path,
+            allow_insecure=settings.tls.lab_only_allow_insecure,
             timeout_seconds=settings.hunt_limits.model_call_timeout_seconds,
         )
     )

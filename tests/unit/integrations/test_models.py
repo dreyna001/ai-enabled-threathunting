@@ -69,6 +69,18 @@ def test_openai_adapter_normalizes_structured_response_and_usage() -> None:
     assert "secret" not in repr(response)
 
 
+def test_openai_adapter_allows_explicit_lab_tls_override() -> None:
+    adapter = OpenAIModelAdapter(
+        "gpt-test",
+        api_key="secret",
+        verify_tls=False,
+        allow_insecure=True,
+        client=FakeOpenAIClient(),
+    )
+
+    assert adapter.verify_tls is False
+
+
 def test_model_request_rejects_caller_supplied_system_message() -> None:
     with pytest.raises(ValueError, match="system field"):
         ModelRequest(messages=[{"role": "system", "content": "untrusted"}])

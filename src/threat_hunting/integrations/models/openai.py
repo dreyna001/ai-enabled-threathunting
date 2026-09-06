@@ -79,6 +79,7 @@ class OpenAIModelAdapter(BaseModelAdapter):
         endpoint: str | None = None,
         verify_tls: bool = True,
         ca_bundle_path: str | Path | None = None,
+        allow_insecure: bool = False,
         timeout_seconds: float = 120.0,
         client: Any | None = None,
     ) -> None:
@@ -87,7 +88,7 @@ class OpenAIModelAdapter(BaseModelAdapter):
         endpoint_origin = "openai"
         if endpoint is not None:
             endpoint_origin = _validate_endpoint(endpoint, verify_tls=verify_tls)
-        if not verify_tls and ca_bundle_path is None:
+        if not verify_tls and ca_bundle_path is None and not allow_insecure:
             # An explicit lab override is owned by runtime configuration.  The
             # adapter accepts verify=False only when its caller deliberately
             # supplies the override through ``allow_insecure`` below.
@@ -100,6 +101,7 @@ class OpenAIModelAdapter(BaseModelAdapter):
         self._endpoint_origin = endpoint_origin
         self.verify_tls = verify_tls
         self.ca_bundle_path = Path(ca_bundle_path) if ca_bundle_path is not None else None
+        self.allow_insecure = allow_insecure
         self.timeout_seconds = timeout_seconds
         self._client = client
 
@@ -226,6 +228,7 @@ class LiteLLMModelAdapter(OpenAIModelAdapter):
         api_key: SecretStr | str | None = None,
         verify_tls: bool = True,
         ca_bundle_path: str | Path | None = None,
+        allow_insecure: bool = False,
         timeout_seconds: float = 120.0,
         client: Any | None = None,
     ) -> None:
@@ -237,6 +240,7 @@ class LiteLLMModelAdapter(OpenAIModelAdapter):
             endpoint=endpoint,
             verify_tls=verify_tls,
             ca_bundle_path=ca_bundle_path,
+            allow_insecure=allow_insecure,
             timeout_seconds=timeout_seconds,
             client=client,
         )

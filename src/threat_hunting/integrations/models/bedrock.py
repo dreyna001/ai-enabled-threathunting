@@ -48,6 +48,7 @@ class BedrockModelAdapter(BaseModelAdapter):
         endpoint: str | None = None,
         verify_tls: bool = True,
         ca_bundle_path: str | Path | None = None,
+        allow_insecure: bool = False,
         timeout_seconds: float = 120.0,
         client: Any | None = None,
     ) -> None:
@@ -56,7 +57,7 @@ class BedrockModelAdapter(BaseModelAdapter):
         endpoint_origin = "bedrock"
         if endpoint is not None:
             endpoint_origin = _validate_endpoint(endpoint, verify_tls=verify_tls)
-        if not verify_tls and ca_bundle_path is None:
+        if not verify_tls and ca_bundle_path is None and not allow_insecure:
             raise ValueError("TLS verification cannot be disabled without an explicit lab override")
         if timeout_seconds <= 0 or timeout_seconds > 600:
             raise ValueError("timeout_seconds is outside the supported bound")
