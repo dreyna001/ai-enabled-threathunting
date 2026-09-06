@@ -45,13 +45,15 @@ Run this only with written approval for a non-production pilot and a synthetic d
 3. Sign in, create a synthetic hunt, run discovery, approve the generated plan, and execute it.
 4. Confirm the query ledger contains only approved bounded searches, then exercise cancellation and budget exhaustion.
 5. Confirm findings cite retained evidence and the finalized report downloads as a PDF.
+6. Run the twelve-scenario qualification command only after the dedicated fixture workflow adapter is installed; a missing adapter is a hard stop, not a pass.
 
 ```bash
 docker compose --env-file .env -f deploy/docker/compose.yml logs --no-log-prefix --tail=200 backend worker
 curl --fail http://127.0.0.1:${THREAT_HUNTING_FRONTEND_PORT:-8080}/health/ready
+.venv/bin/python scripts/run_known_answer_hunts.py --mode synthetic --json
 ```
 
-These commands cannot qualify provider credentials by themselves. A Docker engine outage blocks the container checks; Splunk URL/TLS/token failure blocks discovery and execution; a missing or unqualified model secret blocks plan generation or synthesis. Record the blocker and use Path A for deterministic workflow verification.
+These commands cannot qualify provider credentials by themselves. The live known-answer runner additionally requires `THREAT_HUNTING_KNOWN_ANSWER_FIXTURE_ID` and `THREAT_HUNTING_KNOWN_ANSWER_LIVE_ADAPTER=module:function`; without an application-owned fixture workflow it exits with a blocker and does not claim qualification. A Docker engine outage blocks the container checks; Splunk URL/TLS/token failure blocks discovery and execution; a missing or unqualified model secret blocks plan generation or synthesis. Record the blocker and use Path A for deterministic workflow verification.
 
 ## Monitoring checklist
 

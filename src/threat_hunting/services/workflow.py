@@ -83,6 +83,24 @@ hunts = Table(
     Column("created_at_utc", DateTime(timezone=True), nullable=False),
     Column("updated_at_utc", DateTime(timezone=True), nullable=False),
 )
+audit_records = Table(
+    "audit_records", workflow_metadata,
+    Column("audit_id", String(36), primary_key=True),
+    Column("hunt_id", String(36), nullable=True),
+    Column("owner_id", String(36), nullable=True),
+    Column("request_id", String(128), nullable=True),
+    Column("actor_type", String(32), nullable=False),
+    Column("actor_id", String(200), nullable=True),
+    Column("action", String(100), nullable=False),
+    Column("object_type", String(100), nullable=True),
+    Column("object_id", String(200), nullable=True),
+    Column("prior_state", String(32), nullable=True),
+    Column("resulting_state", String(32), nullable=True),
+    Column("outcome", String(32), nullable=False),
+    Column("detail", String(2000), nullable=True),
+    Column("metadata", JSON, nullable=True),
+    Column("timestamp_utc", DateTime(timezone=True), nullable=False),
+)
 
 
 class WorkflowError(RuntimeError):
@@ -237,9 +255,24 @@ class WorkflowService:
         with self.engine.begin() as connection:
             exists = connection.execute(select(users.c.user_id).where(users.c.username == "analyst")).first()
             if exists is None:
+                user_id = str(uuid4())
+                now = _now()
                 connection.execute(users.insert().values(
-                    user_id=str(uuid4()), username="analyst", display_name="SOC Analyst",
+                    user_id=user_id, username="analyst", display_name="SOC Analyst",
                     password_hash=self.password_hasher.hash(self.demo_password),
+                ))
+                connection.execute(audit_records.insert().values(
+                    audit_id=str(uuid4()),
+                    owner_id=user_id,
+                    actor_type="system",
+                    actor_id=user_id,
+                    action="account_initialized",
+                    object_type="account",
+                    object_id=user_id,
+                    outcome="success",
+                    detail="local demo account initialized",
+                    metadata=None,
+                    timestamp_utc=now,
                 ))
 
     def login(self, username: str, password: str) -> dict[str, Any]:
@@ -248,15 +281,53 @@ class WorkflowService:
         with self.engine.connect() as connection:
             user = connection.execute(select(users).where(users.c.username == username)).mappings().first()
         if user is None:
+            with self.engine.begin() as connection:
+                connection.execute(audit_records.insert().values(
+                    audit_id=str(uuid4()),
+                    actor_type="analyst",
+                    actor_id=username[:200],
+                    action="login_failed",
+                    object_type="session",
+                    outcome="failure",
+                    detail="invalid credentials",
+                    metadata=None,
+                    timestamp_utc=_now(),
+                ))
             raise Validation("invalid username or password")
         try:
             self.password_hasher.verify(str(user["password_hash"]), password)
         except (VerifyMismatchError, VerificationError):
+            with self.engine.begin() as connection:
+                connection.execute(audit_records.insert().values(
+                    audit_id=str(uuid4()),
+                    owner_id=str(user["user_id"]),
+                    actor_type="analyst",
+                    actor_id=str(user["user_id"]),
+                    action="login_failed",
+                    object_type="session",
+                    outcome="failure",
+                    detail="invalid credentials",
+                    metadata=None,
+                    timestamp_utc=_now(),
+                ))
             raise Validation("invalid username or password") from None
         now = _now()
         token = secrets.token_urlsafe(32)
         with self.engine.begin() as connection:
             connection.execute(sessions.insert().values(token_hash=_token_hash(token), user_id=user["user_id"], expires_at_utc=now + timedelta(hours=8)))
+            connection.execute(audit_records.insert().values(
+                audit_id=str(uuid4()),
+                owner_id=str(user["user_id"]),
+                actor_type="analyst",
+                actor_id=str(user["user_id"]),
+                action="login_succeeded",
+                object_type="session",
+                object_id=_token_hash(token),
+                outcome="success",
+                detail=None,
+                metadata=None,
+                timestamp_utc=now,
+            ))
         public_user = {key: value for key, value in user.items() if key != "password_hash"}
         return {"access_token": token, "token_type": "bearer", "user": public_user}
 
@@ -291,6 +362,22 @@ class WorkflowService:
         )
         with self.engine.begin() as connection:
             connection.execute(hunts.insert().values(**values))
+            connection.execute(audit_records.insert().values(
+                audit_id=str(uuid4()),
+                hunt_id=hunt_id,
+                owner_id=owner_id,
+                actor_type="analyst",
+                actor_id=owner_id,
+                action="hunt_created",
+                object_type="hunt",
+                object_id=hunt_id,
+                prior_state=None,
+                resulting_state=HuntState.CREATED.value,
+                outcome="success",
+                detail=None,
+                metadata=None,
+                timestamp_utc=now,
+            ))
         return self.get_hunt(owner_id, hunt_id)
 
     def get_hunt(self, owner_id: str, hunt_id: str) -> dict[str, Any]:
@@ -304,6 +391,23 @@ class WorkflowService:
         """Cancel one owned hunt atomically; repeated cancellation is idempotent."""
         row = self._owned_row(owner_id, hunt_id)
         if row["state"] == HuntState.CANCELLED.value:
+            with self.engine.begin() as connection:
+                connection.execute(audit_records.insert().values(
+                    audit_id=str(uuid4()),
+                    hunt_id=hunt_id,
+                    owner_id=owner_id,
+                    actor_type="analyst",
+                    actor_id=owner_id,
+                    action="hunt_cancel_requested",
+                    object_type="hunt",
+                    object_id=hunt_id,
+                    prior_state=HuntState.CANCELLED.value,
+                    resulting_state=HuntState.CANCELLED.value,
+                    outcome="already_cancelled",
+                    detail=None,
+                    metadata=None,
+                    timestamp_utc=_now(),
+                ))
             return self.get_hunt(owner_id, hunt_id)
         if row["state"] in {HuntState.FINALIZED.value, HuntState.FAILED.value}:
             raise Conflict("terminal hunts cannot be cancelled")
@@ -930,7 +1034,20 @@ class WorkflowService:
             raise NotFound("hunt not found")
         return row
 
-    def _update(self, owner_id: str, hunt_id: str, *, expected_state: str | None = None, expected_plan_version: int | None = None, expected_report_state: str | None = None, expected_report_version: int | None = None, **values: Any) -> None:
+    def _update(
+        self,
+        owner_id: str,
+        hunt_id: str,
+        *,
+        expected_state: str | None = None,
+        expected_plan_version: int | None = None,
+        expected_report_state: str | None = None,
+        expected_report_version: int | None = None,
+        actor_type: str = "system",
+        action: str | None = None,
+        detail: str | None = None,
+        **values: Any,
+    ) -> None:
         predicate = (hunts.c.hunt_id == hunt_id) & (hunts.c.owner_id == owner_id)
         if expected_state is not None:
             predicate &= hunts.c.state == expected_state
@@ -941,13 +1058,56 @@ class WorkflowService:
         if expected_report_version is not None:
             predicate &= hunts.c.report_version == expected_report_version
         with self.engine.begin() as connection:
+            previous = connection.execute(
+                select(
+                    hunts.c.state,
+                    hunts.c.plan_version,
+                    hunts.c.report_state,
+                    hunts.c.report_version,
+                ).where(predicate)
+            ).mappings().first()
+            if previous is None:
+                raise Conflict("hunt changed before the operation completed")
             result = connection.execute(update(hunts).where(predicate).values(**values))
-        if result.rowcount != 1:
-            raise Conflict("hunt changed before the operation completed")
+            if result.rowcount != 1:
+                raise Conflict("hunt changed before the operation completed")
+            changed_fields = [
+                field
+                for field in ("state", "plan_version", "report_state", "report_version", "results")
+                if field in values and values[field] != previous.get(field)
+            ]
+            if changed_fields:
+                prior_state = str(previous["state"])
+                resulting_state = str(values.get("state", previous["state"]))
+                if action is None:
+                    if "state" in changed_fields:
+                        action = "hunt_state_changed"
+                    elif "plan_version" in changed_fields:
+                        action = "plan_updated"
+                    elif "report_version" in changed_fields:
+                        action = "report_updated"
+                    else:
+                        action = "execution_checkpoint"
+                connection.execute(audit_records.insert().values(
+                    audit_id=str(uuid4()),
+                    hunt_id=hunt_id,
+                    owner_id=owner_id,
+                    actor_type=actor_type,
+                    actor_id=owner_id,
+                    action=action,
+                    object_type="hunt",
+                    object_id=hunt_id,
+                    prior_state=prior_state,
+                    resulting_state=resulting_state,
+                    outcome="success",
+                    detail=(detail or None),
+                    metadata={"changed_fields": changed_fields},
+                    timestamp_utc=values.get("updated_at_utc") or _now(),
+                ))
 
     @staticmethod
     def _public(row: Mapping[str, Any]) -> dict[str, Any]:
         return {key: _json_copy(value) for key, value in row.items() if key not in {"owner_id", "report_pdf"}}
 
 
-__all__ = ["Conflict", "IntegrationUnavailable", "NotFound", "Validation", "WorkflowService", "workflow_metadata"]
+__all__ = ["Conflict", "IntegrationUnavailable", "NotFound", "Validation", "WorkflowService", "audit_records", "workflow_metadata"]

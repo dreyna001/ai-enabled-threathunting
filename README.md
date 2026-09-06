@@ -60,7 +60,20 @@ curl --fail http://127.0.0.1:${THREAT_HUNTING_FRONTEND_PORT:-8080}/health/ready
 docker compose --env-file .env -f deploy/docker/compose.yml logs --no-log-prefix --tail=100 backend worker
 ```
 
-Then run a synthetic-data hunt against the approved Splunk instance, verify the query ledger, cancellation, budget enforcement, evidence grounding, and PDF output, and retain the run identifiers for the pilot record.
+Then run a synthetic-data hunt against the approved Splunk instance, verify the query ledger, cancellation, budget enforcement, evidence grounding, and PDF output, and retain the run identifiers for the pilot record. The twelve-scenario live qualification command is opt-in and requires a dedicated non-production fixture plus an application-owned workflow adapter; it never falls back to the deterministic suite:
+
+```bash
+THREAT_HUNTING_SPLUNK_URL="https://splunk-fixture.example:8089" \
+THREAT_HUNTING_SPLUNK_TOKEN_FILE="/protected/splunk_token" \
+THREAT_HUNTING_MODEL_PROVIDER="openai" \
+THREAT_HUNTING_MODEL_NAME="<approved-model>" \
+THREAT_HUNTING_MODEL_API_KEY_FILE="/protected/model_api_key" \
+THREAT_HUNTING_KNOWN_ANSWER_FIXTURE_ID="<fixture-id>" \
+THREAT_HUNTING_KNOWN_ANSWER_LIVE_ADAPTER="<module>:<function>" \
+.venv/bin/python scripts/run_known_answer_hunts.py --mode live --json
+```
+
+If the adapter or fixture is not configured, the command exits with an explicit blocker and produces no live result.
 
 If Docker is unavailable, Path B is blocked by the host runtime. If Splunk is unavailable or its TLS/token setup is not approved, Path C is blocked at live discovery/execution; Path A remains valid. If the application-specific model secret is absent or the provider is not qualified, Path C is blocked at plan generation/synthesis; Codex or another interactive connection does not supply an application credential.
 

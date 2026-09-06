@@ -12,7 +12,7 @@ Required filenames:
 - `splunk_token` (the least-privilege token used by API/worker for the approved Splunk endpoint)
 - `model_api_key` (the API key for the configured OpenAI-compatible model provider)
 
-The default Compose profile requires the four files above. The optional `mcp` profile additionally requires `mcp_service_subject`, `mcp_tls_ca`, `mcp_tls_client_cert`, and `mcp_tls_client_key`; do not enable that profile until the MCP image module and TLS credentials are qualified.
+The default Compose profile requires the four files above. The optional `mcp` profile additionally requires `mcp_service_subject`, `mcp_tls_ca`, `mcp_tls_client_cert`, and `mcp_tls_client_key`; its entrypoint now validates these boundaries and exits closed because MCP handlers are not enabled in the image. Do not enable that profile until the handlers, TLS credentials, and worker-to-MCP authorization flow are qualified.
 
 Future provider credentials must use the same file-backed `/run/secrets` pattern. Use
 a customer secret manager or an alternate secret-file directory for production.

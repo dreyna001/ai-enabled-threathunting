@@ -4,13 +4,13 @@ from datetime import timedelta
 
 import pytest
 from argon2.exceptions import VerifyMismatchError
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.pool import StaticPool
 from starlette.requests import Request
 
 from threat_hunting.api.workflow import _login_client_key
 from threat_hunting.auth.service import AccountService, LoginRateLimiter
-from threat_hunting.services.workflow import workflow_metadata
+from threat_hunting.services.workflow import audit_records, workflow_metadata
 
 
 def _engine():
@@ -115,3 +115,28 @@ def test_login_client_key_accepts_only_valid_proxy_address() -> None:
 
     assert _login_client_key(proxy_request) == "2001:db8::1"
     assert _login_client_key(invalid_proxy_request) == "192.0.2.20"
+
+
+def test_authentication_actions_are_audited_without_secret_material() -> None:
+    engine = _engine()
+    service = AccountService(engine)
+    account = service.create_account("analyst", "correct-password")
+    with pytest.raises(ValueError, match="invalid username or password"):
+        service.login("analyst", "wrong-password", client_key="192.0.2.10")
+    session, _ = service.login("analyst", "correct-password", client_key="192.0.2.10")
+    service.logout(session.token)
+
+    with engine.connect() as connection:
+        rows = connection.execute(
+            select(audit_records.c.action, audit_records.c.actor_id, audit_records.c.metadata)
+            .order_by(audit_records.c.timestamp_utc, audit_records.c.audit_id)
+        ).mappings().all()
+    assert [row["action"] for row in rows] == [
+        "account_created",
+        "login_failed",
+        "login_succeeded",
+        "logout",
+    ]
+    assert rows[0]["actor_id"] == account["user_id"]
+    assert "192.0.2.10" not in str(rows)
+    assert session.token not in str(rows)
