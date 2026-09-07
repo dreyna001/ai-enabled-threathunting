@@ -14,7 +14,7 @@ execution:
   mcp_tls_client_cert_path: null
   mcp_tls_client_key_path: null
   mcp_service_subject: null
-  provider_data_handling_approval_ref: null
+  provider_data_handling_approval_ref: dev-openai-approval
 
 database:
   connect_timeout_seconds: 5
@@ -26,16 +26,16 @@ storage:
   temporary_min_free_bytes: 2147483648
 
 splunk:
-  url: https://splunk.example.invalid:8089
+  url: https://host.docker.internal:18089
   app_namespace: search
 
 model:
-  provider: litellm
-  model_name: development
-  endpoint: https://model.example.invalid/v1
+  provider: openai
+  model_name: gpt-4.1
+  endpoint: null
   # Change to external and set execution.provider_data_handling_approval_ref
   # before any customer data is sent to a provider outside this deployment.
-  data_boundary: local
+  data_boundary: external
 
 hunt_limits:
   query_start_cutoff_utc: "20:00:00"
@@ -77,6 +77,6 @@ reports:
   render_timeout_seconds: 120
 
 tls:
-  verify: true
+  verify: false
+  lab_only_allow_insecure: true
   ca_bundle_path: null
-  lab_only_allow_insecure: false

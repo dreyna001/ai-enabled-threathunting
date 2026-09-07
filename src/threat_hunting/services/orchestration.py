@@ -163,13 +163,15 @@ class StrictModelRunner:
         return response
 
     @staticmethod
-    def _structured(response: ModelResponse, contract: type[T]) -> T:
+    def _structured(response: ModelResponse, contract: type[T], *, wrapper_key: str | None = None) -> T:
         value = response.structured
         if value is None:
             try:
                 value = json.loads(response.text)
             except (TypeError, json.JSONDecodeError) as exc:
                 raise ValueError("response was not valid JSON") from exc
+        if wrapper_key is not None and isinstance(value, Mapping) and set(value) == {wrapper_key}:
+            value = value[wrapper_key]
         validator = getattr(contract, "model_validate", None)
         if callable(validator):
             return validator(value)
@@ -189,8 +191,12 @@ class StrictModelRunner:
 
         name = contract_name or getattr(contract, "__name__", "structured output")
         payload = json.dumps(user_payload, ensure_ascii=False, sort_keys=True, default=str)
+        schema_factory = getattr(contract, "model_json_schema", None) or getattr(contract, "json_schema", None)
+        schema = json.dumps(schema_factory(), ensure_ascii=False, sort_keys=True) if callable(schema_factory) else "{}"
+        system = f"{self.system_instruction} Required contract: {name}. JSON Schema: {schema}"
+        wrapper_key = name.removesuffix("[]") if name.endswith("[]") else None
         request = ModelRequest(
-            system=f"{self.system_instruction} Required contract: {name}.",
+            system=system,
             messages=[{"role": "user", "content": payload}],
             temperature=0,
             max_output_tokens=self.limits.max_model_output_tokens_per_call,
@@ -201,12 +207,12 @@ class StrictModelRunner:
             response = self._call(request, repair=attempt == 1)
             last_response = response.text
             try:
-                return self._structured(response, contract)
+                return self._structured(response, contract, wrapper_key=wrapper_key)
             except (ValidationError, ValueError, TypeError) as exc:
                 if attempt == 1:
                     raise ModelContractError(name, str(exc), attempts=2, raw_response=last_response) from exc
                 request = ModelRequest(
-                    system=f"{self.system_instruction} Required contract: {name}.",
+                    system=system,
                     messages=[
                         {"role": "user", "content": payload},
                         {

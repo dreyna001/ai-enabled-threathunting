@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from io import BytesIO
+import json
 import ssl
 import threading
 import time
@@ -29,7 +31,7 @@ class FakeSplunkClient:
     def get(self, path: str, **_: object) -> object:
         self.get_calls.append(path)
         return {
-            "data/sourcetypes": {"entry": [{"name": "syslog", "content": {"fields": ["host", "message"]}}]},
+            "saved/sourcetypes": {"entry": [{"name": "syslog", "content": {"fields": ["host", "message"]}}]},
             "data/fields": {"entry": [{"name": "host"}, {"name": "message"}]},
             "data/models": {"entry": [{"name": "Endpoint", "content": {"accelerated": True}}]},
             "server/info": {"entry": [{"name": "splunk"}]},
@@ -60,6 +62,47 @@ def test_discovery_uses_metadata_only_and_normalizes_catalog() -> None:
     assert result.time_coverage["main"]["earliest"].endswith("Z")
     assert client.search_calls == 0
     assert "search/jobs" not in client.get_calls
+
+
+def test_discovery_requests_json_metadata_responses() -> None:
+    class JsonClient(FakeSplunkClient):
+        def get(self, path: str, **kwargs: object) -> object:
+            if path in {"saved/sourcetypes", "data/fields", "data/models"}:
+                assert kwargs["output_mode"] == "json"
+            return super().get(path, **kwargs)
+
+    result = make_connector(JsonClient()).discover()
+
+    assert result.sourcetypes == ("syslog",)
+    assert "host" in result.fields
+
+
+def test_discovery_decodes_splunk_sdk_response_body() -> None:
+    class Response:
+        def __init__(self, payload: object) -> None:
+            self.body = BytesIO(json.dumps(payload).encode())
+
+    class SDKResponseClient(FakeSplunkClient):
+        def get(self, path: str, **kwargs: object) -> object:
+            value = super().get(path, **kwargs)
+            return Response(value)
+
+    result = make_connector(SDKResponseClient()).discover()
+
+    assert result.sourcetypes == ("syslog",)
+    assert "host" in result.fields
+
+
+def test_discovery_decodes_splunk_sdk_mapping_response_body() -> None:
+    class SDKResponseClient(FakeSplunkClient):
+        def get(self, path: str, **kwargs: object) -> object:
+            payload = super().get(path, **kwargs)
+            return {"status": 200, "body": BytesIO(json.dumps(payload).encode())}
+
+    result = make_connector(SDKResponseClient()).discover()
+
+    assert result.sourcetypes == ("syslog",)
+    assert "host" in result.fields
 
 
 def test_discovery_normalizes_sdk_resource_objects() -> None:
@@ -210,7 +253,7 @@ def test_cancellation_is_reported_without_calling_splunk() -> None:
 def test_transport_timeout_is_bounded() -> None:
     class SlowClient(FakeSplunkClient):
         def get(self, path: str, **kwargs: object) -> object:
-            if path == "data/sourcetypes":
+            if path == "saved/sourcetypes":
                 time.sleep(0.1)
             return super().get(path, **kwargs)
 

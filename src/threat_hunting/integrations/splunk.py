@@ -382,6 +382,8 @@ class SplunkConnector:
                 value.decode("utf-8", errors="replace"),
                 max_bytes=max_bytes,
             )
+        if isinstance(value, Mapping) and "body" in value and "status" in value:
+            return SplunkConnector._decode_response(value["body"], max_bytes=max_bytes)
         if isinstance(value, (dict, list, tuple, str, int, float, bool)):
             if isinstance(value, str):
                 if max_bytes is not None and len(value.encode("utf-8")) > max_bytes:
@@ -398,6 +400,9 @@ class SplunkConnector:
             except Exception:  # noqa: BLE001 - malformed SDK response
                 return None
             return SplunkConnector._decode_response(raw, max_bytes=max_bytes)
+        body = getattr(value, "body", None)
+        if body is not None:
+            return SplunkConnector._decode_response(body, max_bytes=max_bytes)
         content = getattr(value, "content", None)
         if content is not None:
             return SplunkConnector._decode_response(content, max_bytes=max_bytes)
@@ -490,7 +495,7 @@ class SplunkConnector:
             raise RuntimeError("Splunk client does not expose metadata access")
         value = self._invoke(
             f"discover.{label}",
-            lambda: getter(endpoint, count=self.config.max_discovery_items),
+            lambda: getter(endpoint, count=self.config.max_discovery_items, output_mode="json"),
             cancellation_token=cancellation_token,
         )
         return self._records(
@@ -578,7 +583,7 @@ class SplunkConnector:
                 "sourcetypes",
                 lambda: self._endpoint(
                     "sourcetypes",
-                    "data/sourcetypes",
+                    "saved/sourcetypes",
                     cancellation_token=cancellation_token,
                 ),
             ),

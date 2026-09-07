@@ -42,7 +42,7 @@ class Splunk:
     def get(self, path: str, **_: object) -> object:
         return {
             "data/indexes": {"entry": [{"name": "main"}]},
-            "data/sourcetypes": {"entry": [{"name": "syslog", "content": {"fields": ["host", "event_id"]}}]},
+            "saved/sourcetypes": {"entry": [{"name": "syslog", "content": {"fields": ["host", "event_id"]}}]},
             "data/fields": {"entry": [{"name": "host"}, {"name": "event_id"}]},
             "data/models": {"entry": []},
         }.get(path, {"entry": []})

@@ -5,6 +5,7 @@ import json
 from uuid import uuid4
 
 import pytest
+from pydantic import TypeAdapter
 
 from threat_hunting.domain.budgets import BudgetCounters, BudgetLimits
 from threat_hunting.domain.contracts import HuntPlan, QueryProposal, ResultMode
@@ -79,6 +80,19 @@ def test_strict_runner_stops_after_one_repair() -> None:
 
     assert error.value.attempts == 2
     assert runner.counters.model_calls == 2
+
+
+def test_strict_runner_accepts_exact_contract_named_wrapper_for_root_list() -> None:
+    proposal = _proposal().model_dump(mode="json")
+    adapter = FakeModelAdapter(responses=[json.dumps({"QueryProposal": [proposal]})])
+
+    result = StrictModelRunner(adapter).run(
+        TypeAdapter(list[QueryProposal]),
+        user_payload={"facts": "untrusted"},
+        contract_name="QueryProposal[]",
+    )
+
+    assert result == [QueryProposal.model_validate(proposal)]
 
 
 def test_execution_snapshot_rejects_secret_material_and_is_hashed() -> None:
