@@ -243,11 +243,20 @@ def test_unsplittable_request_is_rejected_before_spending_a_call():
 
 
 def test_repair_growth_is_checked_with_original_evidence_and_no_second_paid_call():
+    contract = _question_synthesis_contract(plan())
+    state = results()
+    payload = {"retained_evidence": state["evidence"], "completed_queries": state["queries"]}
+    original = deepcopy(payload)
+    probe = FakeModelAdapter(responses=[json.dumps({"question_1": limited(), "question_2": limited()})])
+    StrictModelRunner(probe).run(contract, user_payload=payload)
+    request_characters, _ = StrictModelRunner._request_sizes(probe.requests[0])
     adapter = FakeModelAdapter(responses=["x" * 40_000])
-    runner = StrictModelRunner(adapter, limits=BudgetLimits(max_context_characters=30_000))
+    runner = StrictModelRunner(adapter, limits=BudgetLimits(max_context_characters=request_characters + 1000))
     with pytest.raises(AdapterError, match="context"):
-        runner.run(_question_synthesis_contract(plan()), user_payload={})
+        runner.run(contract, user_payload=payload)
     assert adapter.call_count == 1
+    assert adapter.requests[0].messages == probe.requests[0].messages
+    assert payload == original
     assert runner.counters.model_repair_attempts == 0
 
 

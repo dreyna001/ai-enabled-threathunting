@@ -431,11 +431,18 @@ class FindingProposal(DomainModel):
     query_ids: list[UUID]
     inference: StrictStr | Literal["unknown"] = Field(description=(
         "A tentative interpretation that names its supporting observations and unresolved alternatives, "
-        "or unknown. This field is not permission to invent facts or intent. Report a supplied "
+        "or unknown. Its factual premises require this finding's own citations, including both "
+        "endpoints of any temporal or cross-source relationship. Tentative meaning does not make "
+        "unsupported facts acceptable. Report a supplied "
         "baseline comparison or authorization within its documented scope; otherwise leave those "
         "properties unknown. A caveat here or in limitations does not repair an overstated title or statement."
     ))
-    limitations: list[Identifier]
+    limitations: list[Identifier] = Field(description=(
+        "What this finding's cited evidence or query scope cannot determine. Factual assertions here "
+        "need the same citations as the statement; qualify field availability to the actual cited "
+        "source/records. Do not put a separate no-matching-activity conclusion here: use a "
+        "not_supported_within_scope finding with its own successful complete query citations."
+    ))
 
     @model_validator(mode="after")
     def validate_grounding(self) -> "FindingProposal":
@@ -521,7 +528,8 @@ class LeadCoverage(DomainModel):
     limitation: Identifier | None = Field(description=(
         "What remains unanswered for this lead and question, or null when the selected "
         "findings address it. Do not substitute an unrelated indicator observation for "
-        "requested chronology, authentication or communications analysis."
+        "requested chronology, authentication or communications analysis. Identify missing support; "
+        "do not introduce uncited factual claims or a no-matching-activity conclusion here."
     ))
 
     @model_validator(mode="after")
@@ -560,6 +568,9 @@ class QuestionAnswer(DomainModel):
     limitations: list[Identifier] = Field(description=(
         "Missing evidence or scope limits that prevent answering this question fully. "
         "If findings is empty, explain why the question cannot be answered. "
+        "Facts must come from the findings or supplied coverage metadata; qualify field "
+        "availability to the actual source/records. Missing support is not a no-matching-activity "
+        "conclusion, which requires a separate finding with successful complete query citations. "
         "A populated answer slot does not establish factual correctness or complete coverage."
     ))
 
