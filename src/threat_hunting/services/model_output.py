@@ -5,11 +5,12 @@ from __future__ import annotations
 import re
 from copy import deepcopy
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from types import MappingProxyType
 from typing import Any, Mapping
 
 from threat_hunting.domain.contracts import FINDING_GROUNDING_FIELDS
-from threat_hunting.services.evidence import _flatten_scalar_values, advisory_lead_groups, compact_evidence_records, query_results_incomplete
+from threat_hunting.services.evidence import _flatten_scalar_values, advisory_lead_groups, compact_evidence_records, query_results_incomplete, raw_event_time
 
 
 _EVIDENCE_FIELDS = {"evidence_id", "evidence_ids", "lead_evidence_id", "allowed_evidence_ids", "result_row_refs", "evidence_candidate_row_refs",
@@ -302,6 +303,49 @@ def prepare_model_context(payload: Any, name: str) -> tuple[Any, ReferenceLabels
     references = ReferenceLabels.from_context(payload)
     if name == "QuestionSynthesis":
         payload["advisory_leads"] = references.advisory_leads
+        source_by_id = {str(row["evidence_id"]): row for row in references.evidence.values()}
+        rows = {str(row["evidence_id"]): row for row in [
+            *payload.get("retained_evidence", []),
+            *(row for query in queries for row in query.get("retained_evidence", [])),
+        ] if row.get("evidence_kind", "raw_event") == "raw_event"}
+        chronological = sorted(rows.values(), key=lambda row: (
+            (stamp := raw_event_time(row)) is None, stamp or datetime.max.replace(tzinfo=timezone.utc),
+        ))
+        for lead in payload["advisory_leads"]:
+            lead["record_index"] = []
+            identity = lead["identity_fields"]
+            event = source_by_id[lead["lead_evidence_id"]].get("selected_result", {})
+            if not {"host", "process_guid"}.issubset(identity) or any(
+                field in event and field not in identity for field in ("host", "process_guid", "user", "session_id")
+            ):
+                continue
+            scopes = [identity]
+            if {"host", "user", "session_id"}.issubset(identity):
+                scopes.append({field: identity[field] for field in ("host", "user", "session_id")})
+            for filters in scopes:
+                actions: dict[str | None, list[str]] = {}
+                for row in chronological:
+                    observed = row.get("selected_result", {})
+                    if all(observed.get(field) == value for field, value in filters.items()):
+                        action = observed.get("action")
+                        action = action if isinstance(action, str) and action.strip() else None
+                        actions.setdefault(action, []).append(str(row["evidence_id"]))
+                lead["record_index"].append({"filters": filters, "actions": [
+                    {"action": action, "evidence_ids": identifiers} for action, identifiers in actions.items()
+                ]})
+        payload["lead_index_rule"] = (
+            "lead_evidence_id selects the earliest known-time advisory match in the supplied review group; "
+            "it is not the group's only observation or proof of a process start. Review all its evidence_ids. "
+            "record_index lists supplied raw representation groups matching every literal filter, grouped by "
+            "observed action. References within each action are ordered by event time, with unknown times last; "
+            "null action means no unambiguous nonempty string action. Identical representations retain other "
+            "citation origins in duplicate_references; different projections remain separate. These lists are "
+            "navigation, not unique event counts, proven identity, causation, or complete source coverage. "
+            "Use the referenced source fields to describe chronology and both endpoints of relationships. "
+            "Retained positive observations remain usable when a query is truncated; state its incomplete "
+            "coverage instead of discarding those observations or making a negative conclusion. An empty "
+            "index or missing action does not establish source absence."
+        )
     context = references.encode(payload)
     context["reference_rules"] = [
         "Citation fields (evidence_ids, query_ids and evidence_candidate_row_refs) use only the supplied E and Q labels, never native telemetry identifiers. Native process GUIDs, session IDs and other observed field values remain evidence: include their exact values in findings when the question requests them or a relationship depends on them.",

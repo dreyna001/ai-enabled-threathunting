@@ -690,7 +690,9 @@ def advisory_lead_groups(records: Sequence[Mapping[str, Any]]) -> list[dict[str,
     keep records separate. No stored records or source facts are changed.
     """
     groups: dict[tuple[Any, ...], dict[str, Any]] = {}
-    for row in records:
+    for row in sorted(records, key=lambda row: (
+        (stamp := raw_event_time(row)) is None, stamp or datetime.max.replace(tzinfo=timezone.utc),
+    )):
         comparison = row.get("advisory_ioc_comparison", {})
         if row.get("evidence_kind", "raw_event") != "raw_event" or not (
             comparison.get("matched_file_name_literals") or comparison.get("matched_domain_literals")
