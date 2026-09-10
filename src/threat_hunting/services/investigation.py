@@ -16,7 +16,7 @@ from threat_hunting.domain.common import DomainModel
 from threat_hunting.domain.contracts import FindingProposal, FollowUpDecision, HuntPlan, QuestionAnswer, QuestionAnswerStep, QueryAssessment, QueryProposal
 from threat_hunting.domain.errors import Validation
 from threat_hunting.domain.spl_policy import source_pairs
-from threat_hunting.services.evidence import _flatten_scalar_values, evidence_time_bounds, lookup_retained_evidence, query_results_incomplete, query_source_coverage, raw_event_time, result_source
+from threat_hunting.services.evidence import _flatten_scalar_values, advisory_lead_groups, evidence_time_bounds, lookup_retained_evidence, query_results_incomplete, query_source_coverage, raw_event_time, result_source
 from threat_hunting.services.reports import _derive_report_limitations
 from threat_hunting.services.threat_intel import compare_advisory_iocs, query_ioc_context
 
@@ -563,23 +563,59 @@ def _question_synthesis_contract(plan: HuntPlan, *, allow_retrieval: bool = Fals
     return create_model("QuestionSynthesis", __base__=DomainModel, **fields)
 
 
-def _materialize_question_answers(answer: BaseModel, plan: HuntPlan, results: Mapping[str, Any]) -> dict[str, Any]:
+def _materialize_question_answers(answer: BaseModel, plan: HuntPlan, results: Mapping[str, Any], *, threat_intelligence: str = "") -> dict[str, Any]:
     """Assign question/finding relationships without asking the model to copy IDs."""
 
     findings: list[dict[str, Any]] = []
     answers: list[dict[str, Any]] = []
+    advisory_iocs = query_ioc_context(threat_intelligence)
+    completed = {str(query["query_id"]) for query in results.get("queries", []) if query.get("status") == "completed"}
+    leads = advisory_lead_groups([
+        {**row, "advisory_ioc_comparison": compare_advisory_iocs(row.get("selected_result"), advisory_iocs)}
+        for row in results.get("evidence", []) if str(row.get("query_id")) in completed
+    ])
+    lead_by_evidence = {identifier: lead for lead in leads for identifier in lead["evidence_ids"]}
     for index, question in enumerate(plan.questions, 1):
         item: QuestionAnswer = getattr(answer, f"question_{index}")
         if getattr(item, "retained_evidence_requests", []):
             continue
         materialized = _materialize_findings(item.findings, results)
         findings.extend(materialized)
-        answers.append({
+        stored: dict[str, Any] = {
             "question_id": question.question_id, "question": question.question,
             "summary": item.summary,
             "finding_ids": [finding["finding_id"] for finding in materialized],
             "limitations": list(item.limitations),
-        })
+        }
+        if leads:
+            covered = set()
+            coverage = []
+            for disposition in item.lead_coverage:
+                lead = lead_by_evidence.get(str(disposition.lead_evidence_id))
+                if lead is None or lead["lead_evidence_id"] in covered:
+                    raise Validation("lead coverage must reference distinct retained advisory leads")
+                linked = []
+                for number in disposition.finding_numbers:
+                    if not 1 <= number <= len(materialized):
+                        raise Validation("lead coverage references an unavailable finding")
+                    finding = materialized[number - 1]
+                    if finding["classification"] != "not_supported_within_scope" and not set(finding["evidence_ids"]).intersection(lead["evidence_ids"]):
+                        raise Validation("lead coverage finding must cite that advisory lead")
+                    linked.append(finding["finding_id"])
+                covered.add(lead["lead_evidence_id"])
+                coverage.append({"lead_evidence_ids": lead["evidence_ids"], "identity_fields": lead["identity_fields"],
+                                 "finding_ids": linked, "limitation": disposition.limitation})
+            for lead in leads:
+                if lead["lead_evidence_id"] not in covered:
+                    coverage.append({"lead_evidence_ids": lead["evidence_ids"], "identity_fields": lead["identity_fields"],
+                                     "finding_ids": [], "limitation": "This retained advisory lead was not accounted for in the supplied model context."})
+            stored["lead_coverage"] = coverage
+            unanswered = sum(not lead["finding_ids"] for lead in coverage)
+            if unanswered:
+                stored["limitations"].append(f"{unanswered} of {len(coverage)} retained advisory lead groups remain unanswered for this question.")
+        elif item.lead_coverage:
+            raise Validation("lead coverage has no retained advisory support")
+        answers.append(stored)
     return {"findings": findings, "question_answers": answers}
 
 
@@ -707,6 +743,7 @@ def _synthesis_context(
             "If the response schema permits retained_evidence_requests, each question may either give a final answer or request up to three local pages first. For a request, give findings=[] and explain the missing support in limitations. The application checkpoints completed answers and resolves pages from this hunt only; requests cannot submit searches or expand the approved scope.",
             "Use exact typed field filters, optional half-open UTC time bounds within the approved scope, completed query labels and the returned next_offset for paging. Original query coverage, matching subset counts, page size and supplied sample coverage are different. An empty local subset is not proof of absence from Splunk. Do not repeat an identical page request. If requests are unavailable or a needed page remains omitted, give an explicitly limited answer.",
             "Answer every approved question in its application-assigned answer_slot. Each slot requires findings responsive to that question or an explicit limitation explaining why it cannot be answered. Repeating an indicator finding does not answer a different chronology, authentication, or communications question. Use original indicator records as supporting evidence for related observations when needed.",
+            "For every advisory_leads entry, include one lead_coverage disposition in every final question answer. Select its lead_evidence_id and the one-based positions of findings responsive to that question for that lead, or state the missing answer explicitly. Each linked positive finding must cite a record from that lead plus any records supporting the related activity. Shared identity_fields define literal review groups, not proof of one process lifetime or causation. Do not treat a valid disposition as proof of a complete answer. Native identifiers belong in observed facts; citation fields use supplied labels.",
             "Give each question a concise summary covering its material findings and limitations. Group related observations instead of listing every event. Apply the same grounding standard to summaries as to finding titles and statements. Keep the full findings independently of summary length; report presentation must not restrict investigation coverage.",
             "Use retained_query_inventories for application-computed distinct literal counts over each query's full retained raw rows. State their query scope and missing or ambiguous fields. These are observed field-value counts, not confirmed affected entities or unique process instances. Do not sum per-query distinct counts across overlapping searches or infer that a whole-query count describes a narrower lead, session or time window. Truncated searches prevent a complete inventory, but do not erase the recorded observations.",
             "For chronology questions, cover every material lead and the supplied related process/module records before and after it. State the actual process or session relationship and event times; an indicator start/end alone is not a complete surrounding timeline.",

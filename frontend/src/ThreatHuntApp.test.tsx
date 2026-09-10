@@ -30,4 +30,18 @@ describe("question answer presentation", () => {
     expect(markup).not.toContain("<details>");
     expect(renderToStaticMarkup(<QuestionAnswers results={{ findings: [], evidence: [], entities: [], timeline: [] }} />)).toBe("");
   });
+
+  it("shows source identity and unanswered lead gaps without claiming acceptance", () => {
+    const markup = renderToStaticMarkup(<QuestionAnswers results={{ findings: [], evidence: [], entities: [], timeline: [],
+      question_answers: [{ question_id: "q1", question: "Related activity?", summary: "Analysis is incomplete.", finding_ids: [], limitations: [],
+        lead_coverage: [{ lead_evidence_ids: ["e1"], identity_fields: { host: "<script>unsafe</script>", process_guid: "native-process" },
+          finding_ids: [], limitation: "Authentication timeline remains unanswered." }] }] }} />);
+    expect(markup).toContain("Review 1 advisory leads");
+    expect(markup).toContain("native-process");
+    expect(markup).toContain("0 findings linked");
+    expect(markup).toContain("Authentication timeline remains unanswered");
+    expect(markup).toContain("still require analyst review");
+    expect(markup).not.toContain("<script>");
+    expect(markup).not.toContain("<details open");
+  });
 });

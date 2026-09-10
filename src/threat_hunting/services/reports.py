@@ -18,6 +18,7 @@ import re
 import tempfile
 from collections import Counter
 from collections.abc import Mapping, Sequence
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -252,6 +253,20 @@ def validate_report_content(
                     or any(not isinstance(answer.get(key), list) or not all(isinstance(value, str) and value.strip() for value in answer[key]) for key in ("finding_ids", "limitations"))
                     or not (answer["finding_ids"] or answer["limitations"])):
                 raise ReportValidationError("question answers require a summary and finding references or limitations")
+            coverage = answer.get("lead_coverage", [])
+            if not isinstance(coverage, list) or any(
+                not isinstance(lead, dict) or set(lead) != {"lead_evidence_ids", "identity_fields", "finding_ids", "limitation"}
+                or not isinstance(lead["lead_evidence_ids"], list) or not lead["lead_evidence_ids"]
+                or any(not isinstance(value, str) or not value.strip() for value in lead["lead_evidence_ids"])
+                or not isinstance(lead["identity_fields"], dict)
+                or any(not isinstance(key, str) or not isinstance(value, str) or not value.strip() for key, value in lead["identity_fields"].items())
+                or not isinstance(lead["finding_ids"], list)
+                or any(value not in answer["finding_ids"] for value in lead["finding_ids"])
+                or (lead["limitation"] is not None and (not isinstance(lead["limitation"], str) or not lead["limitation"].strip()))
+                or (not lead["finding_ids"] and not lead["limitation"])
+                for lead in coverage
+            ):
+                raise ReportValidationError("question lead coverage requires observed identity fields and findings or a limitation")
             if available_finding_ids is not None and not set(answer["finding_ids"]).issubset(available_finding_ids):
                 raise ReportValidationError("question answer references unavailable findings")
     if str(normalized.get("disposition")) == "supported" and not normalized["evidence_ids"]:
@@ -607,7 +622,7 @@ def _validate_report_content(content: Mapping[str, Any], results: Mapping[str, A
         answered: set[str] = set()
         finding_ids = {str(item.get("finding_id")) for item in (results or {}).get("findings", normalized["findings"]) if isinstance(item, Mapping)}
         for answer in answers:
-            if not isinstance(answer, dict) or set(answer) != {"question_id", "question", "summary", "finding_ids", "limitations"}:
+            if not isinstance(answer, dict) or set(answer) - {"lead_coverage"} != {"question_id", "question", "summary", "finding_ids", "limitations"}:
                 raise Validation("report question answer has invalid fields")
             question_id = answer["question_id"]
             if (not isinstance(question_id, str) or not question_id.strip() or question_id in answered
@@ -623,6 +638,9 @@ def _validate_report_content(content: Mapping[str, Any], results: Mapping[str, A
                 expected and set(answer["finding_ids"]) != set(expected[question_id]["finding_ids"])
             ):
                 raise Validation("report question finding references must match the retained question answer")
+            if "lead_coverage" in answer or "lead_coverage" in expected.get(question_id, {}):
+                if not expected or answer.get("lead_coverage") != expected[question_id].get("lead_coverage"):
+                    raise Validation("report lead coverage must match the retained question answer")
             answered.add(question_id)
         if expected and answered != set(expected):
             raise Validation("report question_answers must contain every approved question")
@@ -655,7 +673,7 @@ def _concise_report_content(
     all_evidence = records("evidence", len(results.get("evidence", [])))
     all_findings = records("findings", len(results.get("findings", [])))
     by_id = {str(item.get("finding_id")): item for item in all_findings}
-    question_answers = records("question_answers", len(results.get("question_answers", [])))
+    question_answers = deepcopy(records("question_answers", len(results.get("question_answers", []))))
     # Select detailed findings across approved questions. All findings remain
     # retained; each question also receives a concise summary independently of
     # whether its detailed findings fit the report's presentation allowance.
@@ -867,6 +885,11 @@ def _question_answer_text(answer: Mapping[str, Any]) -> list[str]:
         f"Answer: {answer['summary']}",
         f"{len(answer['finding_ids'])} finding(s) retained; full details are available in this hunt's results.",
         *(f"Limitation: {item}" for item in answer["limitations"]),
+        *("Advisory lead (observed identity fields): "
+          + ("; ".join(f"{key.replace('_', ' ')}: {value}" for key, value in lead["identity_fields"].items()) or "Identity fields unavailable")
+          + f". {len(lead['finding_ids'])} finding(s) linked."
+          + (f" Unanswered or limited: {lead['limitation']}" if lead["limitation"] else " Analysis still requires review.")
+          for lead in answer.get("lead_coverage", [])),
     ]
 
 

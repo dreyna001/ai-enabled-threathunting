@@ -76,6 +76,12 @@ export interface HuntResults {
     summary: string;
     finding_ids: string[];
     limitations: string[];
+    lead_coverage?: Array<{
+      lead_evidence_ids: string[];
+      identity_fields: Record<string, string>;
+      finding_ids: string[];
+      limitation: string | null;
+    }>;
   }>;
   mode?: string | null;
 }

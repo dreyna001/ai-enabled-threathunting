@@ -9,10 +9,10 @@ from types import MappingProxyType
 from typing import Any, Mapping
 
 from threat_hunting.domain.contracts import FINDING_GROUNDING_FIELDS
-from threat_hunting.services.evidence import _flatten_scalar_values, compact_evidence_records, query_results_incomplete
+from threat_hunting.services.evidence import _flatten_scalar_values, advisory_lead_groups, compact_evidence_records, query_results_incomplete
 
 
-_EVIDENCE_FIELDS = {"evidence_id", "evidence_ids", "allowed_evidence_ids", "result_row_refs", "evidence_candidate_row_refs",
+_EVIDENCE_FIELDS = {"evidence_id", "evidence_ids", "lead_evidence_id", "allowed_evidence_ids", "result_row_refs", "evidence_candidate_row_refs",
                     "returned_evidence_ids", "supplied_evidence_ids"}
 _QUERY_FIELDS = {"query_id", "query_ids", "source_query_id"}
 _SCHEMA_KEYS = {"type", "properties", "items", "$ref", "$defs", "anyOf", "enum", "format", "description", "title"}
@@ -24,6 +24,10 @@ class ReferenceLabels:
 
     evidence: Mapping[str, Mapping[str, Any]]
     queries: Mapping[str, Mapping[str, Any]]
+
+    @property
+    def advisory_leads(self) -> list[dict[str, Any]]:
+        return advisory_lead_groups(list(self.evidence.values()))
 
     @classmethod
     def from_context(cls, context: Mapping[str, Any]) -> "ReferenceLabels":
@@ -137,6 +141,25 @@ class ReferenceLabels:
                 if not isinstance(explicit, list) or set(explicit).difference(expected):
                     raise ValueError("finding query labels do not match its selected evidence")
                 finding["query_ids"] = expected
+            if isinstance(decoded, Mapping):
+                leads = {lead["lead_evidence_id"]: lead for lead in self.advisory_leads}
+                for answer in decoded.values():
+                    if not isinstance(answer, Mapping) or answer.get("retained_evidence_requests"):
+                        continue
+                    coverage = answer.get("lead_coverage", [])
+                    if not isinstance(coverage, list) or any(not isinstance(item, Mapping) for item in coverage):
+                        raise ValueError("lead_coverage must list supplied advisory leads")
+                    selected_leads = [item.get("lead_evidence_id") for item in coverage]
+                    if any(not isinstance(identifier, str) for identifier in selected_leads) or len(set(selected_leads)) != len(selected_leads) or set(selected_leads) != set(leads):
+                        raise ValueError("lead_coverage must account for every supplied advisory lead exactly once")
+                    proposals = answer.get("findings", [])
+                    for item in coverage:
+                        for number in item.get("finding_numbers", []):
+                            if type(number) is not int or not 1 <= number <= len(proposals):
+                                raise ValueError("lead finding_numbers must select existing one-based finding positions")
+                            finding = proposals[number - 1]
+                            if finding.get("classification") != "not_supported_within_scope" and not set(finding.get("evidence_ids", [])).intersection(leads[item["lead_evidence_id"]]["evidence_ids"]):
+                                raise ValueError("lead coverage finding must cite a supplied record for that lead and supporting related activity")
         return decoded
 
 
@@ -170,12 +193,14 @@ def structured_response_format(contract: Any, name: str, references: ReferenceLa
             result["required"] = list(result.get("properties", {}))
         if references is not None:
             for key, prop in result.get("properties", {}).items():
-                labels = list(references.evidence) if key in _EVIDENCE_FIELDS else list(references.queries) if key in _QUERY_FIELDS else None
+                lead_ids = {lead["lead_evidence_id"] for lead in references.advisory_leads} if key == "lead_evidence_id" else set()
+                labels = ([label for label, row in references.evidence.items() if str(row["evidence_id"]) in lead_ids]
+                          if key == "lead_evidence_id" else list(references.evidence) if key in _EVIDENCE_FIELDS else list(references.queries) if key in _QUERY_FIELDS else None)
                 if labels is None:
                     continue
                 # Reuse finite choices across classification branches instead
                 # of multiplying the provider's total enum-value count.
-                reference_name = "SuppliedEvidenceReference" if key in _EVIDENCE_FIELDS else "SuppliedQueryReference"
+                reference_name = "SuppliedAdvisoryLeadReference" if key == "lead_evidence_id" else "SuppliedEvidenceReference" if key in _EVIDENCE_FIELDS else "SuppliedQueryReference"
                 citation_definitions[reference_name] = {"type": "string", **({"enum": labels} if labels else {})}
                 choice = {"$ref": f"#/$defs/{reference_name}"}
                 if prop.get("type") == "array":
@@ -233,7 +258,19 @@ def structured_response_format(contract: Any, name: str, references: ReferenceLa
         for required_field in ("findings", "limitations"):
             variant = deepcopy(definition)
             variant["properties"][required_field]["minItems"] = 1
+            if references is not None:
+                count = len(references.advisory_leads)
+                variant["properties"]["lead_coverage"].update(minItems=count, maxItems=count)
+            if answer_name == "QuestionAnswerStep":
+                variant["properties"]["retained_evidence_requests"]["maxItems"] = 0
             variants.append(variant)
+        if answer_name == "QuestionAnswerStep":
+            retrieval = deepcopy(definition)
+            retrieval["properties"]["retained_evidence_requests"].update(minItems=1, maxItems=3)
+            retrieval["properties"]["findings"]["maxItems"] = 0
+            retrieval["properties"]["lead_coverage"]["maxItems"] = 0
+            retrieval["properties"]["limitations"]["minItems"] = 1
+            variants.append(retrieval)
         schema["$defs"][answer_name] = {"anyOf": variants}
     if name.endswith("[]"):
         definitions = schema.pop("$defs", {})
@@ -263,6 +300,8 @@ def prepare_model_context(payload: Any, name: str) -> tuple[Any, ReferenceLabels
         "Coverage counts still describe original representations, not unique source events."
     )
     references = ReferenceLabels.from_context(payload)
+    if name == "QuestionSynthesis":
+        payload["advisory_leads"] = references.advisory_leads
     context = references.encode(payload)
     context["reference_rules"] = [
         "Citation fields (evidence_ids, query_ids and evidence_candidate_row_refs) use only the supplied E and Q labels, never native telemetry identifiers. Native process GUIDs, session IDs and other observed field values remain evidence: include their exact values in findings when the question requests them or a relationship depends on them.",

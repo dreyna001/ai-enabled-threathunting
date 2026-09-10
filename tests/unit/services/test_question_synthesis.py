@@ -35,8 +35,138 @@ def positive():
 
 
 def response():
-    return {"question_1": {"summary": "A retained event names host-1.", "findings": [positive()], "limitations": []},
-            "question_2": {"summary": "This question remains unanswered.", "findings": [], "limitations": ["The supplied telemetry does not answer this question."]}}
+    return {"question_1": {"summary": "A retained event names host-1.", "findings": [positive()], "lead_coverage": [], "limitations": []},
+            "question_2": {"summary": "This question remains unanswered.", "findings": [], "lead_coverage": [], "limitations": ["The supplied telemetry does not answer this question."]}}
+
+
+def lead_context():
+    supplied = context()
+    first = supplied["retained_evidence"][0]
+    first["selected_result"].update(process_guid="process-a", session_id="session-a", file_name="observed.exe")
+    first["advisory_ioc_comparison"] = {"matched_file_name_literals": ["observed.exe"]}
+    second = deepcopy(first)
+    second["evidence_id"] = str(uuid4())
+    second["selected_result"].update(host="host-2", process_guid="process-b", session_id="session-b")
+    supplied["retained_evidence"].append(second)
+    supplied["completed_queries"][0]["result_count"] = 2
+    return supplied
+
+
+def covered_response():
+    answer = response()
+    answer["question_1"]["lead_coverage"] = [
+        {"lead_evidence_id": "E1", "finding_numbers": [1], "limitation": None},
+        {"lead_evidence_id": "E2", "finding_numbers": [], "limitation": "No related support was established for this lead."},
+    ]
+    answer["question_2"]["lead_coverage"] = [
+        {"lead_evidence_id": label, "finding_numbers": [], "limitation": "The supplied records do not answer this question for the lead."}
+        for label in ("E1", "E2")
+    ]
+    return answer
+
+
+def test_missing_lead_coverage_uses_existing_repair_before_accepting_answer():
+    model = FakeModelAdapter(responses=[json.dumps(response()), json.dumps(covered_response())])
+    runner = StrictModelRunner(model)
+    runner.run(_question_synthesis_contract(plan()), user_payload=lead_context(), contract_name="QuestionSynthesis")
+    assert model.call_count == 2
+    assert runner.counters.model_repair_attempts == 1
+    assert model.requests[0].messages[0] == model.requests[1].messages[0]
+
+
+@pytest.mark.parametrize("failure", ["unknown_lead", "duplicate_lead", "missing_lead", "bad_position", "boolean_position", "missing_endpoint", "no_disposition"])
+def test_lead_dispositions_reject_omissions_and_unsupported_relationships(failure):
+    answer = covered_response()
+    coverage = answer["question_1"]["lead_coverage"]
+    if failure == "unknown_lead":
+        coverage[0]["lead_evidence_id"] = "E99"
+    elif failure == "duplicate_lead":
+        coverage.append(deepcopy(coverage[0]))
+    elif failure == "missing_lead":
+        coverage.pop()
+    elif failure == "bad_position":
+        coverage[0]["finding_numbers"] = [2]
+    elif failure == "boolean_position":
+        coverage[0]["finding_numbers"] = [True]
+    elif failure == "missing_endpoint":
+        coverage[1].update(finding_numbers=[1], limitation=None)
+    else:
+        coverage[1]["limitation"] = None
+    model = FakeModelAdapter(responses=[json.dumps(answer)] * 2)
+    with pytest.raises(ModelContractError):
+        StrictModelRunner(model).run(_question_synthesis_contract(plan()), user_payload=lead_context(), contract_name="QuestionSynthesis")
+    assert model.call_count == 2
+
+
+def test_lead_dispositions_preserve_app_owned_fields_and_explicit_missing_analysis():
+    supplied = lead_context()
+    state = {"queries": supplied["completed_queries"], "evidence": supplied["retained_evidence"]}
+    model = FakeModelAdapter(responses=[json.dumps(covered_response())])
+    answer = StrictModelRunner(model).run(_question_synthesis_contract(plan()), user_payload=supplied, contract_name="QuestionSynthesis")
+    stored = _materialize_question_answers(answer, plan(), state, threat_intelligence="[file:name = 'observed.exe']")
+    first = stored["question_answers"][0]
+    assert len(first["lead_coverage"]) == 2
+    assert first["lead_coverage"][0]["identity_fields"]["process_guid"] == "process-a"
+    assert first["lead_coverage"][0]["finding_ids"] == first["finding_ids"]
+    assert first["lead_coverage"][1]["finding_ids"] == []
+    assert "1 of 2" in first["limitations"][-1]
+    report = _concise_report_content(hypothesis="h", objective="o", data_sources=[], results=stored,
+                                     coverage_and_limitations=[], conclusion_and_disposition="Incomplete lead analysis.")
+    assert _validate_report_content(report, stored) == report
+    assert b"process-a" in _formatted_pdf("Lead report", report)
+    assert b"No related support" in _formatted_pdf("Lead report", report)
+    report["question_answers"][0]["lead_coverage"][1]["limitation"] = None
+    with pytest.raises(Validation, match="lead coverage"):
+        _validate_report_content(report, stored)
+
+
+@pytest.mark.parametrize("change", [None, "host", "process_guid", "session_id", "multivalue", "missing"])
+def test_lead_review_groups_preserve_distinct_and_uncertain_identities(change):
+    from threat_hunting.services.evidence import advisory_lead_groups
+
+    first = lead_context()["retained_evidence"][0]
+    second = deepcopy(first)
+    second["evidence_id"] = str(uuid4())
+    if change in {"host", "process_guid", "session_id"}:
+        second["selected_result"][change] = "different"
+    elif change == "multivalue":
+        second["selected_result"]["session_id"] = ["session-a", "other"]
+    elif change == "missing":
+        second["selected_result"].pop("process_guid")
+    original = deepcopy([first, second])
+    groups = advisory_lead_groups([first, second])
+    assert len(groups) == (1 if change is None else 2)
+    assert {identifier for group in groups for identifier in group["evidence_ids"]} == {first["evidence_id"], second["evidence_id"]}
+    assert [first, second] == original
+
+
+def test_native_contract_requires_all_lead_slots_or_a_bounded_retrieval_request():
+    refs = ReferenceLabels.from_context(lead_context())
+    schema = structured_response_format(_question_synthesis_contract(plan(), allow_retrieval=True), "QuestionSynthesis", refs)["json_schema"]["schema"]
+    validator = Draft202012Validator(schema)
+    answer = covered_response()
+    for item in answer.values():
+        item["retained_evidence_requests"] = []
+    validator.validate(answer)
+    answer["question_1"]["lead_coverage"].pop()
+    assert list(validator.iter_errors(answer))
+    answer["question_1"].update(findings=[], lead_coverage=[], limitations=["Need a retained page."],
+                              retained_evidence_requests=[{"query_ids": ["Q1"], "filters": [], "earliest_utc": None,
+                                                           "latest_utc": None, "offset": 0, "limit": 1}])
+    validator.validate(answer)
+
+
+def test_another_record_in_the_same_lead_group_can_support_the_finding():
+    supplied = lead_context()
+    supplied["retained_evidence"][1]["selected_result"] = deepcopy(supplied["retained_evidence"][0]["selected_result"])
+    supplied["retained_evidence"][1]["selected_result"]["action"] = "process_end"
+    answer = response()
+    answer["question_1"]["findings"][0]["evidence_ids"] = ["E2"]
+    answer["question_1"]["lead_coverage"] = [{"lead_evidence_id": "E1", "finding_numbers": [1], "limitation": None}]
+    answer["question_2"]["lead_coverage"] = [{"lead_evidence_id": "E1", "finding_numbers": [], "limitation": "Unknown."}]
+    model = FakeModelAdapter(responses=[json.dumps(answer)])
+    result = StrictModelRunner(model).run(_question_synthesis_contract(plan()), user_payload=supplied, contract_name="QuestionSynthesis")
+    assert [str(identifier) for identifier in result.question_1.findings[0].evidence_ids] == [supplied["retained_evidence"][1]["evidence_id"]]
 
 
 def test_native_schema_requires_every_question_and_an_answer_or_limitation():

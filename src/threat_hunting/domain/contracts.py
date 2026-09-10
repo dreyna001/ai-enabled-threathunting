@@ -450,6 +450,30 @@ class FindingProposal(DomainModel):
         return self
 
 
+class LeadCoverage(DomainModel):
+    """Account for a supplied advisory lead without model-owned finding IDs."""
+
+    lead_evidence_id: UUID
+    finding_numbers: list[Annotated[StrictInt, Field(ge=1)]] = Field(description=(
+        "One-based positions of findings in this question that answer it for this lead. "
+        "Each positive finding must cite a supplied record for the lead as well as the "
+        "records supporting any related activity. Use [] when it remains unanswered."
+    ))
+    limitation: Identifier | None = Field(description=(
+        "What remains unanswered for this lead and question, or null when the selected "
+        "findings address it. Do not substitute an unrelated indicator observation for "
+        "requested chronology, authentication or communications analysis."
+    ))
+
+    @model_validator(mode="after")
+    def validate_disposition(self) -> "LeadCoverage":
+        if not self.finding_numbers and not self.limitation:
+            raise ValueError("an unanswered lead requires an explicit limitation")
+        if len(set(self.finding_numbers)) != len(self.finding_numbers):
+            raise ValueError("lead finding positions must be unique")
+        return self
+
+
 class QuestionAnswer(DomainModel):
     """Evidence-grounded response for one application-assigned question slot."""
 
@@ -461,6 +485,12 @@ class QuestionAnswer(DomainModel):
         "not a limit on the findings or evidence retained for the investigation."
     ))
     findings: list[FindingProposal]
+    lead_coverage: list[LeadCoverage] = Field(default_factory=list, description=(
+        "Account for every supplied advisory_leads entry exactly once for this question. "
+        "Select its lead_evidence_id, link responsive findings by one-based position, "
+        "and state any remaining gap. A valid disposition does not prove semantic completeness. "
+        "Use [] when no advisory leads are supplied or when requesting more evidence first."
+    ))
     limitations: list[Identifier] = Field(description=(
         "Missing evidence or scope limits that prevent answering this question fully. "
         "If findings is empty, explain why the question cannot be answered. "
@@ -516,8 +546,8 @@ class QuestionAnswerStep(QuestionAnswer):
 
     @model_validator(mode="after")
     def defer_findings_during_retrieval(self) -> "QuestionAnswerStep":
-        if self.retained_evidence_requests and self.findings:
-            raise ValueError("request evidence before generating final findings for this question")
+        if self.retained_evidence_requests and (self.findings or self.lead_coverage):
+            raise ValueError("request evidence before generating final findings or lead coverage for this question")
         return self
 
 

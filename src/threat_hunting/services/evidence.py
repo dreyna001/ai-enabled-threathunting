@@ -682,6 +682,35 @@ def compact_evidence_records(
     return output
 
 
+def advisory_lead_groups(records: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Group advisory matches for review, preserving every evidence origin.
+
+    Shared literal host/process GUID/user/session values define a review group,
+    not proof of one process lifetime. Missing or multivalue identity fields
+    keep records separate. No stored records or source facts are changed.
+    """
+    groups: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for row in records:
+        comparison = row.get("advisory_ioc_comparison", {})
+        if row.get("evidence_kind", "raw_event") != "raw_event" or not (
+            comparison.get("matched_file_name_literals") or comparison.get("matched_domain_literals")
+            or any(item.get("matches_extracted_advisory_hash") for item in comparison.get("hash_literals", []))
+        ):
+            continue
+        event = row.get("selected_result", {})
+        identity = {name: event[name] for name in ("host", "process_guid", "user", "session_id")
+                    if isinstance(event.get(name), str) and event[name].strip()
+                    and event[name].casefold() not in {"unknown", "null", "none"}}
+        # Optional identity fields must also agree, including their absence.
+        ambiguous = any(name in event and name not in identity for name in ("host", "process_guid", "user", "session_id"))
+        key = tuple(identity.items()) if not ambiguous and {"host", "process_guid"}.issubset(identity) else ("record", str(row["evidence_id"]))
+        group = groups.setdefault(key, {"lead_evidence_id": str(row["evidence_id"]),
+                                        "identity_fields": identity, "evidence_ids": []})
+        identifiers = [str(row["evidence_id"]), *(str(origin["evidence_id"]) for origin in row.get("duplicate_references", []))]
+        group["evidence_ids"] = list(dict.fromkeys([*group["evidence_ids"], *identifiers]))
+    return list(groups.values())
+
+
 def lookup_retained_evidence(
     results: Mapping[str, Any], *, query_ids: set[str],
     filters: Mapping[str, Any] | None = None,

@@ -1849,7 +1849,8 @@ class WorkflowService:
                             ),
                         )
                     pages = _retained_synthesis_pages(answer, focused_plan, results)
-                    generated = _materialize_question_answers(answer, focused_plan, results)
+                    generated = _materialize_question_answers(answer, focused_plan, results,
+                                                              threat_intelligence=str(row["threat_intelligence"] or ""))
                 except AdapterError as exc:
                     if allow_retrieval and exc.category in {FailureCategory.BUDGET_EXHAUSTED, FailureCategory.HARD_TIMEOUT}:
                         results["synthesis_retrieval_status"] = "final_only"
@@ -1863,11 +1864,12 @@ class WorkflowService:
                     # A smaller context was already attempted. Preserve completed
                     # answers and expose missing analysis instead of inventing it.
                     pages = []
-                    generated = {"findings": [], "question_answers": [{
-                        "question_id": question.question_id, "question": question.question,
+                    limited_answer = _question_synthesis_contract(focused_plan).model_validate({f"question_{index}": {
                         "summary": "This question remains unanswered because the synthesis budget was exhausted.",
-                        "finding_ids": [], "limitations": ["The remaining call, context or token budget could not support a complete answer."],
-                    } for question in pending]}
+                        "findings": [], "limitations": ["The remaining call, context or token budget could not support a complete answer."],
+                    } for index, _ in enumerate(pending, 1)})
+                    generated = _materialize_question_answers(limited_answer, focused_plan, results,
+                                                              threat_intelligence=str(row["threat_intelligence"] or ""))
                     results["synthesis_retrieval_status"] = "budget_limited"
                 except Validation:
                     counters.model_output_checks[-1].grounding_valid = False

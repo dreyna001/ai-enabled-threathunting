@@ -179,6 +179,18 @@ export function QuestionAnswers({ results }: { results: HuntResults }) {
           <h3>{answer.question}</h3>
           <p>{answer.summary}</p>
           {answer.limitations.length > 0 && <ul>{answer.limitations.map((item, index) => <li key={`${answer.question_id}-${index}`}>{item}</li>)}</ul>}
+          {!!answer.lead_coverage?.length && <details>
+            <summary>Review {answer.lead_coverage.length} advisory leads for this question</summary>
+            <p>Observed identity fields group records for review. Linked findings still require analyst review.</p>
+            {answer.lead_coverage.map((lead) => <section key={lead.lead_evidence_ids[0]}>
+              <dl>{Object.entries(lead.identity_fields).map(([field, value]) => <div key={field}>
+                <dt>{field.replaceAll("_", " ")}</dt><dd>{value}</dd>
+              </div>)}</dl>
+              {!Object.keys(lead.identity_fields).length && <p>Identity fields unavailable.</p>}
+              <p>{lead.finding_ids.length} findings linked.</p>
+              {lead.limitation && <p>Unanswered or limited: {lead.limitation}</p>}
+            </section>)}
+          </details>}
           {answer.finding_ids.length > 0 && <details>
             <summary>View all {answer.finding_ids.length} findings for this question</summary>
             <div className="vs-result-items">{answer.finding_ids.map((id) => (
