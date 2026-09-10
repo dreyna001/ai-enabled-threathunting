@@ -1,5 +1,25 @@
 # Pause and resume checkpoint
 
+## Latest pause: September 10, 2026, 18:45 EDT
+
+**Stopped at the user's explicit request. Do not resume implementation, tests, provider calls, hunts or deployment until the user asks. The checkpoint goal is unfinished; this pause supersedes the active-work and older restart instructions below.**
+
+Continue from this sole authoritative desktop checkout on local `main`: `/mnt/c/Users/dreyn/OneDrive/Desktop/Cursor/ai-enabled-threathunting`. All source changes are committed together. The source candidate is `8a21aab` (prompt **1.33**, SPL policy **1.5**); subsequent commits record verification and this pause. Pre-pause local/remote main was `3912744b5b924fe9f93034f0484e7f5d4fbcfe41`, and the pause documentation is being committed and pushed on the same branch. Do not create a competing checkout or restore the retired older architecture.
+
+Completed since the previous checkpoint:
+
+- V38 corrected conflicting synthesis instructions for inventory prose, factual premises inside inference/limitations, both-endpoint relationship support, separate complete-query negative findings, and scoped field/retrieval limitations. No schema shape, model setting or fixture change. All **777 backend tests** passed with no skips and two existing dependency warnings; typing passed on **55 files**. The repaired budget regression now reaches the intended oversized-repair boundary.
+- The final dry request retains all **447 evidence representations / 12 queries**, with **418 compact groups**, **439 timeline rows** and **five scoped lead groups**. Its **485,421 characters / 486,445 conservative input-token estimate** fit the expanded profile. It does not prove model accuracy.
+- The single real-provider attempt returned **`provider_quota_exhausted`** after **2.35 seconds**. It produced no answer or repair. Provider token usage is unavailable, not known zero. The request matched the final rehearsal byte for byte, and frozen queries/evidence were preserved. **Restore API capacity before retrying; no newer analytical verdict exists.** The user was informed of this blocker.
+- V39 passed **eight offline remaining-budget and recovery cases**: full/sampled final contexts, insufficient input, exhausted calls/output, final-time reservation, partial-answer recovery after an expired worker lease, and repeated-page termination. Three completed answers survive replacement-worker recovery unchanged; only q2 resumes, and the old lease generation is rejected. These use scripted prior usage/time and fake usage, not measured live or whole-hunt performance.
+- Remote [CI for `3912744`](https://github.com/dreyna001/ai-enabled-threathunting/actions/runs/34538904106) passed backend and frontend checks. The earlier [prompt-candidate CI](https://github.com/dreyna001/ai-enabled-threathunting/actions/runs/34538462011) also passed. No provider/search/application execution is running; the local CI watcher finished.
+
+Durable local artifacts are under `runtime/qualification/quality-fixes-20260910/v38-grounded-reasoning/` and `v39-budget-qualification/`, including runners, exact requests, the quota failure, offline verification, test logs and database snapshots. `v38/dry-3` is the final rehearsal (use the full directory name above), and `v38/live-1` preserves the failed attempt. Do not overwrite prior labels or retry an unchanged provider failure while capacity is unavailable.
+
+The application remains on the **unchanged v18 backend/worker images**; source v38 and the newer frontend are not deployed. The active local profile remains `runtime/config/local-20260910-evaluation-limits.yml`: **60 minutes, 48 model calls, 5 million input / 512,000 output tokens per hunt, 64,000 output tokens / 600 seconds per call**, OpenAI **gpt-5.6-terra / medium**. The current source enforces the 800,000-character allowance; deployed v18 does not. All **42 hunts**, zero active jobs and existing hunt/job fingerprints were preserved. Keep trial 14 unapproved, all volumes/history and both frozen fixture files unchanged.
+
+When the user resumes, follow the ordered todo at the top of [remaining-work.md](remaining-work.md). Continue offline planning/query/adaptive large-input checks if quota remains unavailable. After capacity returns, run one clearly labeled prompt-1.33 replay and review its actual claims before any promotion. Local budget/recovery checks do not replace analytical acceptance, coordinated rollout, fresh full hunts, repeated cases, the twelve-scenario fixture adapter/matrix, independent analyst acceptance or the remaining release gates. Cost/cache improvements remain deferred until those earlier tasks finish.
+
 ## Active desktop work after resumption
 
 **The user resumed work on September 10 and set an active goal to finish all checkpoint fixes and qualification gates. This section supersedes the historical pauses below.**

@@ -1,5 +1,21 @@
 # Remaining work and resume handoff
 
+## Paused September 10, 2026, 18:45 EDT
+
+**The user requested a stop. Resume only when asked, starting with [the latest checkpoint](resume-checkpoint.md#latest-pause-september-10-2026-1845-edt). Work remains unfinished.** Everything is together on desktop `main`; the pause documentation is committed/pushed there. V38 source is verified but undeployed and lacks a returned live-model answer because the provider reported exhausted credits/quota. V39's eight offline budget/recovery cases passed. Remote CI for pre-pause `3912744` passed.
+
+Resume todo, in order:
+
+- [ ] Review current source/runtime/job state and preserved v38/v39 artifacts without restarting completed diagnostics. Keep the frozen advisory/example set, trial 14, all history and the sole desktop checkout.
+- [ ] Finish large-input qualification for planning, query generation and adaptive steps, plus remaining whole-hunt budget/time/resource checks. V39 covers final synthesis and recovery from saved evidence with scripted prior usage only.
+- [ ] After API capacity is restored, run one bounded, clearly labeled prompt-1.33 replay on the unchanged four-question trial-13 evidence; review factual claims, inference premises, chronology, all material leads, exact relationship support, inventory scope and complete-query negatives. Fix demonstrated failures before promotion. Do not retry while quota is unavailable.
+- [ ] Qualify and roll out backend, worker and frontend together; verify exact source/prompt/policy/config, health, unchanged state and rollback availability.
+- [ ] Generate and review fresh plans, then run full hunts on unchanged fixtures. Preserve unapproved trial 14 and prior trials.
+- [ ] Complete repeated positive, negative, incomplete-telemetry and outage cases, the application-owned fixture adapter and full twelve-scenario live matrix.
+- [ ] Obtain independent analyst acceptance; assistant reviews and scripted tests do not satisfy it.
+- [ ] Finish production TLS/HTTPS, least-privilege external accounts, approval-reference validation, pinned base images, migration/rollback qualification, dependency/CI warning maintenance and the frontend E2E placeholder. See the detailed release gates below.
+- [ ] Only after the preceding tasks, perform the [deferred cost improvements](#deferred-cost-improvements-after-the-existing-checkpoint-work): cost/cache telemetry, stable prompt reuse, supported caching, cheaper step settings and offline batch evaluation.
+
 ## Active September 10 work
 
 V39 verified eight offline remaining-budget/recovery cases on the unchanged trial-13 checkpoint with the expanded profile. Cases cover one final call with full evidence, a reduced input allowance, insufficient input, exhausted calls/output, final-time reservation, retained-page recovery after worker loss, and repeated-page termination. All preserve 447 representations, 12 queries, the 439-row timeline, five scoped lead groups and four explicit answer slots. A replacement worker resumes only q2 after the three other answers are checkpointed; the old lease generation is rejected, the original hunt start is preserved and saved answers are unchanged. Individual requests fit their remaining allowance, and retrieval steps retain half the remaining tokens plus a final call. Prior usage/time and per-call usage are scripted boundary conditions, not measurements of the historical hunt or live provider behavior. No provider calls, application DB writes, searches, fixture edits or deployment occurred. See `runtime/qualification/quality-fixes-20260910/v39-budget-qualification/verification.json`. Large-input behavior in planning/query/adaptive steps, actual whole-hunt qualification, analytical acceptance and every remaining release gate stay open.
