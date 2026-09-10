@@ -179,6 +179,8 @@ def test_local_demo_exercises_the_approval_gated_vertical_slice() -> None:
         assert pdf.status_code == 200
         assert pdf.headers["content-type"].startswith("application/pdf")
         assert pdf.content.startswith(b"%PDF-")
+        assert b"HUNT HYPOTHESIS" in pdf.content
+        assert b"query_appendix" not in pdf.content
 
         # Owner-scoped lookup semantics do not reveal whether another hunt exists.
         assert client.get(

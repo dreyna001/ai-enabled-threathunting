@@ -4,6 +4,8 @@
 
 Build a focused, production-ready threat-hunting capability for government customers that can be deployed and operationalized with minimal customer-specific development or manual configuration.
 
+Customer setup must be limited to normal deployment, integration access/permissions, and hunt inputs and scope. Manual log normalization, customer-authored correlation scripts, prompt maintenance, and bespoke baseline authoring must not be prerequisites for reliable operation. Discovery, supported source interpretation, IOC comparisons, query handling, and routine evidence validation are application responsibilities. Existing environment documentation and organization context remain optional aids. Missing or inconsistent telemetry must produce actionable diagnostics and appropriately limited conclusions; mandatory analyst plan review does not transfer responsibility for application correctness to the customer.
+
 The MVP is an ad hoc threat-hunting workspace in which an AI agent:
 
 1. Discovers the customer's available Splunk data.
@@ -103,6 +105,12 @@ The agent can discover:
 - Time coverage and retention information that Splunk exposes.
 - Accelerated data models and `tstats` availability.
 - Data quality and coverage limitations observed during discovery.
+
+Prompt contract 1.6 starts with catalog metadata, drafts the hunt scope, then samples that scope before the final plan is reviewed. It samples up to 100 events for each exact index/sourcetype pair, with at most eight pair searches. Sampling stays within the proposed dates; ranges longer than seven days use their final seven days. The snapshot records both the requested scope and actual sampling bounds. When field context changes, one bounded model revision uses the refreshed snapshot and must preserve the sampled scope. Sampled field absence does not establish that a source lacks that capability.
+
+The production catalog includes configured sourcetypes and a bounded indexed-field `tstats` query for observed sourcetypes; saved source configuration is not treated as an exhaustive inventory of indexed data. The query uses exact validated catalog/proposed indexes and existing discovery transport, item and byte limits, returns no raw events, and marks failure or truncation as partial discovery. The catalog does not prove source pairing, hunt-window activity, or continuous coverage.
+
+Analyst edits to the source pairs or dates refresh discovery and its snapshot binding without a model rewriting the edited plan. A failed refresh leaves the previous plan intact. Approval checks that the reviewed scope matches its discovery snapshot.
 
 Discovery results are persisted and used to draft the hunt plan. Customer-provided documentation supplements discovery but does not replace it.
 
@@ -329,6 +337,48 @@ The application maintains and selectively supplies:
 - Customer documentation, threat intelligence, Splunk field values, and retrieved context are untrusted content. Instructions inside that content cannot change system instructions, approval requirements, budgets, query policy, tool permissions, or evidence rules.
 - Direct Splunk evidence, advisory intelligence or documentation, and model inference remain separate fields.
 
+Follow-up validation attributes semantic errors to individual proposals. Prompt contract 1.8 repairs only rejected decisions, preserves accepted proposals unchanged, and revalidates the merged batch before execution. After validation, application code suppresses exact duplicate searches using the policy cache identity and result mode. Normalized SPL, UTC bounds, limits and execution configuration must match; changed windows or limits are new work. Approved questions retain their application-defined priority even when model output is reordered. Duplicate skips record `decision_source: application_duplicate_suppression` and explicitly state that the question was not separately searched. They consume no model repair and do not prevent distinct approved work from running. Repaired proposals that remain invalid fail explicitly.
+
+Query context provides advisory hashes as literal `advisory_iocs.file_hashes`, without algorithm-key names that could be mistaken for telemetry enum values. Query guidance matches these values directly in shared hash fields without an additional type predicate; algorithm-specific fields require discovered schema support. Other categorical values must come from supplied context or observed telemetry, or be explored with a bounded aggregate. This guidance does not establish query correctness by itself.
+
+SPL policy 1.3 normalizes a grouped initial search expression to the explicit `search` command required by the transport API, using the same source-scope proof as an explicitly named search.
+
+### Model transport projection (prompt contract 1.18)
+
+The canonical contracts below describe application and stored data. The model transport derives a closed JSON schema from those contracts and sends it through the provider API. Its shared schema enforces types, required fields, supported string formats, enum choices, and allowed citation labels; application validators retain length, range, timestamp, policy, and cross-field checks. Refusals and truncated responses fail explicitly. Finding wire schema variants require evidence with empty query citations for positive observations and hunt leads, and completed-query citations with empty evidence citations for scoped negative findings. Application code derives positive findings' query relationships from their evidence; canonical stored contracts remain unchanged. The wire schema and application validators share the same classification-to-grounding rules.
+
+Assessment and synthesis use request-local `E1`, `E2`, ... evidence labels and `Q1`, `Q2`, ... completed-query labels. Only records actually supplied to that call can be resolved. The application restores durable IDs before semantic validation or persistence. Assessment wire output selects only a query label; application code supplies its already-known question ID. Canonical stored assessments retain question_id. Findings select evidence labels and normally return `query_ids: []`; the application derives the related queries. Findings without evidence can select completed-query labels, including searches with zero results.
+
+Prompt contract 1.9 makes entity selection explicit: each `AssessmentEntity.value` must equal a complete scalar field value or list element in cited evidence, including parsed JSON containers. A path appearing only within a longer command line is not an exact scalar entity; command-line interpretations may be described in grounded summary text. Invalid-entity repair feedback identifies every failing zero-based `new_entities` position without echoing source values. The validator does not normalize, invent, or silently discard entities.
+
+Prompt contract 1.10 removes `result_row_refs` from the model-facing entity shape. The model selects `entity_type` and an exact observed `value`; application code derives all matching references from that selected query's supplied evidence, using the same scalar extraction as semantic validation. Values found only in another query, an omitted row, or a substring remain rejected. Canonical stored entities retain their references, and historical explicit references still undergo semantic validation. Entity classification and narrative claim support remain subject to analytical review.
+
+Prompt contract 1.11 adds per-source evidence coverage to assessment, adaptive planning, and synthesis. Bounded samples balance both queries and identified sources within each query. For a truncated representative/targeted raw query with an unrepresented source, application code schedules a policy-validated source-specific check, preserving the original question, predicates, pipeline, time bounds, and result cap. Check lineage is checkpointed; existing query/model/cycle budgets remain enforced and unresolved gaps are reported. Combined aggregates are excluded. Source identity derives from observed projection fields and satisfiable exact source pairs, with `unknown` for ambiguous or contradictory projections. Neither retained-source counts nor a completed check establish an answered investigation question.
+
+Prompt contract 1.12 binds model follow-up skips to the application-recorded completed-query set; new query results reopen skipped questions, while unchanged context and exact duplicate suppression cannot create unbounded retries. Execution uses the documented Splunk search job `earliest_time`/`latest_time` parameters rather than unsupported aliases, which were silently ignored in earlier releases. Repeated identical source metadata is resolved to one possible pair; genuinely conflicting source values remain unknown.
+
+Prompt contract 1.13 removes `intelligence_refs` from the model plan shape. Application code derives references to actual supplied advisory content, with hunt/content-bound IDs and content digests retained in `discovery_snapshot.input_context.intelligence_sources`. Empty advisory input creates no source. Canonical explicit references, user plan edits, approval and execution are validated against the supplied source set. Advisory provenance remains separate from direct telemetry evidence and external-document authenticity.
+
+Prompt contract 1.14 reserves one row per observed query/source within the existing 100-record synthesis sample, then prioritizes whole assessment support groups in approved-question order before adaptive groups. Unavailable/wrong-query support and groups exceeding remaining capacity receive no partial priority allocation; remaining capacity uses query/source-balanced sampling. Synthesis receives prior assessments labeled as interpretations only when their full supporting records are supplied. Omitted assessments have an explicit count; shortened summary/limitation text is marked. The selection uses query scope and validated support, never an evaluation answer key or presumed maliciousness. Prior model interpretations do not become observed facts.
+
+Prompt contract 1.15 makes observation/inference boundaries explicit in assessment and synthesis rules and model-facing field descriptions, which are preserved in both the native response schema and repair requests. Familiar names, ports, or successful events do not establish benignness, authorization, intent, or a normal baseline. Supported baseline comparisons remain scoped to their supplied evidence. Shared hosts/accounts are distinct from stable process/session relationships; positive observations cannot establish broad absence of malicious behavior. These descriptions guide the model; structural validation neither rejects every unsupported claim nor rewrites prose. Analytical review remains required.
+
+Prompt contract 1.16 supplies the bounded extracted advisory IOC lists and application-computed literal comparisons beside each sampled evidence row in assessment and synthesis. It distinguishes a filename match from a hash match and missing hash literals from observed values absent from the extracted list. Hash equality ignores hexadecimal case; filename/domain equality uses complete literal values without normalization. Comparisons do not interpret STIX conjunctions, field semantics, file identity, or maliciousness, and do not modify retained evidence. Prior model assessments remain interpretations to be checked against the comparisons and source rows.
+
+With prompt contract 1.17, evidence classification uses the executed supported SPL pipeline rather than the model's requested result mode: `stats` and `timechart` produce aggregate rows, while supported event-preserving pipelines produce raw-event rows. The same distinction controls omitted-source checks for truncated results. Retrieval caps remain tied to the existing query contract; historical evidence is not rewritten. No customer configuration or data normalization is required.
+
+Prompt contract 1.18 replaces the synthesis support-group priority described for 1.14. Final writing receives query/source-balanced records, exact application-computed IOC comparisons, completed query scope and operational coverage. It excludes earlier assessment prose, assessment-based sample priority, and model-authored skip explanations; the investigation retains those records for pivots and audit. Exact advisory literal matches receive priority within each query, without increasing the 100-record total or using fixture answer keys. Queries and samples retain explicit omission metadata. This removes a path for earlier interpretation errors to reach final writing; semantic accuracy still requires qualification. Per-question/claim evidence retrieval remains a separate unfinished requirement.
+
+`usage.model_output_checks` records contract validity after reference resolution and downstream grounding validity separately for initial and repair calls. Neither metric establishes the truth of a claim. Analytical precision, recall, and unsupported claims require independent judgments on actual workflow output.
+
+Application code deduplicates citation references and computes retained/cited counts, classification totals, and searched sources. Query truncation and omission from the bounded model sample are separate metadata fields. Synthesis must support each material claim with relevant evidence, including each source involved in a claimed correlation; references alone do not prove that support. Source names and synthetic-data provenance are preserved without semantic rewriting.
+
+The investigation revisits unsearched approved questions before adaptive pivots. An explicit skip closes only that question, leaving search capacity available for other pending questions. Pending question IDs and reasons remain in the execution record when budgets prevent further work. A completed query establishes search execution, not that the investigation question has been answered.
+
+Prompt contract 1.5 exposes each completed query's actual UTC search bounds to assessment and synthesis, separately from evidence timestamps and the approved range. Initial coverage guidance surveys the approved range before narrowing to a lead; absence claims remain limited to the selected window and filters. Reports explicitly disclose searches that cover only a subset of the approved time range.
+
+SPL policy 1.2 checks source conditions with `search`'s OR-before-AND precedence. Each possible branch must constrain both index and sourcetype, and contradictory source conditions are rejected. Compound alternatives require their own parentheses, such as `((index=one sourcetype=first) OR (index=two sourcetype=second))`, using actual approved values. The bounded source proof does not validate all SPL semantics or prove that an otherwise valid search answers its question. Runtime execution snapshots record the policy version from the implementation constant.
+
 ### Canonical JSON contracts
 
 These are the required MVP structures. Exact field constraints and enums are implemented as versioned Pydantic models.
@@ -412,7 +462,7 @@ Plan approval is created by deterministic application code after the authenticat
 }
 ```
 
-`max_results` is an integer validated against the configured cap for `result_mode`: up to 100 for initial representative events and up to 500 for targeted expansion by default. Aggregate queries return only the bounded aggregate rows needed for the stated purpose. The model cannot raise these deployment limits.
+`max_results` is the total requested retention ceiling: up to 10,000 raw representative/targeted rows or 500 aggregate rows. Retrieval uses fixed pages of at most 500 rows and also enforces the configured per-query/per-hunt row and byte limits. The requested ceiling may be smaller than the policy ceiling; neither changes the separate model context limit. The application records `available_result_count` from completed job metadata when available, `result_count` for retained rows, `result_pages`, and `retrieval_stop_reason`. Row/byte/time limits and incomplete pages are explicit truncation causes. A known server total distinguishes an exactly complete result from a capped result; unknown totals remain conservatively truncated at the cap. Prior pages survive a later timeout/byte-limit failure. Searches skipped for budget exhaustion are checkpointed and reported without discarding earlier evidence. The model cannot raise deployment limits.
 
 #### Query validation result
 
@@ -635,12 +685,12 @@ All values are deployment-configurable. These are the MVP defaults.
 
 | Setting | Default |
 | --- | ---: |
-| Hard hunt completion ceiling | 12 minutes |
-| Stop starting new Splunk queries | At 8 minutes |
+| Hard hunt completion ceiling | 20 minutes |
+| Stop starting new Splunk queries | At 13 minutes with the shipped five-minute model-call limit |
 | Maximum in-flight query time after cutoff | 2 minutes, subject to the per-query timeout |
-| Synthesis/report allowance after investigation closes | Up to 2 minutes within the hard ceiling |
+| Synthesis/report allowance after investigation closes | Reserve 5 minutes within the hard ceiling |
 | Agent investigation cycles | 8 |
-| Splunk queries per hunt | 12 |
+| Splunk queries per hunt | 50 |
 | Concurrent Splunk jobs per hunt | 2 |
 | Active hunts per deployment | 1 |
 | Concurrent Splunk jobs per deployment | 2 |
@@ -648,23 +698,36 @@ All values are deployment-configurable. These are the MVP defaults.
 | Model calls per hunt | 12 |
 | Model input tokens per hunt | 500,000 |
 | Model output tokens per hunt | 96,000 |
-| Model output tokens per call | 8,000 |
-| Hard timeout per model call | 120 seconds |
+| Model output tokens per call | 24,000 in the shipped Docker configuration; 8,000 if omitted |
+| Hard timeout per model call | 300 seconds in the shipped Docker configuration; 120 seconds if omitted |
 | Cached raw rows per query | 10,000 |
 | Cached raw bytes per query | 250 MB |
 | Cached raw rows per hunt | 50,000 |
 | Cached raw bytes per hunt | 1 GB |
-| Initial representative events supplied to model | 100 |
+| Initial representative events supplied to model | 500 |
 | Targeted event expansion supplied to model | 500 |
+
+The 50-search budget is a per-hunt ceiling, not a target. The agent stops when useful leads are exhausted or another limit is reached. Raising it does not increase model calls, tokens, concurrent jobs, or model-visible evidence; measure useful additional coverage before raising those separate limits.
+
+Prompt contract 1.19 raises the default assessment, pivot-planning, and final-synthesis evidence batches to 500 records. Assessment uses the existing representative-event limit; pivot planning and synthesis use the targeted-event limit. Stored-result limits are separate. Repairs retain the original supplied evidence set, and omitted records remain explicit. Larger batches do not establish factual correctness or complete question coverage.
+
+Prompt contract 1.21 requires one application-generated answer slot per approved question. Each slot contains a concise summary, findings, and limitations, with at least one finding or limitation. Native schemas and application validation enforce question coverage and supplied evidence/query references; application code supplies durable IDs and derives relationships. Summaries must cover material findings and their uncertainty without inventing claims. This is structural coverage, not proof that each question was fully answered.
+
+All generated findings remain stored independently of report presentation. The draft selects ten detailed findings by default across questions and favors hunt leads within each question, while retaining every question summary and its complete finding references. Analysts may add more detailed findings within the existing report input-size boundary. Neither this selection nor summary length limits retained investigation state. PDF/HTML question answers avoid printing full reference arrays; PDF finding details show a few references with total counts. The app exposes expandable per-question findings and its full retained findings/evidence. Report edits cannot drop or reassign question finding references. Earlier assessment prose is excluded from new question-answer report limitations.
+
+Prompt contract 1.22 adds time-spread selection within the existing evidence balance and retained-query inventories computed from raw rows. Inventory field counts cover the full retained query, independently of the sampled model rows, with missing/multivalue disclosures. They do not establish affected entities or unique process instances. Exact typed filtering, timezone-aware half-open time windows and 500-row paging are implemented in a retained-evidence helper, but model-directed requests for these pages remain unimplemented. Final synthesis still uses one model call; per-question calls have only been evaluated in a diagnostic. These source changes remain undeployed.
+
+The `context_characters` setting is currently declared but not enforced in execution. Context/token fitting, preserving source coverage and accounting for schema/system/repair size, remains open; the setting must not be treated as an active runtime guard. See the [resume checkpoint](resume-checkpoint.md) for measured diagnostic outcomes and remaining work.
 
 ### Time-limit behavior
 
 - The execution clock starts when an approved hunt enters `running`. Discovery and plan review happen before this clock starts.
-- At minute 8, the application stops starting new Splunk queries.
-- A query that is already running may finish, fail, or reach its existing query timeout.
+- With the shipped configuration, at minute 13 the application stops starting new Splunk queries and further adaptive model work. Unstarted searches remain recorded as skipped, not as completed zero-result searches.
+- A query that is already running may finish, fail, or reach its existing query timeout, with a latest investigation deadline at minute 15. Recovery uses its original submission time rather than restarting the per-query clock. Timed-out searches remain disclosed as coverage gaps.
 - When the investigation closes because of its time cutoff, the agent synthesizes the retained state after in-flight queries finish or are cancelled. An analyst-cancelled hunt does not run synthesis or create a report draft.
-- The full execution must stop by the 12-minute hard ceiling. If synthesis cannot complete by then, the hunt receives `budget_exhausted` with a resumable report-generation error and keeps all state already persisted.
-- The cutoff and hard ceiling are deployment-configurable operator settings.
+- The full execution has a 20-minute hard ceiling. Each model call is limited to the smaller of its configured timeout and remaining phase time. Late model responses are accounted for but rejected. Failure at the hard deadline preserves persisted state and records `hard_timeout`; it does not create an accepted report.
+- The cutoff is derived from the hard ceiling, reserving one configured model-call timeout for synthesis and up to 120 seconds for an in-flight query. With the omitted-setting 120-second model default, the query cutoff is minute 16 and synthesis reserve is two minutes. Short custom ceilings clamp these reserves to fit. The legacy `query_start_cutoff_utc` field is accepted for old configurations but has no scheduling effect; these limits use elapsed time, not time of day.
+- Query, cycle, model-call, token and result-size limits still apply independently. Twenty minutes is a ceiling, not a target runtime or a guarantee that other budgets will last that long. Discovery and plan review, queue waiting, and later analyst PDF finalization are outside this execution clock.
 
 ### Per-hunt and deployment limits
 

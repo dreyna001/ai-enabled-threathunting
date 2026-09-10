@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Run the versioned known-answer qualification suite.
 
-Synthetic mode is deterministic and never contacts external systems.  Live
+Synthetic mode verifies the scorer with scripted fixtures, without measuring
+model quality. Observed mode scores exported workflow results and independent
+analyst judgments without making external calls. Live
 mode is intentionally explicit and requires secret-file configuration before
 any adapter is constructed.  The live adapter is supplied by the configured
 application workflow; this runner only performs bounded preflight and scores
@@ -22,6 +24,8 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tests"))
+
+from known_answer.observed import score_observed_runs  # noqa: E402
 
 from known_answer.harness import (  # noqa: E402
     KnownAnswerError,
@@ -261,11 +265,23 @@ def run_live_suite(configuration: Mapping[str, str]) -> dict[str, Any]:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", choices=("synthetic", "live"), default="synthetic")
+    parser.add_argument("--mode", choices=("synthetic", "live", "observed"), default="synthetic")
+    parser.add_argument("--observations", type=Path, help="JSON exports of actual workflow results and optional independent analyst judgments")
     parser.add_argument("--json", action="store_true", help="emit machine-readable results")
     args = parser.parse_args(argv)
     try:
-        if args.mode == "live":
+        if args.mode == "observed":
+            if args.observations is None:
+                raise KnownAnswerError("observed mode requires --observations PATH")
+            try:
+                with args.observations.open("rb") as handle:
+                    raw = handle.read(32 * 1024 * 1024 + 1)
+                if len(raw) > 32 * 1024 * 1024:
+                    raise ValueError("observation file exceeds 32 MiB")
+                result = score_observed_runs(json.loads(raw))
+            except (OSError, UnicodeError, ValueError, TypeError, KeyError) as exc:
+                raise KnownAnswerError("observations must be a valid bounded export with complete, consistent judgments when supplied") from exc
+        elif args.mode == "live":
             configuration = _require_live_configuration()
             result = run_live_suite(configuration)
         else:
@@ -275,6 +291,9 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     if args.json:
         print(json.dumps(result, sort_keys=True))
+    elif args.mode == "observed":
+        print(f"observed workflow evaluation: {len(result['scenarios'])} scenarios; "
+              f"analytical quality {'assessed' if result['analytical_quality_assessed'] else 'unassessed'}")
     else:
         print(
             f"known-answer suite: {'PASS' if result['passed'] else 'FAIL'}; "
@@ -282,7 +301,8 @@ def main(argv: list[str] | None = None) -> int:
             f"evidence recovery {result['recovery_percent']:.2f}%; "
             f"queries {result['query_count']}; model calls {result['model_calls']}"
         )
-    return 0 if result["passed"] else 1
+    outcome = result["answer_key_matched"] if args.mode == "observed" else result["passed"]
+    return 2 if outcome is None else 0 if outcome else 1
 
 
 if __name__ == "__main__":

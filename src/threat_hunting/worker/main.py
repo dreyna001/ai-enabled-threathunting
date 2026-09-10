@@ -10,6 +10,7 @@ from datetime import datetime
 
 from sqlalchemy.exc import SQLAlchemyError
 
+from threat_hunting.domain.errors import failure_metadata
 from threat_hunting.config import RuntimeSettings, load_database_url
 from threat_hunting.db import Database
 from threat_hunting.health import worker_id_from_environment
@@ -30,9 +31,10 @@ def process_one(
 ) -> bool:
     """Claim and process one job while renewing its fenced lease."""
     job_service.recover_expired(now=now)
-    lease = job_service.claim(worker_id, now=now)
-    if lease is None:
+    claimed = job_service.claim(worker_id, now=now)
+    if claimed is None:
         return False
+    lease: JobLease = claimed
     outcome: dict[str, BaseException | None] = {"error": None}
 
     def invoke() -> None:
@@ -64,7 +66,7 @@ def process_one(
     error = outcome["error"]
     try:
         if error is not None:
-            job_service.complete(lease, status="failed", error=str(error)[:500], now=now)
+            job_service.complete(lease, status="failed", error="{category}: {error_type}".format(**failure_metadata(error)), now=now)
         else:
             job_service.complete(lease, status="completed", now=now)
     except JobConflict:
@@ -91,6 +93,7 @@ def run() -> None:
         connect_timeout_seconds=settings.database.connect_timeout_seconds,
     )
     worker_id = worker_id_from_environment()
+    service = None
     try:
         database.require_current_migration()
         LOGGER.info("worker started", extra={"worker_id": worker_id})
@@ -101,12 +104,14 @@ def run() -> None:
             database.publish_worker_heartbeat(worker_id)
             try:
                 process_one(jobs, worker_id, handler=handler)
-            except SQLAlchemyError:
+            except SQLAlchemyError as exc:
                 # A worker remains healthy while a deployment is rolling out
                 # the queue migration; readiness still reports migration state.
-                LOGGER.exception("durable job poll failed", extra={"worker_id": worker_id})
+                LOGGER.error("durable job poll failed worker_id=%s error_type=%s", worker_id, type(exc).__name__)
             stop.wait(JOB_POLL_INTERVAL_SECONDS)
     finally:
+        if service is not None:
+            service.close()
         database.dispose()
         LOGGER.info("worker stopped", extra={"worker_id": worker_id})
 

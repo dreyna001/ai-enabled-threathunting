@@ -9,10 +9,11 @@ constructing a contract.
 from __future__ import annotations
 
 from enum import StrEnum
+from types import MappingProxyType
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
-from pydantic import Field, StrictBool, StrictInt, StrictStr, field_validator, model_validator
+from pydantic import ConfigDict, Field, StrictBool, StrictInt, StrictStr, field_validator, model_validator
 
 from .common import (
     DomainModel,
@@ -48,12 +49,26 @@ class ResultMode(StrEnum):
     TARGETED = "targeted"
 
 
+QUERY_RESULT_LIMITS = MappingProxyType({
+    ResultMode.AGGREGATE: 500,
+    ResultMode.REPRESENTATIVE: 10_000,
+    ResultMode.TARGETED: 10_000,
+})
+
+
 class FindingClassification(StrEnum):
     """Permitted finding classifications."""
 
     HUNT_LEAD = "hunt_lead"
     SUPPORTED_OBSERVATION = "supported_observation"
     NOT_SUPPORTED_WITHIN_SCOPE = "not_supported_within_scope"
+
+
+FINDING_GROUNDING_FIELDS = MappingProxyType({
+    FindingClassification.HUNT_LEAD: "evidence_ids",
+    FindingClassification.SUPPORTED_OBSERVATION: "evidence_ids",
+    FindingClassification.NOT_SUPPORTED_WITHIN_SCOPE: "query_ids",
+})
 
 
 class Confidence(StrEnum):
@@ -168,6 +183,16 @@ class PlanApproval(DomainModel):
 class QueryProposal(DomainModel):
     """Bounded query request proposed for one existing plan question."""
 
+    model_config = ConfigDict(json_schema_extra={
+        "allOf": [
+            {
+                "if": {"properties": {"result_mode": {"const": mode.value}}},
+                "then": {"properties": {"max_results": {"maximum": cap}}},
+            }
+            for mode, cap in QUERY_RESULT_LIMITS.items()
+        ],
+    })
+
     question_id: Identifier
     purpose: Identifier
     expected_information_gain: Identifier
@@ -178,7 +203,14 @@ class QueryProposal(DomainModel):
     sourcetypes: list[Identifier]
     requested_fields: list[Identifier]
     result_mode: ResultMode
-    max_results: Annotated[StrictInt, Field(gt=0, le=500)]
+    max_results: Annotated[StrictInt, Field(
+        gt=0, le=max(QUERY_RESULT_LIMITS.values()),
+        description="Maximum retained rows by mode: " + ", ".join(
+            f"{mode.value}={cap}" for mode, cap in QUERY_RESULT_LIMITS.items()
+        ) + ". Raw results are fetched in pages of at most 500 rows. This is the total retrieval "
+        "ceiling, independent of the smaller evidence batch shown to the model. Request enough "
+        "rows to cover the question; use a smaller ceiling only when sufficient.",
+    )]
 
     @model_validator(mode="after")
     def validate_query(self) -> "QueryProposal":
@@ -186,9 +218,27 @@ class QueryProposal(DomainModel):
 
         if self.latest_utc <= self.earliest_utc:
             raise ValueError("latest_utc must be later than earliest_utc")
-        cap = 100 if self.result_mode in {ResultMode.AGGREGATE, ResultMode.REPRESENTATIVE} else 500
+        cap = QUERY_RESULT_LIMITS[self.result_mode]
         if self.max_results > cap:
             raise ValueError(f"max_results exceeds {self.result_mode.value} cap of {cap}")
+        return self
+
+
+class FollowUpDecision(DomainModel):
+    """One executable proposal or explicit reason for skipping a generated question."""
+
+    question_id: Identifier
+    proposal: QueryProposal | None
+    skip_reason: Annotated[StrictStr, Field(min_length=1, max_length=2000)] | None
+
+    @model_validator(mode="after")
+    def validate_decision(self) -> "FollowUpDecision":
+        if (self.proposal is None) == (self.skip_reason is None):
+            raise ValueError("provide exactly one of proposal or skip_reason")
+        if self.skip_reason is not None and not self.skip_reason.strip():
+            raise ValueError("skip_reason must explain why the question cannot proceed")
+        if self.proposal is not None and self.proposal.question_id != self.question_id:
+            raise ValueError("proposal question_id must match its decision")
         return self
 
 
@@ -236,10 +286,15 @@ class QueryValidationResult(DomainModel):
 
 
 class AssessmentEntity(DomainModel):
-    """Entity extracted from a query result."""
+    """Entity selected from an exact scalar value in a cited query result."""
 
     entity_type: EntityType
-    value: Identifier
+    value: Identifier = Field(description=(
+        "Copy a complete scalar field value or list element from this query's supplied evidence. "
+        "Do not derive substrings, parse file paths from command lines, or remove "
+        "quotes/arguments. Select an observed file_name or process value instead; "
+        "command-line interpretation belongs in the evidence-backed summary."
+    ))
     result_row_refs: list[Identifier]
 
 
@@ -258,7 +313,11 @@ class QueryAssessment(DomainModel):
     question_id: Identifier
     answered_question: StrictBool
     material_progress: StrictBool
-    summary: Identifier
+    summary: Identifier = Field(description=(
+        "State observed actions and identifiers, then label any interpretation and its basis. "
+        "Familiar names, ports, or successful events do not establish normality, authorization, "
+        "benignness, or intent. Shared hosts/accounts alone do not establish a process or session link."
+    ))
     new_entities: list[AssessmentEntity]
     evidence_candidate_row_refs: list[Identifier]
     coverage_changes: list[Identifier]
@@ -341,16 +400,77 @@ class Finding(DomainModel):
     def validate_grounding(self) -> "Finding":
         """Require grounding appropriate to the finding classification."""
 
-        if self.classification in {
-            FindingClassification.HUNT_LEAD,
-            FindingClassification.SUPPORTED_OBSERVATION,
-        } and not self.evidence_ids:
-            raise ValueError("this finding classification requires evidence_ids")
-        if (
-            self.classification == FindingClassification.NOT_SUPPORTED_WITHIN_SCOPE
-            and not self.query_ids
-        ):
-            raise ValueError("not_supported_within_scope requires completed query_ids")
+        required_field = FINDING_GROUNDING_FIELDS[self.classification]
+        if not getattr(self, required_field):
+            reason = (
+                "this finding classification requires evidence_ids"
+                if required_field == "evidence_ids"
+                else "not_supported_within_scope requires completed query_ids"
+            )
+            raise ValueError(reason)
+        return self
+
+
+class FindingProposal(DomainModel):
+    """Model-produced finding before the application assigns its identifier."""
+
+    title: Identifier = Field(description=(
+        "A concise description of the supported observation or precisely scoped search outcome. "
+        "Keep uncertainty in the title when the relationship or interpretation is unconfirmed."
+    ))
+    classification: FindingClassification
+    statement: Identifier = Field(description=(
+        "State only facts established by the cited records or the selected completed searches. "
+        "Describe observed actions and the actual relationship keys; shared hosts/accounts and "
+        "overlapping times do not prove the same process, session, or cause. A positive observation "
+        "must not also assert absence of malicious behavior. Normality, benignness, authorization, "
+        "and intent require their own supplied support, not familiar names or successful events."
+    ))
+    confidence: Confidence
+    evidence_ids: list[UUID]
+    query_ids: list[UUID]
+    inference: StrictStr | Literal["unknown"] = Field(description=(
+        "A tentative interpretation that names its supporting observations and unresolved alternatives, "
+        "or unknown. This field is not permission to invent facts or intent. Report a supplied "
+        "baseline comparison or authorization within its documented scope; otherwise leave those "
+        "properties unknown. A caveat here or in limitations does not repair an overstated title or statement."
+    ))
+    limitations: list[Identifier]
+
+    @model_validator(mode="after")
+    def validate_grounding(self) -> "FindingProposal":
+        required_field = FINDING_GROUNDING_FIELDS[self.classification]
+        if not getattr(self, required_field):
+            reason = (
+                "this finding classification requires evidence_ids"
+                if required_field == "evidence_ids"
+                else "not_supported_within_scope requires completed query_ids"
+            )
+            raise ValueError(reason)
+        return self
+
+
+class QuestionAnswer(DomainModel):
+    """Evidence-grounded response for one application-assigned question slot."""
+
+    summary: Identifier = Field(description=(
+        "A concise answer to this question, normally one to three sentences. Summarize the "
+        "material conclusions across all its findings and the limits on those conclusions; "
+        "do not enumerate every finding or introduce claims unsupported by them. Preserve "
+        "uncertainty and distinguish observations from inference. This is presentation text, "
+        "not a limit on the findings or evidence retained for the investigation."
+    ))
+    findings: list[FindingProposal]
+    limitations: list[Identifier] = Field(description=(
+        "Missing evidence or scope limits that prevent answering this question fully. "
+        "If findings is empty, explain why the question cannot be answered. "
+        "A populated answer slot does not establish factual correctness or complete coverage."
+    ))
+
+    @model_validator(mode="after")
+    def require_answer_or_limitation(self) -> "QuestionAnswer":
+        if not self.findings and not self.limitations:
+            raise ValueError("each question requires a supported finding or an explicit limitation")
         return self
 
 

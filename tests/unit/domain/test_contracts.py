@@ -117,13 +117,26 @@ def test_query_proposal_enforces_result_mode_caps() -> None:
     }
     assert QueryProposal.model_validate(base).result_mode is ResultMode.REPRESENTATIVE
 
-    base["max_results"] = 101
-    with pytest.raises(ValidationError):
-        QueryProposal.model_validate(base)
+    for mode, cap in (("aggregate", 500), ("representative", 10_000), ("targeted", 10_000)):
+        base.update(result_mode=mode, max_results=cap)
+        assert QueryProposal.model_validate(base).max_results == cap
+        base["max_results"] = cap + 1
+        with pytest.raises(ValidationError):
+            QueryProposal.model_validate(base)
 
-    base["result_mode"] = "targeted"
-    base["max_results"] = 500
-    assert QueryProposal.model_validate(base).max_results == 500
+
+def test_query_schema_exposes_mode_specific_limits() -> None:
+    schema = QueryProposal.model_json_schema()
+    limits = {
+        item["if"]["properties"]["result_mode"]["const"]:
+        item["then"]["properties"]["max_results"]["maximum"]
+        for item in schema["allOf"]
+    }
+    assert limits == {"aggregate": 500, "representative": 10_000, "targeted": 10_000}
+    description = schema["properties"]["max_results"]["description"]
+    for mode, cap in limits.items():
+        assert f"{mode}={cap}" in description
+    assert schema["additionalProperties"] is False
 
 
 def test_query_validation_result_requires_consistent_execution_fields() -> None:

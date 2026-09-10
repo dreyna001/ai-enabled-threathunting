@@ -216,7 +216,13 @@ def run_suite(case_file: Path = CASE_FILE, answer_file: Path = ANSWER_FILE) -> d
 
     cases = load_cases(case_file)
     answers = load_answers(answer_file)
-    return score_runs([run_synthetic_case(case) for case in cases], answers)
+    return {
+        **score_runs([run_synthetic_case(case) for case in cases], answers),
+        "qualification_mode": "synthetic",
+        "measurement_basis": "scripted fixtures; scoring regression only",
+        "analytical_quality_assessed": False,
+        "live_model_quality_measured": False,
+    }
 
 
 __all__ = ["KnownAnswerError", "load_answers", "load_cases", "run_suite", "run_synthetic_case", "score_runs"]

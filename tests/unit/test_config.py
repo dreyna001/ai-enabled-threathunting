@@ -29,9 +29,9 @@ def test_settings_accept_valid_minimal_configuration(tmp_path: Path) -> None:
     settings = RuntimeSettings.model_validate(valid_config(tmp_path))
     assert settings.reports.display_timezone == "UTC"
     assert settings.hunt_limits.query_start_cutoff_utc.hour == 20
-    assert settings.hunt_limits.hard_completion_minutes == 12
+    assert settings.hunt_limits.hard_completion_minutes == 20
     assert settings.hunt_limits.agent_cycles == 8
-    assert settings.hunt_limits.query_count == 12
+    assert settings.hunt_limits.query_count == 50
     assert settings.hunt_limits.per_hunt_query_concurrency == 2
     assert settings.hunt_limits.active_hunts_per_deployment == 1
     assert settings.hunt_limits.deployment_query_concurrency == 2
@@ -39,11 +39,12 @@ def test_settings_accept_valid_minimal_configuration(tmp_path: Path) -> None:
     assert settings.hunt_limits.per_query_byte_limit == 250 * 1024 * 1024
     assert settings.hunt_limits.per_hunt_row_limit == 50_000
     assert settings.hunt_limits.per_hunt_byte_limit == 1024 * 1024 * 1024
-    assert settings.hunt_limits.representative_event_limit == 100
+    assert settings.hunt_limits.representative_event_limit == 500
     assert settings.hunt_limits.targeted_event_limit == 500
     assert settings.hunt_limits.model_calls == 12
     assert settings.hunt_limits.input_tokens == 500_000
     assert settings.hunt_limits.output_tokens == 96_000
+    assert settings.hunt_limits.output_tokens_per_call == 8_000
     assert settings.execution.mode == "direct"
     assert settings.execution.deployment_scope_id == "default"
 
@@ -51,6 +52,48 @@ def test_settings_accept_valid_minimal_configuration(tmp_path: Path) -> None:
 def test_settings_reject_unknown_keys(tmp_path: Path) -> None:
     value = valid_config(tmp_path)
     value["unexpected"] = True
+    with pytest.raises(ValueError):
+        RuntimeSettings.model_validate(value)
+
+
+@pytest.mark.parametrize("minutes,model_seconds,expected", [
+    (20, 300, (1200, 780, 120, 300)),
+    (20, 120, (1200, 960, 120, 120)),
+    (12, 300, (720, 300, 120, 300)),
+    (1, 300, (60, 1, 1, 58)),
+])
+def test_hunt_time_reserves_follow_runtime_settings(tmp_path: Path, minutes: int, model_seconds: int, expected: tuple[int, ...]) -> None:
+    value = valid_config(tmp_path)
+    value["hunt_limits"] = {"hard_completion_minutes": minutes, "model_call_timeout_seconds": model_seconds}
+    limits = runtime.budget_limits_from_settings(RuntimeSettings.model_validate(value))
+    assert (limits.hard_hunt_seconds, limits.query_start_cutoff_seconds,
+            limits.max_inflight_query_seconds_after_cutoff, limits.synthesis_allowance_seconds) == expected
+    assert limits.max_model_call_timeout_seconds == model_seconds
+    assert limits.max_model_calls == 12
+
+
+def test_shipped_runtime_uses_twenty_minutes_and_five_minute_model_calls() -> None:
+    settings = RuntimeSettings.from_yaml(Path("deploy/docker/config/runtime.yml"))
+    limits = runtime.budget_limits_from_settings(settings)
+    assert limits.hard_hunt_seconds == 1200
+    assert limits.query_start_cutoff_seconds == 780
+    assert limits.max_splunk_queries == 50
+    assert limits.max_model_call_timeout_seconds == limits.synthesis_allowance_seconds == 300
+
+
+def test_configured_per_call_model_budget_reaches_runtime(tmp_path: Path) -> None:
+    value = valid_config(tmp_path)
+    value["hunt_limits"] = {"output_tokens_per_call": 24000}
+    settings = RuntimeSettings.model_validate(value)
+    limits = runtime.budget_limits_from_settings(settings)
+    assert limits.max_model_output_tokens_per_call == 24000
+    assert limits.max_model_output_tokens == 96000
+
+
+@pytest.mark.parametrize("limit", [0, -1, 96001])
+def test_invalid_per_call_model_budget_is_rejected(tmp_path: Path, limit: int) -> None:
+    value = valid_config(tmp_path)
+    value["hunt_limits"] = {"output_tokens_per_call": limit}
     with pytest.raises(ValueError):
         RuntimeSettings.model_validate(value)
 

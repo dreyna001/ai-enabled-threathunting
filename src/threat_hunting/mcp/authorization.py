@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import StrEnum
 from types import MappingProxyType
-from typing import Any, Callable, Literal, overload
+from typing import Any, Callable, Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -297,7 +297,7 @@ def _request_value(request: MCPToolRequest | Mapping[str, Any], *names: str, def
     return default
 
 
-def _row_value(row: Mapping[str, Any], *names: str, default: Any = None) -> Any:
+def _row_value(row: Mapping[Any, Any], *names: str, default: Any = None) -> Any:
     """Return the first populated persisted value matching column aliases."""
 
     for name in names:
@@ -814,21 +814,6 @@ def _configured_subject(settings: Any, explicit: str | None) -> str | None:
     return None
 
 
-@overload
-def authorize_mcp_tool_request(
-    bind: Engine | Connection,
-    request: MCPToolRequest | Mapping[str, Any],
-    *,
-    authenticated_subject: str | None = None,
-    configured_service_subject: str | None = None,
-    service_subject: str | None = None,
-    settings: Any = None,
-    envelope_worker_id: str | None = None,
-    worker_id: str | None = None,
-    now: datetime | None = None,
-) -> AuthorizedMCPContext: ...
-
-
 def authorize_mcp_tool_request(
     bind: Engine | Connection,
     request: MCPToolRequest | Mapping[str, Any],
@@ -886,19 +871,14 @@ def authorize_mcp_tool_request(
         required_tables = (job_table, execution_table, hunt_table, approval_table, plan_table, config_table, discovery_table, query_table)
         if any(table is None for table in required_tables):
             raise AuthorizationDenied(AuthorizationCode.SCHEMA_UNAVAILABLE, "authorization schema incomplete", request_id=request_id)
-        assert all(
-            table is not None
-            for table in (
-                job_table,
-                execution_table,
-                hunt_table,
-                approval_table,
-                plan_table,
-                config_table,
-                discovery_table,
-                query_table,
-            )
-        )
+        assert job_table is not None
+        assert execution_table is not None
+        assert hunt_table is not None
+        assert approval_table is not None
+        assert plan_table is not None
+        assert config_table is not None
+        assert discovery_table is not None
+        assert query_table is not None
 
         job = _lookup_any(
             conn,

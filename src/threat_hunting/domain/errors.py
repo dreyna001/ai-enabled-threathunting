@@ -14,6 +14,7 @@ class FailureCategory(StrEnum):
 
     TEMPORARY_NETWORK = "temporary_network"
     RATE_LIMITED = "rate_limited"
+    PROVIDER_QUOTA_EXHAUSTED = "provider_quota_exhausted"
     PROVIDER_SERVER_ERROR = "provider_server_error"
     INVALID_CREDENTIALS = "invalid_credentials"
     PERMISSION_DENIED = "permission_denied"
@@ -46,6 +47,7 @@ ErrorCategory = FailureCategory
 _RETRY_CLASSIFICATION: dict[FailureCategory, RetryClassification] = {
     FailureCategory.TEMPORARY_NETWORK: RetryClassification.RETRYABLE,
     FailureCategory.RATE_LIMITED: RetryClassification.RETRYABLE,
+    FailureCategory.PROVIDER_QUOTA_EXHAUSTED: RetryClassification.NON_RETRYABLE,
     FailureCategory.PROVIDER_SERVER_ERROR: RetryClassification.RETRYABLE,
     FailureCategory.MODEL_OUTPUT_INVALID: RetryClassification.REPAIRABLE,
     FailureCategory.INVALID_CREDENTIALS: RetryClassification.NON_RETRYABLE,
@@ -117,3 +119,33 @@ class FailureRecord(DomainModel):
 DomainFailure = FailureRecord
 Failure = FailureRecord
 
+
+class WorkflowError(RuntimeError):
+    """Base workflow failure with a stable HTTP-facing category."""
+
+
+class NotFound(WorkflowError):
+    pass
+
+
+class Conflict(WorkflowError):
+    pass
+
+
+class Validation(WorkflowError):
+    pass
+
+
+class IntegrationUnavailable(WorkflowError):
+    pass
+
+
+
+
+def failure_metadata(error: BaseException) -> dict[str, str]:
+    """Record diagnostic categories without exception text, inputs, or credentials."""
+    try:
+        category = FailureCategory(getattr(error, "category", FailureCategory.UNKNOWN))
+    except (ValueError, TypeError):
+        category = FailureCategory.UNKNOWN
+    return {"category": category.value, "error_type": type(error).__name__[:100]}

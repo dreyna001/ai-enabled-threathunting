@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=75"]
+requires = ["setuptools==84.0.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -25,6 +25,9 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
   "httpx>=0.28,<1",
+  "jsonschema>=4.23,<5",
+  "mypy>=1.19,<2",
+  "types-PyYAML>=6,<7",
   "pytest>=8.3,<9",
 ]
 
@@ -41,3 +44,15 @@ where = ["src"]
 addopts = "-ra"
 testpaths = ["tests"]
 
+
+[tool.mypy]
+python_version = "3.12"
+files = ["src/threat_hunting"]
+check_untyped_defs = true
+warn_unused_ignores = true
+no_implicit_optional = true
+show_error_codes = true
+
+[[tool.mypy.overrides]]
+module = ["boto3", "boto3.*", "botocore.*", "splunklib.*"]
+ignore_missing_imports = true

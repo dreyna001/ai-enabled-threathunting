@@ -1,0 +1,28 @@
+{
+  "review_basis": "scenario defined before any model execution; assistant-authored, not independent analyst acceptance",
+  "expected_event_ids": [
+    "f111007a-756f-5582-87f3-eaafbf69b2d3"
+  ],
+  "key_events": {
+    "nearby_browser_dns": "76c1cc20-48ab-5244-bfc2-8d2f56a6375c",
+    "nearby_browser_network": "1f9b1718-6a3f-509c-b5d4-7679469e8115",
+    "advisory_process": "f111007a-756f-5582-87f3-eaafbf69b2d3",
+    "advisory_process_end": "8b6993e0-4f1e-5862-bf33-6b3dca0d913e"
+  },
+  "supported": [
+    "One observed process image hash matches the supplied advisory indicator.",
+    "Nearby browser DNS/network records have a different process GUID from that process."
+  ],
+  "not_established": [
+    "Ransomware execution, encryption, compromise, actor attribution, or operator intent.",
+    "That browser connections were made by HRsword.exe.",
+    "Authorization of either copy of HRsword.exe or a causal link from the failed login on ws-18."
+  ],
+  "outage": {
+    "host": "ws-17.corp.example",
+    "source": "network",
+    "earliest_utc": "2026-01-06T12:00:00Z",
+    "latest_utc": "2026-01-06T18:00:00Z",
+    "meaning": "Endpoint network collection unavailable; other telemetry continues. Absence does not establish no connections."
+  }
+}

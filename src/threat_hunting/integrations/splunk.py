@@ -2,18 +2,22 @@
 
 Only the official ``splunk-sdk`` client is used when a real client is needed.
 Unit tests inject a small fake client, which keeps the adapter deterministic and
-avoids a live Splunk dependency.  Discovery deliberately uses metadata REST
-resources and collection properties; it never calls ``search`` or reads event
-rows.
+avoids a live Splunk dependency.  Discovery uses metadata REST resources and
+collection properties by default. Production planning also reads a bounded
+indexed-sourcetype catalog using tstats. An explicitly approved source scope may
+additionally use one bounded ``fieldsummary`` search to discover search-time
+fields.
 """
 
 from __future__ import annotations
 
 import json
+import re
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from itertools import islice
 from pathlib import Path
 from types import MappingProxyType
@@ -81,6 +85,8 @@ class SplunkConnectionConfig:
     app_namespace: str = "search"
     max_discovery_items: int = 1_000
     max_discovery_bytes: int = 8 * 1024 * 1024
+    max_representative_searches: int = 8
+    representative_event_limit: int = 1
 
     def __post_init__(self) -> None:
         parsed = urlsplit(self.endpoint)
@@ -104,6 +110,10 @@ class SplunkConnectionConfig:
             raise ValueError("max_discovery_items is outside the supported bound")
         if self.max_discovery_bytes <= 0 or self.max_discovery_bytes > 64 * 1024 * 1024:
             raise ValueError("max_discovery_bytes is outside the supported bound")
+        if self.max_representative_searches <= 0 or self.max_representative_searches > 100:
+            raise ValueError("max_representative_searches is outside the supported bound")
+        if self.representative_event_limit <= 0 or self.representative_event_limit > 100:
+            raise ValueError("representative_event_limit is outside the supported bound")
         if self.token is not None:
             object.__setattr__(
                 self,
@@ -147,7 +157,7 @@ class SplunkConnectionConfig:
             "verify": str(self.ca_bundle_path) if self.ca_bundle_path else self.verify_tls,
         }
         if self.token is not None:
-            kwargs["token"] = self.token.get_secret_value()
+            kwargs["token"] = self.token.get_secret_value() if isinstance(self.token, SecretStr) else self.token
         else:
             kwargs["username"] = self.username
             kwargs["password"] = self.password.get_secret_value()  # type: ignore[union-attr]
@@ -293,7 +303,7 @@ class SplunkConnector:
         if self._client is not None:
             return self._client
         try:
-            from splunklib import client as splunk_client  # type: ignore[import-not-found]
+            from splunklib import client as splunk_client
         except ImportError as exc:
             raise AdapterError(
                 FailureCategory.INVALID_CONFIGURATION,
@@ -322,13 +332,14 @@ class SplunkConnector:
         callback: Callable[[], Any],
         *,
         cancellation_token: Any = None,
+        timeout_seconds: float | None = None,
     ) -> Any:
         if _is_cancelled(cancellation_token):
             raise AdapterError(FailureCategory.CANCELLED, "operation cancelled", operation=operation)
         executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="splunk-adapter")
         future = executor.submit(callback)
         try:
-            value = future.result(timeout=self.config.timeout_seconds)
+            value = future.result(timeout=timeout_seconds or self.config.timeout_seconds)
         except FutureTimeout as exc:
             future.cancel()
             raise AdapterError(
@@ -395,10 +406,7 @@ class SplunkConnector:
             return value
         reader = getattr(value, "read", None)
         if callable(reader):
-            try:
-                raw = reader(max_bytes + 1) if max_bytes is not None else reader()
-            except Exception:  # noqa: BLE001 - malformed SDK response
-                return None
+            raw = reader(max_bytes + 1) if max_bytes is not None else reader()
             return SplunkConnector._decode_response(raw, max_bytes=max_bytes)
         body = getattr(value, "body", None)
         if body is not None:
@@ -538,6 +546,340 @@ class SplunkConnector:
             return names
         return []
 
+    @staticmethod
+    def _approved_scope_values(values: Iterable[str] | None, *, label: str, limit: int) -> tuple[str, ...]:
+        """Normalize a bounded exact-value scope supplied for schema discovery."""
+
+        if values is None:
+            return ()
+        if isinstance(values, str):
+            raise AdapterError(
+                FailureCategory.VALIDATION_FAILURE,
+                f"approved {label} must be a bounded sequence of strings",
+                operation="discover",
+            )
+        normalized: list[str] = []
+        for value in islice(values, limit + 1):
+            if not isinstance(value, str) or not value.strip():
+                raise AdapterError(
+                    FailureCategory.VALIDATION_FAILURE,
+                    f"approved {label} must contain non-empty strings",
+                    operation="discover",
+                )
+            value = value.strip()
+            # These values are inserted into a fixed search expression.  Keep
+            # them exact and token-like; wildcards and SPL syntax are not an
+            # approved discovery scope.
+            if not re.fullmatch(r"[A-Za-z0-9_.:-]+", value):
+                raise AdapterError(
+                    FailureCategory.VALIDATION_FAILURE,
+                    f"approved {label} must contain exact safe identifiers",
+                    operation="discover",
+                )
+            if value not in normalized:
+                normalized.append(value)
+        if len(normalized) > limit:
+            raise AdapterError(
+                FailureCategory.BUDGET_EXHAUSTED,
+                f"approved {label} exceed the discovery limit",
+                operation="discover",
+            )
+        return tuple(normalized)
+
+    @staticmethod
+    def _absolute_utc(value: datetime | str | None, *, label: str) -> datetime | None:
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            parsed = value
+        elif isinstance(value, str):
+            try:
+                parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError as exc:
+                raise AdapterError(
+                    FailureCategory.VALIDATION_FAILURE,
+                    f"{label} must be an absolute RFC3339 timestamp",
+                    operation="discover",
+                ) from exc
+        else:
+            raise AdapterError(
+                FailureCategory.VALIDATION_FAILURE,
+                f"{label} must be an absolute RFC3339 timestamp",
+                operation="discover",
+            )
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise AdapterError(
+                FailureCategory.VALIDATION_FAILURE,
+                f"{label} must include a timezone",
+                operation="discover",
+            )
+        return parsed.astimezone(timezone.utc)
+
+    @staticmethod
+    def _schema_fields(records: Iterable[Mapping[str, Any]]) -> list[str]:
+        """Extract fieldsummary rows or keys from bounded representative rows."""
+
+        fields: list[str] = []
+        for record in records:
+            field = record.get("field") or record.get("fieldName")
+            if isinstance(field, str) and field.strip():
+                fields.append(field.strip())
+                continue
+            for key in record:
+                if isinstance(key, str) and key.strip() and key not in {"_raw", "_time"}:
+                    fields.append(key.strip())
+        return list(dict.fromkeys(fields))
+
+    def _representative_schema(
+        self,
+        index: str,
+        sourcetype: str,
+        *,
+        earliest_utc: datetime,
+        latest_utc: datetime,
+        cancellation_token: Any = None,
+    ) -> list[str]:
+        """Read a bounded fieldsummary result for one approved source pair."""
+
+        client = self._get_client()
+        query = (
+            f'search index="{index}" sourcetype="{sourcetype}" '
+            f"| head {self.config.representative_event_limit} | fieldsummary"
+        )
+        kwargs = {
+            "earliest_time": earliest_utc.isoformat().replace("+00:00", "Z"),
+            "latest_time": latest_utc.isoformat().replace("+00:00", "Z"),
+            "output_mode": "json",
+            # ``fieldsummary`` emits one row per field, so cap its output by
+            # the discovery item budget while fixed ``head`` separately caps
+            # the number of events inspected.
+            "max_count": self.config.max_discovery_items,
+        }
+
+        def submit_schema_search() -> Any:
+            search = getattr(client, "search", None)
+            if callable(search):
+                return search(query, **kwargs)
+            jobs = getattr(client, "jobs", None)
+            create = getattr(jobs, "create", None)
+            if callable(create):
+                return create(query, **kwargs)
+            raise RuntimeError("Splunk client does not expose read-only search")
+
+        # Keep the returned job available so cancellation that arrives while
+        # Splunk is creating it can still cancel that job before returning.
+        # The caller checks the token immediately before entering this method.
+        job_or_rows = self._invoke("discover.representative_schema", submit_schema_search)
+        if _is_cancelled(cancellation_token):
+            cancel = getattr(job_or_rows, "cancel", None)
+            if callable(cancel):
+                try:
+                    cancel()
+                except Exception:  # noqa: BLE001 - cancellation is best effort
+                    pass
+            raise AdapterError(FailureCategory.CANCELLED, "operation cancelled", operation="discover")
+        results = getattr(job_or_rows, "results", None)
+        if callable(results):
+            try:
+                self._wait_for_representative_job(job_or_rows, cancellation_token=cancellation_token)
+                job_or_rows = self._invoke(
+                    "discover.representative_schema.results",
+                    lambda: results(output_mode="json", count=self.config.max_discovery_items),
+                    cancellation_token=cancellation_token,
+                )
+            except AdapterError:
+                cancel = getattr(job_or_rows, "cancel", None)
+                if callable(cancel) and _is_cancelled(cancellation_token):
+                    try:
+                        cancel()
+                    except Exception:  # noqa: BLE001 - cancellation is best effort
+                        pass
+                raise
+        try:
+            records = self._records(
+                job_or_rows,
+                limit=self.config.max_discovery_items,
+                max_bytes=self.config.max_discovery_bytes,
+            )
+        except ValueError as exc:
+            raise AdapterError(
+                FailureCategory.BUDGET_EXHAUSTED,
+                "representative schema exceeded the configured byte limit",
+                operation="discover.representative_schema",
+            ) from exc
+        return self._schema_fields(records)
+
+    def _wait_for_representative_job(self, job: Any, *, cancellation_token: Any = None) -> None:
+        """Wait for a read-only discovery job within the transport timeout."""
+
+        is_done = getattr(job, "is_done", None)
+        content = getattr(job, "content", None)
+        has_status = callable(is_done) or isinstance(content, Mapping)
+        if not has_status:
+            return
+        deadline = time.monotonic() + self.config.timeout_seconds
+        while True:
+            if _is_cancelled(cancellation_token):
+                cancel = getattr(job, "cancel", None)
+                if callable(cancel):
+                    try:
+                        cancel()
+                    except Exception:  # noqa: BLE001 - cancellation is best effort
+                        pass
+                raise AdapterError(FailureCategory.CANCELLED, "operation cancelled", operation="discover")
+            if callable(is_done):
+                done = bool(
+                    self._invoke(
+                        "discover.representative_schema.status",
+                        is_done,
+                        cancellation_token=cancellation_token,
+                        timeout_seconds=max(0.001, min(self.config.timeout_seconds, deadline - time.monotonic())),
+                    )
+                )
+            else:
+                current = getattr(job, "content", {})
+                done = False
+                if isinstance(current, Mapping):
+                    done = any(
+                        value is True
+                        or str(value).lower()
+                        in {"1", "true", "yes", "done", "complete", "finished", "success", "successful"}
+                        for key, value in current.items()
+                        if key in {"isDone", "done", "is_done", "dispatchState", "state", "status"}
+                    )
+            if done:
+                return
+            if time.monotonic() >= deadline:
+                cancel = getattr(job, "cancel", None)
+                if callable(cancel):
+                    try:
+                        cancel()
+                    except Exception:  # noqa: BLE001 - cancellation is best effort
+                        pass
+                raise AdapterError(
+                    FailureCategory.HARD_TIMEOUT,
+                    "representative schema search exceeded its transport timeout",
+                    operation="discover.representative_schema",
+                )
+            refresh = getattr(job, "refresh", None)
+            if callable(refresh):
+                self._invoke(
+                    "discover.representative_schema.refresh",
+                    refresh,
+                    cancellation_token=cancellation_token,
+                    timeout_seconds=max(0.001, min(self.config.timeout_seconds, deadline - time.monotonic())),
+                )
+            time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+
+    def _representative_event(
+        self,
+        index: str,
+        *,
+        earliest_utc: datetime,
+        latest_utc: datetime,
+        cancellation_token: Any = None,
+    ) -> list[Mapping[str, Any]]:
+        """Read one bounded event from an index to derive an actual source pair."""
+
+        client = self._get_client()
+        query = f'search index="{index}" | head {self.config.representative_event_limit}'
+        kwargs = {
+            "earliest_time": earliest_utc.isoformat().replace("+00:00", "Z"),
+            "latest_time": latest_utc.isoformat().replace("+00:00", "Z"),
+            "output_mode": "json",
+            "max_count": self.config.representative_event_limit,
+        }
+
+        def submit() -> Any:
+            search = getattr(client, "search", None)
+            if callable(search):
+                return search(query, **kwargs)
+            jobs = getattr(client, "jobs", None)
+            create = getattr(jobs, "create", None)
+            if callable(create):
+                return create(query, **kwargs)
+            raise RuntimeError("Splunk client does not expose read-only search")
+
+        job_or_rows = self._invoke(
+            "discover.representative_event",
+            submit,
+            cancellation_token=cancellation_token,
+        )
+        if _is_cancelled(cancellation_token):
+            cancel = getattr(job_or_rows, "cancel", None)
+            if callable(cancel):
+                try:
+                    cancel()
+                except Exception:  # noqa: BLE001 - cancellation is best effort
+                    pass
+            raise AdapterError(FailureCategory.CANCELLED, "operation cancelled", operation="discover")
+        results = getattr(job_or_rows, "results", None)
+        if callable(results):
+            self._wait_for_representative_job(job_or_rows, cancellation_token=cancellation_token)
+            job_or_rows = self._invoke(
+                "discover.representative_event.results",
+                lambda: results(output_mode="json", count=self.config.representative_event_limit),
+                cancellation_token=cancellation_token,
+            )
+        try:
+            return self._records(
+                job_or_rows,
+                limit=self.config.representative_event_limit,
+                max_bytes=self.config.max_discovery_bytes,
+            )
+        except ValueError as exc:
+            raise AdapterError(
+                FailureCategory.BUDGET_EXHAUSTED,
+                "representative event exceeded the configured byte limit",
+                operation="discover.representative_event",
+            ) from exc
+
+    def _indexed_sourcetypes(
+        self, indexes: Iterable[str], *, latest_utc: datetime, cancellation_token: Any = None,
+    ) -> list[Mapping[str, Any]]:
+        """Read indexed source names without scanning or returning raw events."""
+        names = self._approved_scope_values(indexes, label="indexes", limit=self.config.max_discovery_items)
+        if not names:
+            return []
+        scope = " OR ".join(f'index="{name}"' for name in names)
+        query = f"| tstats count WHERE ({scope}) BY sourcetype | head {self.config.max_discovery_items}"
+        client = self._get_client()
+        kwargs = {"earliest_time": "0", "latest_time": latest_utc.isoformat().replace("+00:00", "Z"),
+                  "output_mode": "json", "max_count": self.config.max_discovery_items}
+
+        def submit() -> Any:
+            search = getattr(client, "search", None)
+            if callable(search):
+                return search(query, **kwargs)
+            create = getattr(getattr(client, "jobs", None), "create", None)
+            if callable(create):
+                return create(query, **kwargs)
+            raise RuntimeError("Splunk client does not expose read-only search")
+
+        job = self._invoke("discover.indexed_sourcetypes", submit)
+        try:
+            if _is_cancelled(cancellation_token):
+                raise AdapterError(FailureCategory.CANCELLED, "operation cancelled", operation="discover")
+            results = getattr(job, "results", None)
+            if callable(results):
+                self._wait_for_representative_job(job, cancellation_token=cancellation_token)
+                rows = self._invoke(
+                    "discover.indexed_sourcetypes.results",
+                    lambda: results(output_mode="json", count=self.config.max_discovery_items),
+                    cancellation_token=cancellation_token,
+                )
+            else:
+                rows = job
+            return self._records(rows, limit=self.config.max_discovery_items, max_bytes=self.config.max_discovery_bytes)
+        finally:
+            if _is_cancelled(cancellation_token):
+                cancel = getattr(job, "cancel", None)
+                if callable(cancel):
+                    try:
+                        cancel()
+                    except Exception:  # noqa: BLE001 - cancellation cleanup is best effort
+                        pass
+
     def healthcheck(self, *, cancellation_token: Any = None) -> SplunkHealth:
         checked = datetime.now(timezone.utc)
         try:
@@ -556,8 +898,25 @@ class SplunkConnector:
             return SplunkHealth(False, checked, self._normalize_error(exc, operation="healthcheck").failure.category)
         return SplunkHealth(True, checked)
 
-    def discover(self, *, cancellation_token: Any = None) -> SplunkDiscovery:
-        """Discover Splunk catalog metadata without submitting an event search."""
+    def discover(
+        self,
+        *,
+        approved_indexes: Iterable[str] | None = None,
+        approved_sourcetypes: Iterable[str] | None = None,
+        source_pairs: Iterable[tuple[str, str]] | None = None,
+        earliest_utc: datetime | str | None = None,
+        latest_utc: datetime | str | None = None,
+        include_representative_schemas: bool = False,
+        include_indexed_sources: bool = False,
+        cancellation_token: Any = None,
+    ) -> SplunkDiscovery:
+        """Discover catalog metadata and optionally bounded representative schemas.
+
+        Metadata endpoints remain the default.  Representative searches are
+        attempted only when the caller supplies exact approved source values
+        and absolute UTC bounds; those values are intersected with the
+        metadata catalog before a fixed ``head``/``fieldsummary`` search runs.
+        """
 
         if _is_cancelled(cancellation_token):
             raise AdapterError(FailureCategory.CANCELLED, "operation cancelled", operation="discover")
@@ -570,6 +929,49 @@ class SplunkConnector:
         models: list[str] = []
         errors: list[str] = []
         limitations: list[str] = []
+        sampling_limited = False
+        approved_index_values = self._approved_scope_values(
+            approved_indexes,
+            label="indexes",
+            limit=self.config.max_discovery_items,
+        )
+        approved_sourcetype_values = self._approved_scope_values(
+            approved_sourcetypes,
+            label="sourcetypes",
+            limit=self.config.max_discovery_items,
+        )
+        representative_earliest = self._absolute_utc(earliest_utc, label="earliest_utc")
+        representative_latest = self._absolute_utc(latest_utc, label="latest_utc")
+        selected_pairs: list[tuple[str, str]] | None = None
+        if source_pairs is not None:
+            selected_pairs = []
+            for pair in islice(source_pairs, self.config.max_discovery_items + 1):
+                if (not isinstance(pair, (tuple, list)) or len(pair) != 2
+                        or pair[0] not in approved_index_values or pair[1] not in approved_sourcetype_values):
+                    raise AdapterError(FailureCategory.VALIDATION_FAILURE, "source pair is outside the exact discovery scope", operation="discover")
+                if tuple(pair) not in selected_pairs:
+                    selected_pairs.append((pair[0], pair[1]))
+            if not selected_pairs or len(selected_pairs) > self.config.max_discovery_items or representative_earliest is None or representative_latest is None:
+                raise AdapterError(FailureCategory.VALIDATION_FAILURE, "source pairs require a bounded source and UTC scope", operation="discover")
+        if (representative_earliest is None) != (representative_latest is None):
+            raise AdapterError(
+                FailureCategory.VALIDATION_FAILURE,
+                "earliest_utc and latest_utc must be supplied together",
+                operation="discover",
+            )
+        if representative_earliest is not None and representative_latest is not None:
+            if representative_latest <= representative_earliest:
+                raise AdapterError(
+                    FailureCategory.VALIDATION_FAILURE,
+                    "latest_utc must be after earliest_utc",
+                    operation="discover",
+                )
+            if (representative_latest - representative_earliest).total_seconds() > 7 * 24 * 60 * 60:
+                raise AdapterError(
+                    FailureCategory.BUDGET_EXHAUSTED,
+                    "representative discovery time range exceeds seven days",
+                    operation="discover",
+                )
         endpoint_specs: list[tuple[str, Callable[[], list[Mapping[str, Any]]]]] = [
             (
                 "indexes",
@@ -640,11 +1042,153 @@ class SplunkConnector:
                 if schema_fields:
                     schemas[name] = schema_fields
 
+        indexed_tstats_succeeded = False
+        if include_indexed_sources:
+            limitations.append(
+                "Source catalog combines configured sourcetypes with indexed sourcetypes observed through discovery time. "
+                "Catalog membership does not establish a source pair, activity in the hunt window, or continuous coverage; "
+                "absence from this bounded catalog does not prove a source is unavailable."
+            )
+            try:
+                probe_indexes = approved_index_values or indexes
+                source_rows = self._indexed_sourcetypes(
+                    probe_indexes, latest_utc=discovered_at, cancellation_token=cancellation_token,
+                )
+                indexed_tstats_succeeded = bool(probe_indexes)
+                for record in source_rows:
+                    name = record.get("sourcetype")
+                    if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]+", name):
+                        raise ValueError("indexed sourcetype metadata contained an invalid identifier")
+                    sourcetypes.append(name)
+                if len(source_rows) >= self.config.max_discovery_items:
+                    sampling_limited = True
+                    limitations.append("indexed sourcetype result limit reached; discovery is partial")
+            except AdapterError as exc:
+                if exc.category is FailureCategory.CANCELLED:
+                    raise
+                errors.append(f"indexed_sourcetypes: {exc.failure.category.value}")
+            except Exception as exc:  # noqa: BLE001 - preserve observable partial discovery
+                normalized = self._normalize_error(exc, operation="discover.indexed_sourcetypes")
+                errors.append(f"indexed_sourcetypes: {normalized.failure.category.value}")
+
         for record in results.get("fields", []):
             name = self._record_name(record)
             if name:
                 fields.append(name)
             fields.extend(self._field_names(record))
+
+        metadata_has_complete_schemas = bool(sourcetypes) and all(schemas.get(source) for source in sourcetypes)
+        if include_representative_schemas and not metadata_has_complete_schemas and not any(
+            (approved_index_values, approved_sourcetype_values, representative_earliest, representative_latest)
+        ):
+            candidates = [
+                (index, values)
+                for index, values in coverage.items()
+                if values.get("earliest") and values.get("latest")
+            ][: self.config.max_representative_searches]
+            if len(coverage) > len(candidates):
+                limitations.append("representative schema search limit reached; discovery is partial")
+                sampling_limited = True
+            for index, bounds in candidates:
+                try:
+                    index_earliest = self._absolute_utc(bounds["earliest"], label="index earliest coverage")
+                    index_latest = self._absolute_utc(bounds["latest"], label="index latest coverage")
+                    if index_earliest is None or index_latest is None or index_latest <= index_earliest:
+                        continue
+                    if (index_latest - index_earliest).total_seconds() > 7 * 24 * 60 * 60:
+                        index_earliest = index_latest - timedelta(days=7)
+                    rows = self._representative_event(
+                        index,
+                        earliest_utc=index_earliest,
+                        latest_utc=index_latest,
+                        cancellation_token=cancellation_token,
+                    )
+                    for row in rows:
+                        source = row.get("sourcetype")
+                        if not isinstance(source, str) or not source.strip():
+                            limitations.append(f"representative event had no sourcetype for index {index}")
+                            continue
+                        source = source.strip()
+                        if not re.fullmatch(r"[A-Za-z0-9_.:-]+", source):
+                            limitations.append(f"representative event sourcetype was not a safe identifier for index {index}")
+                            continue
+                        if source not in sourcetypes:
+                            sourcetypes.append(source)
+                        schema_fields = self._representative_schema(
+                            index,
+                            source,
+                            earliest_utc=index_earliest,
+                            latest_utc=index_latest,
+                            cancellation_token=cancellation_token,
+                        )
+                        if schema_fields:
+                            schemas.setdefault(source, []).extend(schema_fields)
+                            fields.extend(schema_fields)
+                except AdapterError as exc:
+                    if exc.category is FailureCategory.CANCELLED:
+                        raise
+                    errors.append(f"representative_schema[{index}]: {exc.failure.category.value}")
+                except Exception as exc:  # noqa: BLE001 - normalize partial discovery
+                    normalized = self._normalize_error(exc, operation="discover.representative_schema")
+                    errors.append(f"representative_schema[{index}]: {normalized.failure.category.value}")
+        elif approved_index_values and approved_sourcetype_values and representative_earliest and representative_latest:
+            catalog_indexes = set(indexes)
+            catalog_sourcetypes = set(sourcetypes)
+            candidate_pairs = [
+                pair for pair in selected_pairs
+                if pair[0] in catalog_indexes and pair[1] in catalog_sourcetypes
+            ] if selected_pairs is not None else [
+                (index, sourcetype)
+                for index in approved_index_values
+                if index in catalog_indexes
+                for sourcetype in approved_sourcetype_values
+                if sourcetype in catalog_sourcetypes
+            ]
+            if len(candidate_pairs) > self.config.max_representative_searches:
+                limitations.append("representative schema search limit reached; discovery is partial")
+                sampling_limited = True
+            if selected_pairs is not None and len(candidate_pairs) != len(selected_pairs):
+                limitations.append("some requested source pairs were not present in the catalog; discovery is partial")
+                sampling_limited = True
+            pairs = candidate_pairs[: self.config.max_representative_searches]
+            if not pairs:
+                limitations.append("approved representative schema scope was not present in Splunk metadata")
+            limitations.append(
+                f"Field lists combine catalog metadata and any bounded samples of up to {self.config.representative_event_limit} events per source "
+                f"within {representative_earliest.isoformat()} to {representative_latest.isoformat()}; they are not exhaustive. "
+                "A field missing from a sample does not establish that the source cannot provide it."
+            )
+            for index, sourcetype in pairs:
+                if selected_pairs is None and schemas.get(sourcetype):
+                    continue
+                if _is_cancelled(cancellation_token):
+                    raise AdapterError(FailureCategory.CANCELLED, "operation cancelled", operation="discover")
+                try:
+                    schema_fields = self._representative_schema(
+                        index,
+                        sourcetype,
+                        earliest_utc=representative_earliest,
+                        latest_utc=representative_latest,
+                        cancellation_token=cancellation_token,
+                    )
+                    if schema_fields:
+                        schemas.setdefault(sourcetype, []).extend(schema_fields)
+                        fields.extend(schema_fields)
+                    else:
+                        limitations.append(f"representative schema was empty for {index}/{sourcetype}")
+                except AdapterError as exc:
+                    if exc.category is FailureCategory.CANCELLED:
+                        raise
+                    errors.append(f"representative_schema[{index}/{sourcetype}]: {exc.failure.category.value}")
+                except Exception as exc:  # noqa: BLE001 - normalize partial discovery
+                    normalized = self._normalize_error(exc, operation="discover.representative_schema")
+                    errors.append(
+                        f"representative_schema[{index}/{sourcetype}]: {normalized.failure.category.value}"
+                    )
+        elif any((approved_index_values, approved_sourcetype_values, representative_earliest, representative_latest)):
+            limitations.append(
+                "representative schema discovery requires approved indexes, sourcetypes, and absolute UTC bounds"
+            )
 
         tstats_available: bool | None = None
         for record in results.get("data_models", []):
@@ -657,6 +1201,12 @@ class SplunkConnector:
                     models.append(name)
                 if "tstats_available" in content:
                     tstats_available = bool(content["tstats_available"])
+        if indexed_tstats_succeeded:
+            tstats_available = True
+            limitations.append(
+                "Indexed-source tstats succeeded in this discovery scope; this does not establish "
+                "data-model acceleration or support for every tstats query."
+            )
         if tstats_available is None and models:
             tstats_available = True
         if tstats_available is None:
@@ -667,7 +1217,7 @@ class SplunkConnector:
             limitations.append("index time coverage was unavailable from metadata endpoints")
         if errors:
             limitations.append("one or more metadata endpoints failed; discovery is partial")
-        complete = not errors and bool(indexes or sourcetypes)
+        complete = not errors and not sampling_limited and bool(indexes or sourcetypes)
         if not results:
             raise AdapterError(
                 FailureCategory.TEMPORARY_NETWORK,
@@ -760,31 +1310,35 @@ class SplunkConnector:
         *,
         max_bytes: int | None = None,
         cancellation_token: Any = None,
+        timeout_seconds: float | None = None,
     ) -> list[Mapping[str, Any]]:
         if page < 0 or limit <= 0 or limit > 10_000:
             raise AdapterError(FailureCategory.VALIDATION_FAILURE, "invalid result page or limit", operation="fetch_results")
         if max_bytes is not None and max_bytes <= 0:
             raise AdapterError(FailureCategory.VALIDATION_FAILURE, "invalid result byte limit", operation="fetch_results")
-        job = self._invoke("fetch_results", lambda: self._job(job_id), cancellation_token=cancellation_token)
+        if timeout_seconds is not None and timeout_seconds <= 0:
+            raise AdapterError(FailureCategory.HARD_TIMEOUT, "Result page deadline exceeded", operation="fetch_results")
 
-        def fetch() -> Any:
+        def fetch() -> list[Mapping[str, Any]]:
+            job = self._job(job_id)
             results = getattr(job, "results", None)
             if not callable(results):
                 raise RuntimeError("Splunk job does not expose results")
-            return results(offset=page * limit, count=limit)
+            try:
+                return self._records(
+                    results(offset=page * limit, count=limit, output_mode="json"),
+                    limit=limit, max_bytes=max_bytes,
+                )[:limit]
+            except ValueError as exc:
+                raise AdapterError(
+                    FailureCategory.BUDGET_EXHAUSTED,
+                    "Splunk result exceeded the configured byte limit", operation="fetch_results",
+                ) from exc
 
-        try:
-            return self._records(
-                self._invoke("fetch_results", fetch, cancellation_token=cancellation_token),
-                limit=limit,
-                max_bytes=max_bytes,
-            )[:limit]
-        except ValueError as exc:
-            raise AdapterError(
-                FailureCategory.BUDGET_EXHAUSTED,
-                "Splunk result exceeded the configured byte limit",
-                operation="fetch_results",
-            ) from exc
+        return self._invoke(
+            "fetch_results", fetch, cancellation_token=cancellation_token,
+            timeout_seconds=min(timeout_seconds, self.config.timeout_seconds) if timeout_seconds is not None else None,
+        )
 
     def cancel(self, job_id: str, *, cancellation_token: Any = None) -> bool:
         # Cancellation is best effort: once a hunt is being cancelled, the

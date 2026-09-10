@@ -7,7 +7,7 @@ requests are real model requests and therefore increment ``model_calls``.
 
 from __future__ import annotations
 
-from typing import Annotated
+from typing import Annotated, Literal
 
 from pydantic import Field, StrictBool, StrictInt, model_validator
 
@@ -20,12 +20,12 @@ PositiveInt = Annotated[StrictInt, Field(gt=0)]
 class BudgetLimits(DomainModel):
     """Deployment-adjustable per-hunt and shared concurrency limits."""
 
-    hard_hunt_seconds: PositiveInt = 720
-    query_start_cutoff_seconds: PositiveInt = 480
+    hard_hunt_seconds: PositiveInt = 1200
+    query_start_cutoff_seconds: PositiveInt = 960
     max_inflight_query_seconds_after_cutoff: PositiveInt = 120
     synthesis_allowance_seconds: PositiveInt = 120
     max_agent_cycles: PositiveInt = 8
-    max_splunk_queries: PositiveInt = 12
+    max_splunk_queries: PositiveInt = 50
     max_concurrent_splunk_jobs: PositiveInt = 2
     max_active_hunts: PositiveInt = 1
     max_deployment_splunk_jobs: PositiveInt = 2
@@ -40,7 +40,7 @@ class BudgetLimits(DomainModel):
     max_cached_bytes_per_query: PositiveInt = 262_144_000
     max_cached_rows_per_hunt: PositiveInt = 50_000
     max_cached_bytes_per_hunt: PositiveInt = 1_073_741_824
-    max_representative_events: PositiveInt = 100
+    max_representative_events: PositiveInt = 500
     max_targeted_events: PositiveInt = 500
     max_model_repair_attempts: NonNegativeInt = 2
     max_transport_retries: NonNegativeInt = 1
@@ -69,6 +69,16 @@ class BudgetLimits(DomainModel):
         return self
 
 
+class ModelOutputCheck(DomainModel):
+    """Observed validation outcomes; these do not measure claim truth."""
+
+    contract: str
+    repair: StrictBool
+    contract_valid: StrictBool | None = None
+    grounding_valid: StrictBool | None = None
+    validation_error_code: Literal["schema", "json", "reference_label", "citation_relationship", "structure"] | None = None
+
+
 class BudgetCounters(DomainModel):
     """Mutable usage ledger for one hunt.
 
@@ -81,6 +91,7 @@ class BudgetCounters(DomainModel):
     model_config = {"extra": "forbid", "validate_assignment": True}
 
     model_calls: NonNegativeInt = 0
+    model_output_checks: list[ModelOutputCheck] = Field(default_factory=list)
     failed_model_calls: NonNegativeInt = 0
     model_repair_attempts: NonNegativeInt = 0
     model_input_tokens: NonNegativeInt = 0
@@ -193,4 +204,3 @@ class BudgetCounters(DomainModel):
 # Compatibility vocabulary used in services and tests.
 UsageCounters = BudgetCounters
 HuntBudget = BudgetLimits
-

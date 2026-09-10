@@ -30,6 +30,17 @@ describe("workflow API session transport", () => {
     expect(headers.get("Authorization")).toBeNull();
   });
 
+  it("requests a bounded page and loads complete details separately", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response(JSON.stringify([{ hunt_id: "h1", title: "Summary" }])))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ hunt_id: "h1", plan: { hypothesis: "detail" } })));
+    await workflowApi.listHunts(undefined, { limit: 51, cursor: "previous-id" });
+    const hunt = await workflowApi.getHunt(undefined, "h1");
+    expect(fetchMock).toHaveBeenNthCalledWith(1, "/api/hunts?limit=51&cursor=previous-id", expect.anything());
+    expect(fetchMock).toHaveBeenNthCalledWith(2, "/api/hunts/h1", expect.anything());
+    expect(hunt.plan?.hypothesis).toBe("detail");
+  });
+
   it("signals session expiry on an unauthorized API response", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({ detail: "authentication required" }), { status: 401 }));
     const onExpired = vi.fn();
@@ -38,6 +49,17 @@ describe("workflow API session transport", () => {
     expect(onExpired).toHaveBeenCalledTimes(1);
     delete (globalThis as { window?: unknown }).window;
     fetchMock.mockRestore();
+  });
+
+  it("restores a cookie-backed session after a page refresh", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({
+      user_id: "u1", username: "analyst", display_name: "Analyst", csrf_token: "csrf-2",
+    }), { status: 200, headers: { "Content-Type": "application/json" } }));
+
+    await expect(workflowApi.me()).resolves.toEqual({
+      user: { user_id: "u1", username: "analyst", display_name: "Analyst" }, csrf_token: "csrf-2",
+    });
+    expect(fetchMock).toHaveBeenCalledWith("/api/auth/me", expect.objectContaining({ credentials: "include" }));
   });
 
   it("provides an explicit logout request", async () => {

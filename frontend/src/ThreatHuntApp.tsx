@@ -4,6 +4,7 @@ import {
   Hunt,
   HuntPlan,
   HuntResults,
+  HuntSummary,
   JobStatus,
   JsonObject,
   ReportPreview,
@@ -149,7 +150,7 @@ function CreateHuntForm({ token, onCreated }: { token: string | undefined; onCre
       <label>Hypothesis<textarea required rows={3} value={form.hypothesis} onChange={(event) => update("hypothesis", event.target.value)} /></label>
       <label>Objective<textarea required rows={3} value={form.objective} onChange={(event) => update("objective", event.target.value)} /></label>
       <IntakeField id="threat-intelligence" label="Threat intelligence" value={form.threat_intelligence} onChange={(value) => update("threat_intelligence", value)} onError={setError} />
-      <IntakeField id="synthetic-data" label="Synthetic data" value={form.synthetic_data} onChange={(value) => update("synthetic_data", value)} onError={setError} />
+      <IntakeField id="synthetic-data" label="Environment context" value={form.synthetic_data} onChange={(value) => update("synthetic_data", value)} onError={setError} />
       <StatusMessage error={error} />
       <button disabled={busy}>{busy ? "Creating hunt…" : "Create hunt"}</button>
     </form>
@@ -159,10 +160,33 @@ function CreateHuntForm({ token, onCreated }: { token: string | undefined; onCre
 function ResultCard({ title, items }: { title: string; items: JsonObject[] }) {
   return (
     <section className="vs-card">
-      <header><h3>{title}</h3><span>{items.length}</span></header>
-      {items.length ? items.map((item, index) => (
+      <header><h3>{title}</h3><span>{items.length} · scroll</span></header>
+      {items.length ? <div className="vs-result-items">{items.map((item, index) => (
         <pre key={String(item.id ?? item.evidence_id ?? item.finding_id ?? `${title}-${index}`)}>{dump(item)}</pre>
-      )) : <p className="vs-empty">None recorded.</p>}
+      ))}</div> : <p className="vs-empty">None recorded.</p>}
+    </section>
+  );
+}
+
+export function QuestionAnswers({ results }: { results: HuntResults }) {
+  if (!results.question_answers?.length) return null;
+  const findings = new Map(results.findings.map((item) => [String(item.finding_id), item]));
+  return (
+    <section className="vs-card vs-span">
+      <h2>Approved question answers</h2>
+      {results.question_answers.map((answer) => (
+        <article key={answer.question_id}>
+          <h3>{answer.question}</h3>
+          <p>{answer.summary}</p>
+          {answer.limitations.length > 0 && <ul>{answer.limitations.map((item, index) => <li key={`${answer.question_id}-${index}`}>{item}</li>)}</ul>}
+          {answer.finding_ids.length > 0 && <details>
+            <summary>View all {answer.finding_ids.length} findings for this question</summary>
+            <div className="vs-result-items">{answer.finding_ids.map((id) => (
+              <pre key={id}>{findings.has(id) ? dump(findings.get(id)) : "Finding details unavailable. Reload the hunt results."}</pre>
+            ))}</div>
+          </details>}
+        </article>
+      ))}
     </section>
   );
 }
@@ -191,6 +215,15 @@ function Workspace({ session, initial, onBack }: { session: Session; initial: Hu
     setResults(nextResults);
     setReport(nextReport);
   }
+
+  useEffect(() => {
+    if (!["report_draft", "finalized", "budget_exhausted"].includes(hunt.state)) return;
+    let active = true;
+    void loadArtifacts(hunt).catch((error) => {
+      if (active) setError(errorMessage(error));
+    });
+    return () => { active = false; };
+  }, [hunt.hunt_id, hunt.state, session.access_token]);
 
   async function act(name: string, task: () => Promise<Hunt>) {
     setBusy(name);
@@ -273,47 +306,98 @@ function Workspace({ session, initial, onBack }: { session: Session; initial: Hu
       <StatusMessage error={error} />
       <nav className="vs-steps" aria-label="Workflow">{["Create", "Discover", "Review", "Approve", "Execute", "Report"].map((step, index) => <span key={step}>{index + 1} {step}</span>)}</nav>
       <div className="vs-grid">
-        <section className="vs-card"><p className="vs-eyebrow">Data source</p><h2>Splunk discovery</h2>{hunt.discovery_snapshot ? <pre>{dump(hunt.discovery_snapshot)}</pre> : <p className="vs-empty">No metadata discovered.</p>}<button disabled={Boolean(busy) || hunt.state !== "created"} onClick={() => void act("discover", () => workflowApi.discover(session.access_token, hunt.hunt_id))}>{busy === "discover" ? "Discovering…" : "Run discovery"}</button></section>
+        <section className="vs-card"><p className="vs-eyebrow">Data source</p><h2>Splunk discovery</h2>{hunt.discovery_snapshot ? <div className="vs-scroll-panel"><pre>{dump(hunt.discovery_snapshot)}</pre></div> : <p className="vs-empty">No metadata discovered.</p>}<button disabled={Boolean(busy) || hunt.state !== "created"} onClick={() => void act("discover", () => workflowApi.discover(session.access_token, hunt.hunt_id))}>{busy === "discover" ? "Discovering…" : "Run discovery"}</button></section>
         <section className="vs-card"><header><div><p className="vs-eyebrow">Analyst gate</p><h2>Plan review</h2></div><span>v{hunt.plan_version ?? 1}</span></header>{hunt.plan ? <><label>Plan JSON<textarea className="vs-code" rows={15} readOnly={!editable} value={planBody} onChange={(event) => setPlanBody(event.target.value)} /></label>{editable && <><button disabled={Boolean(busy)} onClick={savePlan}>Save edits</button><label>Revision instruction<textarea value={instruction} onChange={(event) => setInstruction(event.target.value)} /></label><button className="vs-secondary" disabled={Boolean(busy) || !instruction.trim()} onClick={() => void act("revise", () => workflowApi.revisePlan(session.access_token, hunt.hunt_id, instruction))}>Request revision</button><label>Analyst note<textarea value={note} onChange={(event) => setNote(event.target.value)} /></label><div className="vs-actions"><button disabled={Boolean(busy)} onClick={() => void act("approve", () => workflowApi.approvePlan(session.access_token, hunt.hunt_id, note))}>Approve plan</button><button className="vs-danger" disabled={Boolean(busy) || !note.trim()} onClick={() => void act("reject", () => workflowApi.rejectPlan(session.access_token, hunt.hunt_id, note))}>Reject plan</button></div></>}</> : <p className="vs-empty">Run discovery to generate a plan.</p>}</section>
         <section className="vs-card vs-span"><p className="vs-eyebrow">Bounded action</p><h2>Execution</h2><p className="vs-muted">Uses only the approved, locked plan and limits.</p>{job && <p className="vs-muted" role="status">Job <code>{job.job_id}</code> · {job.status}{job.attempts === undefined ? "" : ` · attempt ${job.attempts}`}{job.last_error ? ` · ${job.last_error}` : ""}</p>}<div className="vs-actions"><button disabled={Boolean(busy) || hunt.state !== "approved"} onClick={() => void act("execute", () => workflowApi.execute(session.access_token, hunt.hunt_id))}>{busy === "execute" ? "Executing…" : "Execute approved hunt"}</button>{canCancel && <button className="vs-danger" disabled={Boolean(busy)} onClick={() => void act("cancel", () => workflowApi.cancel(session.access_token, hunt.hunt_id))}>{busy === "cancel" ? "Cancelling…" : "Cancel hunt"}</button>}</div></section>
-        {results && <div className="vs-results vs-span">{(["findings", "evidence", "entities", "timeline"] as const).map((key) => <ResultCard key={key} title={key[0].toUpperCase() + key.slice(1)} items={results[key]} />)}</div>}
-        {report && <section className="vs-card vs-span"><header><div><p className="vs-eyebrow">Final product</p><h2>Editable report</h2></div><span>{report.state} · v{report.version}</span></header><label>Structured report content<textarea className="vs-code" rows={20} readOnly={report.state === "finalized"} value={reportBody} onChange={(event) => setReportBody(event.target.value)} /></label><div className="vs-actions">{report.state !== "finalized" ? <><button disabled={Boolean(busy)} onClick={() => void saveReport(false)}>Save draft</button><button className="vs-secondary" disabled={Boolean(busy)} onClick={() => void saveReport(true)}>Save and finalize PDF</button></> : <button onClick={() => void workflowApi.downloadPdf(session.access_token, hunt.hunt_id).catch((error) => setError(errorMessage(error)))}>Download PDF</button>}</div></section>}
+        {results && <QuestionAnswers results={results} />}
+        {results && <div id="hunt-results" className="vs-results vs-span">{(["findings", "evidence", "entities", "timeline"] as const).map((key) => <ResultCard key={key} title={key[0].toUpperCase() + key.slice(1)} items={results[key]} />)}</div>}
+        {report && <section className="vs-card vs-span"><header><div><p className="vs-eyebrow">Final product</p><h2>Editable report</h2></div><span>{report.state} · v{report.version}</span></header><p>The report summarizes the investigation. <a href="#hunt-results">View complete findings and evidence</a>.</p><label>Structured report content<textarea className="vs-code" rows={20} readOnly={report.state === "finalized"} value={reportBody} onChange={(event) => setReportBody(event.target.value)} /></label><div className="vs-actions">{report.state !== "finalized" ? <><button disabled={Boolean(busy)} onClick={() => void saveReport(false)}>Save draft</button><button className="vs-secondary" disabled={Boolean(busy)} onClick={() => void saveReport(true)}>Save and finalize PDF</button></> : <button onClick={() => void workflowApi.downloadPdf(session.access_token, hunt.hunt_id).catch((error) => setError(errorMessage(error)))}>Download PDF</button>}</div></section>}
       </div>
     </main>
   );
 }
 
 function Dashboard({ session, onSelect, onSignOut }: { session: Session; onSelect: (hunt: Hunt) => void; onSignOut: () => void }) {
-  const [hunts, setHunts] = useState<Hunt[]>([]);
+  const pageSize = 50;
+  const [hunts, setHunts] = useState<HuntSummary[]>([]);
+  const [cursors, setCursors] = useState<Array<string | undefined>>([undefined]);
   const [loading, setLoading] = useState(true);
+  const [opening, setOpening] = useState<string | null>(null);
   const [error, setError] = useState("");
+  const cursor = cursors[cursors.length - 1];
+  const visible = hunts.slice(0, pageSize);
 
   useEffect(() => {
     let active = true;
-    workflowApi.listHunts(session.access_token)
+    setLoading(true);
+    setError("");
+    workflowApi.listHunts(session.access_token, { limit: pageSize + 1, cursor })
       .then((items) => { if (active) setHunts(items); })
-      .catch((error) => { if (active) setError(errorMessage(error)); })
+      .catch((error) => { if (active) { setHunts([]); setError(errorMessage(error)); } })
       .finally(() => { if (active) setLoading(false); });
     return () => { active = false; };
-  }, [session.access_token]);
+  }, [session.access_token, cursor]);
+
+  async function openHunt(id: string) {
+    setOpening(id);
+    setError("");
+    try {
+      onSelect(await workflowApi.getHunt(session.access_token, id));
+    } catch (error) {
+      setError(errorMessage(error));
+    } finally {
+      setOpening(null);
+    }
+  }
 
   return (
-    <><header className="vs-top"><div><p className="vs-eyebrow">Federal SOC workspace</p><strong>Threat Hunt Console</strong></div><div><span>{session.user.display_name}</span><button className="vs-secondary" onClick={onSignOut}>Sign out</button></div></header><main className="vs-dashboard"><section aria-busy={loading}><h1>Threat hunts</h1><p className="vs-muted">Create a bounded investigation or resume one.</p><StatusMessage error={error} />{loading ? <p className="vs-muted" role="status">Loading hunts…</p> : hunts.length ? hunts.map((hunt) => <button className="vs-hunt-row" key={hunt.hunt_id} onClick={() => onSelect(hunt)}><span><strong>{hunt.title}</strong><small>{hunt.hypothesis}</small></span><span>{hunt.state.replaceAll("_", " ")}</span></button>) : <p className="vs-empty">No hunts yet. Create your first investigation.</p>}</section><CreateHuntForm token={session.access_token} onCreated={onSelect} /></main></>
+    <>
+      <header className="vs-top">
+        <div><p className="vs-eyebrow">Federal SOC workspace</p><strong>Threat Hunt Console</strong></div>
+        <div><span>{session.user.display_name}</span><button className="vs-secondary" onClick={onSignOut}>Sign out</button></div>
+      </header>
+      <main className="vs-dashboard">
+        <section aria-busy={loading || Boolean(opening)}>
+          <h1>Threat hunts</h1><p className="vs-muted">Create a bounded investigation or resume one.</p>
+          <StatusMessage error={error} />
+          {loading ? <p className="vs-muted" role="status">Loading hunts…</p> : visible.length ? visible.map((hunt) => (
+            <button className="vs-hunt-row" key={hunt.hunt_id} disabled={Boolean(opening)} onClick={() => void openHunt(hunt.hunt_id)}>
+              <span><strong>{hunt.title}</strong><small>{hunt.hypothesis}</small></span>
+              <span>{opening === hunt.hunt_id ? "Opening…" : hunt.state.replaceAll("_", " ")}</span>
+            </button>
+          )) : !error && <p className="vs-empty">{cursors.length === 1 ? "No hunts yet. Create your first investigation." : "No more hunts on this page."}</p>}
+          <nav className="vs-actions" aria-label="Hunt pages">
+            <button className="vs-secondary" disabled={loading || Boolean(opening) || cursors.length === 1} onClick={() => setCursors((pages) => pages.slice(0, -1))}>Previous</button>
+            <span aria-live="polite">Page {cursors.length}</span>
+            <button className="vs-secondary" disabled={loading || Boolean(opening) || hunts.length <= pageSize} onClick={() => setCursors((pages) => [...pages, visible[pageSize - 1].hunt_id])}>Next</button>
+          </nav>
+        </section>
+        <CreateHuntForm token={session.access_token} onCreated={onSelect} />
+      </main>
+    </>
   );
 }
 
 export default function ThreatHuntApp() {
-  const [session, setSession] = useState<Session | null>(null);
+  const [session, setSession] = useState<Session | null | undefined>(undefined);
   const [selected, setSelected] = useState<Hunt | null>(null);
 
   useEffect(() => {
+    let active = true;
     const handleExpiry = () => {
       setSession(null);
       setSelected(null);
     };
     window.addEventListener("threat-hunt-auth-expired", handleExpiry);
-    return () => window.removeEventListener("threat-hunt-auth-expired", handleExpiry);
+    void workflowApi.me()
+      .then((restored) => { if (active) setSession(restored); })
+      .catch(() => { if (active) setSession(null); });
+    return () => {
+      active = false;
+      window.removeEventListener("threat-hunt-auth-expired", handleExpiry);
+    };
   }, []);
+  if (session === undefined) return <main className="vs-login"><p className="vs-muted">Restoring session…</p></main>;
   if (!session) return <Login onLogin={setSession} />;
   if (selected) return <Workspace session={session} initial={selected} onBack={() => setSelected(null)} />;
   return <Dashboard session={session} onSelect={setSelected} onSignOut={() => {

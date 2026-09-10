@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
+
 import json
 import ssl
 import threading
+import logging
+import time
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeout
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -166,7 +170,7 @@ class ModelResponse:
 
     @property
     def provider_name(self) -> str:
-        return self.provider.value
+        return ModelProvider(self.provider).value
 
     @property
     def output(self) -> str:
@@ -174,7 +178,7 @@ class ModelResponse:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "provider": self.provider.value,
+            "provider": ModelProvider(self.provider).value,
             "model_name": self.model_name,
             "text": self.text,
             "structured": self.structured,
@@ -237,11 +241,54 @@ def _usage_from_mapping(value: Any) -> ModelUsage:
     return ModelUsage(integer(input_tokens), integer(output_tokens), integer(total_tokens))
 
 
-class BaseModelAdapter:
-    """Common timeout, cancellation, and normalized failure behavior."""
+class BaseModelAdapter(ABC):
+    """Bound provider work, including work that outlives its caller's deadline."""
 
     provider: ModelProvider
     model_name: str
+    timeout_seconds: float = 120.0
+    _client: Any = None
+
+    @abstractmethod
+    def complete(self, request: ModelRequest, *, timeout_seconds: float | None = None, cancellation_token: Any = None) -> ModelResponse:
+        """Each concrete adapter must transport and normalize one request."""
+        raise NotImplementedError
+
+    def __init__(self) -> None:
+        self._call_lock = threading.Lock()
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="model-adapter")
+        self._in_flight: Future[Any] | None = None
+        self._closed = False
+
+    @property
+    def outstanding_calls(self) -> int:
+        with self._call_lock:
+            return int(self._in_flight is not None and not self._in_flight.done())
+
+    def close(self) -> None:
+        """Stop admission and release the SDK client after active work finishes."""
+        with self._call_lock:
+            if self._closed:
+                return
+            self._closed = True
+            future = self._in_flight
+            self._executor.shutdown(wait=False, cancel_futures=True)
+        if future is not None and not future.done():
+            future.add_done_callback(lambda _future: self._close_client())
+        else:
+            self._close_client()
+
+    def _close_client(self) -> None:
+        client = getattr(self, "_client", None)
+        close = getattr(client, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception as exc:  # SDK boundary; never log credential-bearing details.
+                logging.getLogger(__name__).warning(
+                    "model client cleanup failed", extra={"error_type": type(exc).__name__},
+                )
+        self._client = None
 
     def _bounded_call(
         self,
@@ -256,19 +303,39 @@ class BaseModelAdapter:
         timeout = timeout_seconds if timeout_seconds is not None else self.timeout_seconds
         if timeout <= 0 or timeout > 600:
             raise AdapterError(FailureCategory.INVALID_CONFIGURATION, "model timeout is outside the supported bound", operation=operation)
-        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="model-adapter")
-        future: Future[Any] = executor.submit(callback)
+        deadline = time.monotonic() + timeout
+        with self._call_lock:
+            if self._closed:
+                raise AdapterError(FailureCategory.INVALID_CONFIGURATION, "model adapter is closed", operation=operation)
+            if self._in_flight is not None and not self._in_flight.done():
+                raise AdapterError(
+                    FailureCategory.BUDGET_EXHAUSTED,
+                    "model capacity is occupied by an outstanding call; no additional work was started",
+                    operation=operation,
+                )
+            future = self._executor.submit(callback)
+            self._in_flight = future
         try:
-            value = future.result(timeout=timeout)
-        except FutureTimeout as exc:
-            future.cancel()
-            raise AdapterError(FailureCategory.HARD_TIMEOUT, "model operation exceeded its timeout", operation=operation) from exc
+            while True:
+                if is_cancelled(cancellation_token):
+                    future.cancel()
+                    raise AdapterError(FailureCategory.CANCELLED, "model operation cancelled", operation=operation)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    future.cancel()
+                    raise AdapterError(FailureCategory.HARD_TIMEOUT, "model operation exceeded its timeout", operation=operation)
+                try:
+                    value = future.result(timeout=min(remaining, 0.05))
+                    break
+                except FutureTimeout:
+                    if future.done():
+                        raise
         except AdapterError:
             raise
-        except Exception as exc:  # noqa: BLE001 - provider-specific errors are normalized
+        except Exception as exc:  # Provider-specific errors are normalized at this boundary.
             raise self.normalize_provider_error(exc, operation=operation) from exc
-        finally:
-            executor.shutdown(wait=False, cancel_futures=True)
+        # A running Future cannot be cancelled. It remains the admission gate
+        # until it actually finishes; caller timeout never frees that capacity.
         if is_cancelled(cancellation_token):
             raise AdapterError(FailureCategory.CANCELLED, "model operation cancelled", operation=operation)
         return value
@@ -277,12 +344,30 @@ class BaseModelAdapter:
     def normalize_provider_error(exc: Exception, *, operation: str) -> AdapterError:
         name = type(exc).__name__.lower()
         status = getattr(exc, "status_code", None) or getattr(exc, "status", None)
+        response = getattr(exc, "response", None)
+        if status is None and isinstance(response, Mapping):
+            metadata = response.get("ResponseMetadata", {})
+            if isinstance(metadata, Mapping):
+                status = metadata.get("HTTPStatusCode")
         if isinstance(status, str) and status.isdigit():
             status = int(status)
         numeric_status = status if isinstance(status, int) and not isinstance(status, bool) else None
+        # Inspect only stable error codes. Provider messages can contain private
+        # account or request details and must never become application errors.
+        body = getattr(exc, "body", None)
+        details = body.get("error", body) if isinstance(body, Mapping) else {}
+        quota_exhausted = isinstance(details, Mapping) and any(
+            details.get(key) in ("insufficient_quota", "credit_balance_exhausted")
+            for key in ("code", "type")
+        )
         if numeric_status in {401, 403} or "auth" in name or "credential" in name:
             category = FailureCategory.INVALID_CREDENTIALS if numeric_status != 403 else FailureCategory.PERMISSION_DENIED
             message = "model provider authentication failed" if category is FailureCategory.INVALID_CREDENTIALS else "model provider permission denied"
+        elif numeric_status in {400, 404, 422}:
+            category, message = FailureCategory.INVALID_CONFIGURATION, "model provider rejected the request configuration"
+        elif numeric_status == 429 and quota_exhausted:
+            category = FailureCategory.PROVIDER_QUOTA_EXHAUSTED
+            message = "model provider account credits or quota exhausted; restore API capacity before retrying"
         elif numeric_status == 429 or "rate" in name or "thrott" in name:
             category, message = FailureCategory.RATE_LIMITED, "model provider rate limit reached"
         elif numeric_status is not None and numeric_status >= 500:
@@ -295,6 +380,10 @@ class BaseModelAdapter:
             category, message = FailureCategory.TEMPORARY_NETWORK, "model provider connection failed"
         else:
             category, message = FailureCategory.UNKNOWN, "model provider operation failed"
+        logging.getLogger(__name__).warning(
+            "model provider failure operation=%s category=%s status=%s error_type=%s",
+            operation, category.value, numeric_status, type(exc).__name__,
+        )
         return AdapterError(category, message, operation=operation)
 
     def generate(self, request: ModelRequest, **kwargs: Any) -> ModelResponse:

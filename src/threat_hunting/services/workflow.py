@@ -4,22 +4,25 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import secrets
+from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping, Sequence
 from uuid import UUID, uuid4
 
 from pydantic import TypeAdapter
 
 from argon2 import PasswordHasher
 from argon2.exceptions import VerificationError, VerifyMismatchError
-from sqlalchemy import JSON, Boolean, Column, DateTime, ForeignKey, Integer, LargeBinary, MetaData, String, Table, Text, select, update
-from sqlalchemy.engine import Engine
+from sqlalchemy import JSON, Boolean, Column, DateTime, ForeignKey, Index, Integer, LargeBinary, MetaData, String, Table, Text, and_, func, or_, select, update
+from sqlalchemy.engine import Connection, Engine
 
+from threat_hunting.db import bounded_audit_metadata
 from threat_hunting.domain.budgets import BudgetCounters, BudgetLimits
-from threat_hunting.domain.contracts import HuntPlan, QueryProposal
-from threat_hunting.domain.errors import FailureCategory
-from threat_hunting.domain.spl_policy import SPLPolicy
+from threat_hunting.domain.contracts import FindingProposal, FollowUpDecision, HuntPlan, QueryAssessment, QueryProposal
+from threat_hunting.domain.errors import FailureCategory, failure_metadata
+from threat_hunting.domain.spl_policy import SPLPolicy, parse_spl
 from threat_hunting.domain.state import HuntState
 from threat_hunting.integrations.errors import AdapterError
 from threat_hunting.integrations.models.base import ModelAdapter
@@ -32,8 +35,35 @@ from threat_hunting.services.orchestration import (
     sha256_json,
 )
 from threat_hunting.services.jobs import JobConflict, JobService
+from threat_hunting.services.threat_intel import query_ioc_context, intelligence_sources, validate_intelligence_refs
+from threat_hunting.services.evidence import query_source_coverage
 from threat_hunting.services.uploads import UploadLimits
 
+
+
+from threat_hunting.domain.errors import (Conflict as Conflict, IntegrationUnavailable as IntegrationUnavailable, NotFound as NotFound, Validation as Validation, WorkflowError as WorkflowError)
+from threat_hunting.services.reports import (
+    _concise_report_content,
+    _derive_report_limitations,
+    _formatted_pdf,
+    _execution_report_content,
+    _validate_report_content,
+)
+from threat_hunting.services.investigation import (
+    _assessment_context,
+    _assessment_repair_context,
+    _balanced_evidence_sample,
+    _completed_query_questions,
+    _flatten_scalar_values,
+    _follow_up_decision_contract,
+    _materialize_findings,
+    _materialize_question_answers,
+    _materialize_follow_up_questions,
+    _question_synthesis_contract,
+    _synthesis_context,
+    _pending_investigation_questions,
+    _follow_up_proposal_errors,
+)
 
 workflow_metadata = MetaData()
 CONTEXT_INPUT_MAX_LENGTH = 50_000
@@ -83,6 +113,8 @@ hunts = Table(
     Column("created_at_utc", DateTime(timezone=True), nullable=False),
     Column("updated_at_utc", DateTime(timezone=True), nullable=False),
 )
+Index("ix_workflow_hunts_owner_created_id", hunts.c.owner_id, hunts.c.created_at_utc, hunts.c.hunt_id)
+
 audit_records = Table(
     "audit_records", workflow_metadata,
     Column("audit_id", String(36), primary_key=True),
@@ -101,26 +133,6 @@ audit_records = Table(
     Column("metadata", JSON, nullable=True),
     Column("timestamp_utc", DateTime(timezone=True), nullable=False),
 )
-
-
-class WorkflowError(RuntimeError):
-    """Base workflow failure with a stable HTTP-facing category."""
-
-
-class NotFound(WorkflowError):
-    pass
-
-
-class Conflict(WorkflowError):
-    pass
-
-
-class Validation(WorkflowError):
-    pass
-
-
-class IntegrationUnavailable(WorkflowError):
-    pass
 
 
 def _now() -> datetime:
@@ -163,53 +175,6 @@ class _HuntCancellationToken:
             return True
 
 
-def _validate_report_content(content: Mapping[str, Any], results: Mapping[str, Any] | None) -> dict[str, Any]:
-    """Validate bounded report structure and retained-evidence references."""
-
-    normalized = _json_copy(content)
-    required = {"hypothesis", "objective_and_scope", "data_sources_used", "findings", "selected_evidence", "entities", "timeline", "coverage_and_limitations", "conclusion_and_disposition", "query_appendix"}
-    if not isinstance(normalized, dict) or required.difference(normalized):
-        raise Validation("report is missing required sections")
-    if len(json.dumps(normalized, ensure_ascii=False).encode("utf-8")) > 1024 * 1024:
-        raise Validation("report content exceeds the 1 MiB limit")
-    for key in ("hypothesis", "objective_and_scope", "conclusion_and_disposition"):
-        if not isinstance(normalized.get(key), str) or not normalized[key].strip():
-            raise Validation(f"report section {key!r} must contain text")
-    for key in ("data_sources_used", "findings", "selected_evidence", "entities", "timeline", "coverage_and_limitations", "query_appendix"):
-        if not isinstance(normalized.get(key), list):
-            raise Validation(f"report section {key!r} must be an array")
-    available_evidence = {str(item.get("evidence_id")) for item in (results or {}).get("evidence", [])}
-    cited_evidence = {str(item.get("evidence_id")) for item in normalized["selected_evidence"] if isinstance(item, dict)}
-    if not cited_evidence.issubset(available_evidence):
-        raise Validation("report references unavailable evidence")
-    return normalized
-
-
-def _minimal_pdf(title: str, body: str) -> bytes:
-    """Return a small valid PDF containing escaped printable report text."""
-
-    safe = f"{title} - {body}".replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
-    safe = "".join(character if 32 <= ord(character) <= 126 else "?" for character in safe)
-    stream = f"BT /F1 11 Tf 50 750 Td ({safe}) Tj ET".encode("ascii")
-    objects = [
-        b"<< /Type /Catalog /Pages 2 0 R >>",
-        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
-        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
-        b"<< /Length " + str(len(stream)).encode() + b" >>\nstream\n" + stream + b"\nendstream",
-        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
-    ]
-    output = bytearray(b"%PDF-1.4\n")
-    offsets = [0]
-    for number, obj in enumerate(objects, 1):
-        offsets.append(len(output))
-        output.extend(f"{number} 0 obj\n".encode() + obj + b"\nendobj\n")
-    xref = len(output)
-    output.extend(f"xref\n0 {len(objects) + 1}\n0000000000 65535 f \n".encode())
-    output.extend(b"".join(f"{offset:010d} 00000 n \n".encode() for offset in offsets[1:]))
-    output.extend(f"trailer << /Size {len(objects) + 1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n".encode())
-    return bytes(output)
-
-
 class WorkflowService:
     """Transactional workflow facade; every hunt operation is owner scoped."""
 
@@ -243,6 +208,13 @@ class WorkflowService:
             raise ValueError("splunk_poll_interval_seconds must be greater than 0 and at most 30")
         self.deployment_scope_id = str(self.execution_config.get("deployment_scope_id", "default"))
         self.jobs = JobService(engine, deployment_scope_id=self.deployment_scope_id, max_active_hunts=self.budget_limits.max_active_hunts)
+
+    def close(self) -> None:
+        """Release application adapters; the composing caller owns the engine."""
+        for adapter in (self.model_adapter, self.splunk_connector):
+            close = getattr(adapter, "close", None)
+            if callable(close):
+                close()
 
     def initialize_demo(self) -> None:
         """Create local/test tables and the one documented demo principal."""
@@ -337,14 +309,33 @@ class WorkflowService:
         expires = None if row is None else row["expires_at_utc"]
         if expires is not None and expires.tzinfo is None:
             expires = expires.replace(tzinfo=timezone.utc)
-        if row is None or expires <= _now():
+        if row is None or expires is None or expires <= _now():
             raise Validation("invalid or expired bearer token")
         return str(row["user_id"])
 
-    def list_hunts(self, owner_id: str) -> list[dict[str, Any]]:
+    def list_hunts(self, owner_id: str, *, limit: int = 50, cursor: str | None = None) -> list[dict[str, Any]]:
+        """Return a bounded summary page, ordered by immutable creation time and ID."""
+        if not 1 <= limit <= 100:
+            raise Validation("limit must be between 1 and 100")
+        statement = select(
+            hunts.c.hunt_id, hunts.c.title, func.substr(hunts.c.hypothesis, 1, 500).label("hypothesis"),
+            hunts.c.state, hunts.c.created_at_utc, hunts.c.updated_at_utc,
+        ).where(hunts.c.owner_id == owner_id)
         with self.engine.connect() as connection:
-            rows = connection.execute(select(hunts).where(hunts.c.owner_id == owner_id).order_by(hunts.c.created_at_utc.desc())).mappings().all()
-        return [self._public(row) for row in rows]
+            if cursor is not None:
+                cursor_time = connection.execute(select(hunts.c.created_at_utc).where(
+                    hunts.c.owner_id == owner_id, hunts.c.hunt_id == cursor,
+                )).scalar_one_or_none()
+                if cursor_time is None:
+                    raise Validation("invalid hunt page cursor")
+                statement = statement.where(or_(
+                    hunts.c.created_at_utc < cursor_time,
+                    and_(hunts.c.created_at_utc == cursor_time, hunts.c.hunt_id < cursor),
+                ))
+            rows = connection.execute(statement.order_by(
+                hunts.c.created_at_utc.desc(), hunts.c.hunt_id.desc(),
+            ).limit(limit)).mappings().all()
+        return [dict(row) for row in rows]
 
     def create_hunt(
         self, owner_id: str, *, title: str, hypothesis: str, objective: str,
@@ -385,7 +376,7 @@ class WorkflowService:
             row = connection.execute(select(hunts).where(hunts.c.hunt_id == hunt_id, hunts.c.owner_id == owner_id)).mappings().first()
         if row is None:
             raise NotFound("hunt not found")
-        return self._public(row)
+        return self._public(dict(row))
 
     def cancel(self, owner_id: str, hunt_id: str) -> dict[str, Any]:
         """Cancel one owned hunt atomically; repeated cancellation is idempotent."""
@@ -463,6 +454,8 @@ class WorkflowService:
                 "objective": row["objective"],
                 "analyst_supplied_context": {
                     "threat_intelligence": row["threat_intelligence"],
+                    "intelligence_sources": intelligence_sources(str(row["hunt_id"]), str(row["threat_intelligence"] or "")),
+                    "advisory_iocs": query_ioc_context(str(row["threat_intelligence"] or "")),
                     "customer_context": row["synthetic_data"],
                 },
                 "discovery_snapshot": discovery_snapshot.to_dict(),
@@ -471,30 +464,84 @@ class WorkflowService:
                     "discovery_snapshot_id": str(snapshot_id),
                     "execution_config_snapshot_id": str(config_id),
                 },
+                "planning_rules": [
+                    "The application owns intelligence_refs and attaches references to the supplied advisory content. Omit intelligence_refs from the response; do not invent document names, IDs or external source provenance.",
+                    "Question IDs are application-owned. Use unknown for draft question_id values; the application assigns unique IDs before plan review. Do not reference draft IDs elsewhere in the plan.",
+                    "Frame questions around the hypothesis, available telemetry, and the approved scope.",
+                    "Exact advisory file hashes can be matched directly in a shared hash field. Do not prescribe additional hash-type filters from advisory algorithm names, or assume categorical telemetry values from field names; discover unknown values when needed.",
+                    "When the hypothesis could involve compromise or spread, include a question that assesses scope and spread across related hosts, users, source or destination IPs, and processes; answer it with available telemetry or record the limitation.",
+                    "When relevant, examine activity before and after a suspicious lead to establish a bounded timeline.",
+                    "Cover observable behaviors relevant to the advisory and hypothesis; do not attempt every ATT&CK tactic or require unsupported telemetry.",
+                    "Treat blast-radius questions as unanswered until scoped evidence supports an assessment; record telemetry gaps and uncertainty.",
+                    "Distinguish an advisory or IOC match from observed execution or activity and from a confirmed incident; do not treat one as proof of the next.",
+                    "Use NIST SP 800-61 Rev. 3 DE.AE-03, DE.AE-04, and RS.AN-08, together with MITRE TTP-Based Hunting section 2.4.3.6, as general guidance only; do not claim framework compliance.",
+                ],
             }
             counters = BudgetCounters()
-            plan = orchestrator.draft_plan(
-                runner=StrictModelRunner(self.model_adapter, counters=counters, limits=self.budget_limits),
-                context=context,
+            runner = StrictModelRunner(self.model_adapter, counters=counters, limits=self.budget_limits)
+            required_scope = None
+            required_pairs: set[tuple[str, str]] | None = None
+            context["planning_stage"] = "scope_draft"
+            context["planning_rules"].append(
+                "Catalog metadata may omit search-time fields. Do not infer that a source cannot provide a field merely because it is missing from metadata or a sample. The application samples the proposed sources and dates before final plan review."
             )
-            if plan.plan_id != plan_id or plan.hunt_id != UUID(str(row["hunt_id"])) or plan.discovery_snapshot_id != snapshot_id or plan.execution_config_snapshot_id != config_id:
-                raise Validation("model plan identifiers do not match application-assigned snapshots")
-            if plan.plan_version != 1:
-                raise Validation("production discovery requires plan_version 1")
+            for _ in range(2):
+                plan = orchestrator.draft_plan(runner=runner, context=context)
+                if plan.plan_id != plan_id or plan.hunt_id != UUID(str(row["hunt_id"])) or plan.discovery_snapshot_id != snapshot_id or plan.execution_config_snapshot_id != config_id:
+                    raise Validation("model plan identifiers do not match application-assigned snapshots")
+                if plan.plan_version != 1:
+                    raise Validation("production discovery requires plan_version 1")
+                pairs = {(source.index, kind) for source in plan.data_sources for kind in source.sourcetypes}
+                if (not set(plan.scope.indexes).issubset(discovery.indexes)
+                        or not set(plan.scope.sourcetypes).issubset(discovery.sourcetypes)
+                        or any(index not in plan.scope.indexes or kind not in plan.scope.sourcetypes for index, kind in pairs)):
+                    raise Validation("proposed plan sources are outside discovery or plan scope")
+                if required_scope is not None:
+                    if (plan.scope.earliest_utc != required_scope.earliest_utc or plan.scope.latest_utc != required_scope.latest_utc
+                            or set(plan.scope.indexes) != set(required_scope.indexes)
+                            or set(plan.scope.sourcetypes) != set(required_scope.sourcetypes) or pairs != required_pairs):
+                        raise Validation("grounded plan changed the sampled scope or source pairs")
+                    break
+                required_scope, required_pairs = plan.scope, pairs
+                scoped_discovery, scoped_snapshot = orchestrator.discover(plan=plan)
+                fields_changed = (set(scoped_discovery.fields) != set(discovery.fields)
+                                  or scoped_discovery.representative_schemas != discovery.representative_schemas)
+                discovery, discovery_snapshot = scoped_discovery, scoped_snapshot
+                snapshot_id = discovery_snapshot.snapshot_id
+                if not fields_changed:
+                    # Identities are application-owned and the field context
+                    # is unchanged; no second model call is necessary.
+                    plan.discovery_snapshot_id = snapshot_id
+                    break
+                context["planning_stage"] = "grounded_plan"
+                context["discovery_snapshot"] = discovery_snapshot.to_dict()
+                context["application_assigned_ids"]["discovery_snapshot_id"] = str(snapshot_id)
+                context["required_scope"] = required_scope.model_dump(mode="json")
+                context["required_source_pairs"] = sorted(pairs)
+                context["planning_rules"].append(
+                    "Finish the plan using the refreshed field context. Preserve required_scope and required_source_pairs exactly; revise questions and limitations to reflect observed field availability. Use the new application-assigned discovery_snapshot_id."
+                )
+            plan.coverage_limitations = list(dict.fromkeys([*plan.coverage_limitations, *discovery.coverage_limitations]))
+            # Initial identities belong to the application, not the model.
+            # Assign only before review; never renumber saved or approved plans.
+            for number, question in enumerate(plan.questions, start=1):
+                question.question_id = f"q{number}"
             snapshot = discovery_snapshot.to_dict()
             snapshot["execution_config_snapshot"] = execution_snapshot.to_dict()
             snapshot["input_context"] = context["analyst_supplied_context"]
             snapshot["mode"] = "production"
-            plan_payload = plan.model_dump(mode="json")
+            plan_payload = self._validate_plan(plan.model_dump(mode="json"))
             self._update(owner_id, hunt_id, expected_state=HuntState.DISCOVERING.value, state=HuntState.PLAN_DRAFT.value, discovery_snapshot=snapshot, plan=plan_payload, plan_version=1, updated_at_utc=now)
             self._update(owner_id, hunt_id, expected_state=HuntState.PLAN_DRAFT.value, state=HuntState.AWAITING_PLAN_REVIEW.value, updated_at_utc=_now())
             return self.get_hunt(owner_id, hunt_id)
-        except (AdapterError, ModelContractError, ValueError) as exc:
+        except (AdapterError, ModelContractError, ValueError, Validation) as exc:
             # Keep provider details out of the API and leave the hunt explicitly failed.
             try:
                 self._update(owner_id, hunt_id, expected_state=HuntState.DISCOVERING.value, state=HuntState.FAILED.value, updated_at_utc=_now())
             except Conflict:
                 pass
+            if isinstance(exc, AdapterError) and exc.category == FailureCategory.BUDGET_EXHAUSTED:
+                raise IntegrationUnavailable(f"production discovery failed: {exc}") from exc
             raise IntegrationUnavailable("production discovery failed") from exc
 
     def save_plan(self, owner_id: str, hunt_id: str, *, expected_version: int, plan: Mapping[str, Any]) -> dict[str, Any]:
@@ -504,7 +551,42 @@ class WorkflowService:
         if row["plan_version"] != expected_version:
             raise Conflict("plan version is stale")
         normalized = self._validate_plan(plan)
-        self._update(owner_id, hunt_id, expected_plan_version=expected_version, state=HuntState.AWAITING_PLAN_REVIEW.value, plan=normalized, plan_version=expected_version + 1, approval=None, updated_at_utc=_now())
+        updates: dict[str, Any] = {}
+        if not self.local_demo:
+            previous = HuntPlan.model_validate(row["plan"])
+            try:
+                revised = HuntPlan.model_validate(normalized)
+                validate_intelligence_refs(revised.intelligence_refs, row["discovery_snapshot"].get("input_context", {}).get("intelligence_sources", []))
+            except ValueError as exc:
+                raise Validation("edited plan does not satisfy the production plan contract or supplied intelligence reference boundary") from exc
+            for key in ("hunt_id", "plan_id", "discovery_snapshot_id", "execution_config_snapshot_id"):
+                if getattr(revised, key) != getattr(previous, key):
+                    raise Validation("plan editing cannot replace application-assigned identities")
+            previous_pairs = {(source.index, kind) for source in previous.data_sources for kind in source.sourcetypes}
+            revised_pairs = {(source.index, kind) for source in revised.data_sources for kind in source.sourcetypes}
+            if any(index not in revised.scope.indexes or kind not in revised.scope.sourcetypes for index, kind in revised_pairs):
+                raise Validation("edited plan data sources are outside its scope")
+            if revised.scope != previous.scope or revised_pairs != previous_pairs:
+                if self.splunk_connector is None or self.model_adapter is None:
+                    raise IntegrationUnavailable("scoped discovery is not configured")
+                original_snapshot = row["discovery_snapshot"]
+                catalog = original_snapshot["payload"]
+                if (not set(revised.scope.indexes).issubset(catalog["indexes"])
+                        or not set(revised.scope.sourcetypes).issubset(catalog["sourcetypes"])):
+                    raise Validation("edited plan sources are outside the discovered catalog")
+                orchestrator = ProductionOrchestrator(self.splunk_connector, self.model_adapter, limits=self.budget_limits)
+                try:
+                    discovery, snapshot = orchestrator.discover(plan=revised)
+                except AdapterError as exc:
+                    raise IntegrationUnavailable("scoped discovery failed; the previous plan is unchanged") from exc
+                revised.discovery_snapshot_id = snapshot.snapshot_id
+                revised.coverage_limitations = list(dict.fromkeys([*revised.coverage_limitations, *discovery.coverage_limitations]))
+                updates["discovery_snapshot"] = snapshot.to_dict() | {
+                    key: original_snapshot[key] for key in ("execution_config_snapshot", "input_context", "mode")
+                }
+            revised.plan_version = expected_version + 1
+            normalized = revised.model_dump(mode="json")
+        self._update(owner_id, hunt_id, expected_plan_version=expected_version, state=HuntState.AWAITING_PLAN_REVIEW.value, plan=normalized, plan_version=expected_version + 1, approval=None, updated_at_utc=_now(), **updates)
         return self.get_hunt(owner_id, hunt_id)
 
     def revise_plan(self, owner_id: str, hunt_id: str, instruction: str) -> dict[str, Any]:
@@ -520,6 +602,19 @@ class WorkflowService:
         row = self._owned_row(owner_id, hunt_id)
         if row["state"] != HuntState.AWAITING_PLAN_REVIEW.value:
             raise Conflict("only a plan awaiting review can be approved")
+        self._validate_plan(row["plan"])
+        if not self.local_demo:
+            try:
+                validate_intelligence_refs(row["plan"].get("intelligence_refs", []), (row.get("discovery_snapshot") or {}).get("input_context", {}).get("intelligence_sources", []))
+            except ValueError as exc:
+                raise Conflict("plan intelligence reference is not bound to a supplied source; edit the plan before approval") from exc
+        discovery_payload = (row.get("discovery_snapshot") or {}).get("payload", {})
+        if not self.local_demo and discovery_payload.get("schema_requested_scope") is not None:
+            reviewed = HuntPlan.model_validate(row["plan"])
+            if (reviewed.scope.model_dump(mode="json") != discovery_payload["schema_requested_scope"]
+                    or {(source.index, kind) for source in reviewed.data_sources for kind in source.sourcetypes}
+                    != {tuple(pair) for pair in discovery_payload["schema_sampling_scope"]["source_pairs"]}):
+                raise Conflict("plan scope does not match its discovery snapshot; save the plan to refresh discovery")
         canonical = json.dumps(row["plan"], sort_keys=True, separators=(",", ":")).encode()
         approval = {"approval_id": str(uuid4()), "plan_version": row["plan_version"], "plan_sha256": hashlib.sha256(canonical).hexdigest(), "approved_by_user_id": owner_id, "approved_at_utc": _rfc3339(_now()), "analyst_note": note or "unknown"}
         snapshot = row.get("discovery_snapshot") or {}
@@ -545,26 +640,33 @@ class WorkflowService:
             raise Conflict("execution requires approval of the current plan version")
         if row["approval"]["plan_version"] != row["plan_version"]:
             raise Conflict("approved plan version no longer matches the current plan")
+        self._validate_plan(row["plan"])
         if not self.local_demo:
             snapshot = row.get("discovery_snapshot") or {}
+            try:
+                validate_intelligence_refs(row["plan"].get("intelligence_refs", []), snapshot.get("input_context", {}).get("intelligence_sources", []))
+            except ValueError as exc:
+                raise Conflict("plan intelligence reference is not bound to a supplied source") from exc
             config_snapshot = snapshot.get("execution_config_snapshot") if isinstance(snapshot, Mapping) else None
             if not isinstance(config_snapshot, Mapping) or row["approval"].get("execution_config_snapshot_id") != config_snapshot.get("snapshot_id") or row["approval"].get("execution_config_sha256") != config_snapshot.get("sha256"):
                 raise Conflict("approved execution configuration binding is invalid")
             self._validate_execution_snapshot(config_snapshot)
             now = _now()
-            job = self.jobs.enqueue(owner_id, hunt_id, idempotency_key=f"hunt:{hunt_id}:execution", payload={"hunt_id": hunt_id, "plan_version": row["plan_version"], "plan_sha256": row["approval"]["plan_sha256"], "execution_config_snapshot_id": row["approval"].get("execution_config_snapshot_id"), "execution_config_sha256": row["approval"].get("execution_config_sha256")})
-            try:
-                self._update(owner_id, hunt_id, expected_state=HuntState.APPROVED.value, state=HuntState.QUEUED.value, updated_at_utc=now)
-            except Exception:
-                # If the state transition loses a race or the write fails, do
-                # not leave an executable orphan in the queue.
-                self.jobs.request_cancel(owner_id, hunt_id)
-                raise
+            with self.engine.begin() as connection:
+                self._update(owner_id, hunt_id, expected_state=HuntState.APPROVED.value, expected_plan_version=int(row["plan_version"]), state=HuntState.QUEUED.value, updated_at_utc=now, connection=connection)
+                job = self.jobs.enqueue(owner_id, hunt_id, idempotency_key=f"hunt:{hunt_id}:execution", payload={"hunt_id": hunt_id, "plan_version": row["plan_version"], "plan_sha256": row["approval"]["plan_sha256"], "execution_config_snapshot_id": row["approval"].get("execution_config_snapshot_id"), "execution_config_sha256": row["approval"].get("execution_config_sha256")}, connection=connection)
             return self.get_hunt(owner_id, hunt_id) | {"job": {key: value for key, value in job.items() if key not in {"payload"}}}
         now, query_id, evidence_id, finding_id = _now(), str(uuid4()), str(uuid4()), str(uuid4())
         evidence = {"evidence_id": evidence_id, "query_id": query_id, "source": "deterministic_local_demo", "event_time_utc": _rfc3339(now - timedelta(minutes=14)), "selected_result": {"host": "demo-workstation-17", "user": "demo\\analyst", "src_ip": "192.0.2.17", "EventCode": "4624"}, "disclaimer": "Deterministic local demo evidence; not a production observation."}
         results = {"findings": [{"finding_id": finding_id, "title": "Local demo authentication lead", "classification": "hunt_lead", "statement": "The deterministic demo dataset contains one scoped authentication event for analyst review.", "confidence": "low", "evidence_ids": [evidence_id], "query_ids": [query_id], "inference": "Local demonstration only."}], "evidence": [evidence], "entities": [{"entity_id": str(uuid4()), "entity_type": "host", "value": "demo-workstation-17", "evidence_ids": [evidence_id]}, {"entity_id": str(uuid4()), "entity_type": "ip", "value": "192.0.2.17", "evidence_ids": [evidence_id]}], "timeline": [{"timestamp_utc": evidence["event_time_utc"], "summary": "Local demo authentication event", "evidence_ids": [evidence_id]}], "queries": [{"query_id": query_id, "purpose": "Answer q1", "spl": "index=security sourcetype=WinEventLog:Security EventCode=4624 | head 100", "status": "completed", "result_count": 1}], "mode": "deterministic_local_demo"}
-        content = {"hypothesis": row["hypothesis"], "objective_and_scope": row["objective"], "data_sources_used": ["Local demo Splunk adapter"], "findings": results["findings"], "selected_evidence": results["evidence"], "entities": results["entities"], "timeline": results["timeline"], "coverage_and_limitations": ["Deterministic local demo results; production integrations were not invoked."], "conclusion_and_disposition": "One low-confidence hunt lead requires analyst validation.", "query_appendix": results["queries"]}
+        content = _concise_report_content(
+            hypothesis=row["hypothesis"],
+            objective=row["objective"],
+            data_sources=["Local demo Splunk adapter"],
+            results=results,
+            coverage_and_limitations=["Deterministic local demo results; production integrations were not invoked."],
+            conclusion_and_disposition="One low-confidence hunt lead requires analyst validation.",
+        )
         self._update(owner_id, hunt_id, expected_state=HuntState.APPROVED.value, state=HuntState.QUEUED.value, updated_at_utc=now)
         self._update(owner_id, hunt_id, expected_state=HuntState.QUEUED.value, state=HuntState.RUNNING.value, updated_at_utc=now)
         self._update(owner_id, hunt_id, expected_state=HuntState.RUNNING.value, state=HuntState.SYNTHESIZING.value, results=results, updated_at_utc=now)
@@ -594,11 +696,10 @@ class WorkflowService:
             raise Validation("execution results and report content must be JSON objects")
         if len(json.dumps(normalized_results, ensure_ascii=False).encode()) > 8 * 1024 * 1024:
             raise Validation("execution results exceed the 8 MiB limit")
-        if len(json.dumps(normalized_report, ensure_ascii=False).encode()) > 1024 * 1024:
-            raise Validation("report content exceeds the 1 MiB limit")
         row = self._owned_row(owner_id, hunt_id)
         if row["state"] == HuntState.CANCELLED.value:
             raise Conflict("cancelled hunts cannot accept late execution results")
+        normalized_report = _validate_report_content(normalized_report, normalized_results)
         if row["state"] == HuntState.REPORT_DRAFT.value:
             return self.get_hunt(owner_id, hunt_id)
         if row["state"] == HuntState.RUNNING.value:
@@ -621,6 +722,781 @@ class WorkflowService:
         failure_results["failure"] = detail
         self._update(owner_id, hunt_id, expected_state=str(row["state"]), state=HuntState.FAILED.value, updated_at_utc=now, results=failure_results)
         return self.get_hunt(owner_id, hunt_id)
+
+    def _persist_policy_rejections(
+        self,
+        owner_id: str,
+        hunt_id: str,
+        rejections: Sequence[Mapping[str, Any]],
+        *,
+        expected_state: str,
+    ) -> None:
+        """Durably retain rejected proposals and deterministic reason codes."""
+
+        if not rejections:
+            return
+        current = self._owned_row(owner_id, hunt_id)
+        payload = dict(current["results"] or {}) if isinstance(current["results"], Mapping) else {}
+        prior = payload.get("query_policy_rejections", [])
+        if not isinstance(prior, list):
+            prior = []
+        payload["query_policy_rejections"] = [*prior, *[_json_copy(item) for item in rejections]]
+        audit_rejections: list[dict[str, Any]] = []
+        for rejection in rejections:
+            item = {
+                "query_id": rejection.get("query_id"),
+                "reason_codes": list(rejection.get("reason_codes", [])),
+                "query_policy_version": rejection.get("query_policy_version"),
+                "proposal": rejection.get("proposal"),
+            }
+            try:
+                bounded_audit_metadata({"rejection": item})
+            except ValueError:
+                # Keep the exact proposal in the durable results checkpoint,
+                # while audit metadata remains bounded and non-sensitive.
+                item = {
+                    "query_id": rejection.get("query_id"),
+                    "reason_codes": list(rejection.get("reason_codes", [])),
+                    "query_policy_version": rejection.get("query_policy_version"),
+                    "proposal_sha256": sha256_json(rejection.get("proposal", {})),
+                }
+            audit_rejections.append(item)
+        reason_codes: list[str] = []
+        for rejection in rejections:
+            for reason in rejection.get("reason_codes", []):
+                normalized_reason = str(reason)
+                if normalized_reason not in reason_codes:
+                    reason_codes.append(normalized_reason)
+        audit_metadata: dict[str, Any] = {
+            "reason_codes": reason_codes,
+            "rejections": audit_rejections,
+        }
+        try:
+            bounded_audit_metadata(audit_metadata)
+        except ValueError:
+            audit_metadata = {
+                "reason_codes": reason_codes,
+                "rejections": [
+                    {
+                        "query_id": rejection.get("query_id"),
+                        "reason_codes": list(rejection.get("reason_codes", [])),
+                        "query_policy_version": rejection.get("query_policy_version"),
+                        "proposal_sha256": sha256_json(rejection.get("proposal", {})),
+                    }
+                    for rejection in rejections
+                ],
+            }
+            # Reason codes and digests are intentionally retained even when
+            # the raw proposal set cannot fit the audit metadata bound.
+            if len(json.dumps(audit_metadata, ensure_ascii=False).encode("utf-8")) > 32_768:
+                audit_metadata["rejections"] = audit_metadata["rejections"][:100]
+        self._update(
+            owner_id,
+            hunt_id,
+            expected_state=expected_state,
+            results=payload,
+            action="query_policy_rejected",
+            audit_outcome="rejected",
+            detail="deterministic SPL policy rejected proposal",
+            audit_metadata=audit_metadata,
+            updated_at_utc=_now(),
+        )
+
+    def _draft_execution_ledger(
+        self, *, lease: Any, row: Mapping[str, Any], plan: HuntPlan, policy: SPLPolicy,
+        discovery_scope: Mapping[str, Any], open_question_ids: list[str],
+        counters: BudgetCounters, token: _HuntCancellationToken,
+    ) -> list[dict[str, Any]]:
+        """Generate initial queries and repair policy violations before publication."""
+        assert self.model_adapter is not None
+        runner = StrictModelRunner(
+            self.model_adapter,
+            counters=counters,
+            limits=self.budget_limits,
+            cancellation_token=token,
+        )
+        proposal_context = {
+            "approved_plan": plan.model_dump(mode="json"),
+            "discovery_scope": discovery_scope,
+            "open_question_ids": open_question_ids,
+            "advisory_iocs": query_ioc_context(str(row["threat_intelligence"] or "")),
+            "proposal_rules": [
+                "Use only approved indexes and sourcetypes from discovery_scope.",
+                "Use only discovery_scope.fields in requested_fields and SPL field references; use representative_schemas to select fields for each sourcetype.",
+                "Use only open_question_ids and the approved UTC range from discovery_scope.",
+                "Cover independent approved questions before proposing repeated pivots. Defer only questions needing evidence from earlier searches; the application will revisit unsearched approved questions.",
+                "When useful for an open question, query for the extent of activity across related hosts, users, source or destination IPs, and processes, and for activity before or after an observed lead.",
+                "Cover relevant observable behaviors from the hypothesis and advisory; do not attempt every ATT&CK tactic or add arbitrary extra searches.",
+                "Do not invent fields, telemetry, identifiers, facts, or scope.",
+                "For IOC comparisons, use literal values from advisory_iocs; never emit placeholder IOC values.",
+                "For a shared hash field, compare advisory_iocs.file_hashes directly without an additional hash-algorithm/type filter. Advisory algorithm names do not establish telemetry enum values. Use algorithm-specific hash fields only when the discovered schema supports them.",
+                "Do not guess categorical filter values from field names or advisory terminology. Use analyst-supplied values or observed telemetry; when unknown, first issue a bounded aggregate or omit the unnecessary categorical predicate.",
+            ],
+            "remaining_budget": self.budget_limits.model_dump(mode="json"),
+        }
+        proposals = runner.run(
+            TypeAdapter(list[QueryProposal]),
+            user_payload=proposal_context,
+            contract_name="QueryProposal[]",
+        )
+        rejected: list[dict[str, Any]] = []
+        ledger: list[dict[str, Any]] = []
+        for proposal in proposals:
+            validation = policy.validate(proposal, open_question_ids=open_question_ids)
+            if not validation.allowed:
+                rejected.append({
+                    "query_id": str(validation.query_id),
+                    "proposal": proposal.model_dump(mode="json"),
+                    "reason_codes": list(validation.reason_codes),
+                    "query_policy_version": validation.query_policy_version,
+                })
+        if rejected:
+            self._persist_policy_rejections(
+                row["owner_id"], lease.hunt_id, rejected,
+                expected_state=HuntState.QUEUED.value,
+            )
+            repair_context: dict[str, Any] = {
+                "approved_plan": plan.model_dump(mode="json"),
+                "discovery_scope": discovery_scope,
+                "open_question_ids": open_question_ids,
+                "policy_reason_codes": sorted({
+                    code for item in rejected for code in item["reason_codes"]
+                }),
+                "rejected_proposals": rejected,
+                "remaining_budget": self.budget_limits.model_dump(mode="json"),
+            }
+            repair_instruction = (
+                "The previous QueryProposal[] violated deterministic SPL policy. "
+                "Return one complete replacement QueryProposal[] and make exactly the "
+                "following policy repairs. Preserve the approved plan and discovery "
+                "scope exactly: use only its open question IDs, approved/discovered "
+                "indexes and sourcetypes, discovered fields, and approved time range. "
+                "Use only policy-allowed SPL commands, positive exact index and "
+                "sourcetype predicates, and no inline earliest/latest predicates. "
+                "Do not add facts, telemetry, identifiers, or scope. Address every "
+                f"reason code listed in the rejection records: {', '.join(sorted({code for item in rejected for code in item['reason_codes']}))}. "
+                "Return exactly {\"QueryProposal\": [...]} as JSON."
+            )
+            try:
+                proposals = runner.repair_once(
+                    TypeAdapter(list[QueryProposal]),
+                    user_payload=repair_context,
+                    previous_output=[item["proposal"] for item in rejected],
+                    repair_instruction=repair_instruction,
+                    contract_name="QueryProposal[]",
+                )
+            except ModelContractError:
+                raise
+            repaired_rejections: list[dict[str, Any]] = []
+            for proposal in proposals:
+                validation = policy.validate(proposal, open_question_ids=open_question_ids)
+                if not validation.allowed:
+                    repaired_rejections.append({
+                        "query_id": str(validation.query_id),
+                        "proposal": proposal.model_dump(mode="json"),
+                        "reason_codes": list(validation.reason_codes),
+                        "query_policy_version": validation.query_policy_version,
+                    })
+            if repaired_rejections:
+                self._persist_policy_rejections(
+                    row["owner_id"], lease.hunt_id, repaired_rejections,
+                    expected_state=HuntState.QUEUED.value,
+                )
+                reason_codes = sorted({
+                    code for item in repaired_rejections for code in item["reason_codes"]
+                })
+                raise AdapterError(
+                    FailureCategory.QUERY_POLICY_REJECTED,
+                    "SPL query rejected by deterministic policy: " + ", ".join(reason_codes),
+                    operation="splunk.validate_query",
+                )
+        for proposal in proposals:
+            validation = policy.validate(proposal, open_question_ids=open_question_ids)
+            if not validation.allowed:
+                # Defensive invariant: all rejected proposals must have
+                # been handled above before they can reach the ledger.
+                raise AdapterError(
+                    FailureCategory.QUERY_POLICY_REJECTED,
+                    "SPL query rejected by deterministic policy",
+                    operation="splunk.validate_query",
+                )
+            ledger.append(
+                {
+                    "query_id": str(validation.query_id),
+                    "proposal": proposal.model_dump(mode="json"),
+                    "status": "planned",
+                }
+            )
+        return ledger
+
+    def _run_checkpoint_queries(
+        self, *, lease: Any, executor: ProductionHuntExecutor,
+        counters: BudgetCounters, require_lease: Callable[[], None],
+        query_start_deadline: datetime | None = None,
+    ) -> None:
+        """Resume submitted searches and checkpoint each completed result exactly once."""
+        checkpoint = self._owned_row(lease.owner_id, lease.hunt_id)
+        checkpoint_results = dict(checkpoint["results"] or {}) if isinstance(checkpoint["results"], Mapping) else {}
+        checkpoint_ledger = list(checkpoint_results.get("query_ledger", []))
+        for position in range(len(checkpoint_ledger)):
+            current = self._owned_row(lease.owner_id, lease.hunt_id)
+            payload = dict(current["results"] or {}) if isinstance(current["results"], Mapping) else {}
+            current_ledger = list(payload.get("query_ledger", []))
+            if position >= len(current_ledger):
+                raise Conflict("query checkpoint changed during recovery")
+            entry = current_ledger[position]
+            status = str(entry.get("status", ""))
+            if status in {"completed", "skipped_time_cutoff", "skipped_budget", "timed_out"}:
+                continue
+            if status not in {"planned", "submitted"} or not isinstance(entry.get("proposal"), Mapping):
+                raise Conflict("query checkpoint is not recoverable")
+            proposal = QueryProposal.model_validate(entry["proposal"])
+            query_id = UUID(str(entry.get("query_id")))
+            existing_sid = entry.get("splunk_job_id") if status == "submitted" else None
+            if existing_sid is not None and not isinstance(existing_sid, str):
+                raise Conflict("recorded Splunk job ID is malformed")
+            stop_status = None
+            if status == "planned" and query_start_deadline is not None and _now() >= query_start_deadline:
+                stop_status = "skipped_time_cutoff"
+            else:
+                submitted_at = None
+                if existing_sid is not None:
+                    try:
+                        submitted_at = datetime.fromisoformat(str(entry["submitted_at_utc"]).replace("Z", "+00:00"))
+                        if submitted_at.tzinfo is None or submitted_at.utcoffset() is None:
+                            raise ValueError("naive query submission time")
+                    except (KeyError, ValueError) as exc:
+                        raise Conflict("recorded query submission time is malformed") from exc
+                try:
+                    execution = executor.execute_query(
+                        proposal, query_id=query_id, existing_job_id=existing_sid,
+                        submitted_at_utc=submitted_at,
+                    )
+                except AdapterError as exc:
+                    if exc.category not in {FailureCategory.HARD_TIMEOUT, FailureCategory.BUDGET_EXHAUSTED}:
+                        raise
+                    stop_status = "timed_out" if exc.category is FailureCategory.HARD_TIMEOUT else "skipped_budget"
+            if stop_status is not None:
+                require_lease()
+                current = self._owned_row(lease.owner_id, lease.hunt_id)
+                payload = dict(current["results"] or {})
+                for item in payload["query_ledger"]:
+                    if str(item.get("query_id")) == str(query_id):
+                        item.update(status=stop_status, completed_at_utc=_rfc3339(_now()))
+                payload["usage"] = counters.model_dump(mode="json")
+                self._update(
+                    lease.owner_id, lease.hunt_id, expected_state=HuntState.RUNNING.value,
+                    results=payload, updated_at_utc=_now(),
+                )
+                continue
+            evidence = executor.evidence_for_query(
+                execution, hunt_id=UUID(lease.hunt_id), proposal=proposal
+            )
+            evidence_values = [item.model_dump(mode="json") for item in evidence]
+            query_record = {
+                "query_id": str(execution.query_id),
+                "question_id": proposal.question_id,
+                "splunk_job_id": execution.splunk_job_id,
+                "purpose": proposal.purpose,
+                "spl": execution.normalized_spl,
+                "earliest_utc": _rfc3339(proposal.earliest_utc),
+                "latest_utc": _rfc3339(proposal.latest_utc),
+                "status": "completed",
+                "result_count": len(execution.rows),
+                "result_bytes": execution.result_bytes,
+                "truncated": execution.truncated,
+                "available_result_count": execution.available_result_count,
+                "retrieval_stop_reason": execution.retrieval_stop_reason,
+                "result_pages": execution.result_pages,
+                "result_mode": proposal.result_mode.value,
+            }
+            require_lease()
+            current = self._owned_row(lease.owner_id, lease.hunt_id)
+            payload = dict(current["results"] or {}) if isinstance(current["results"], Mapping) else {}
+            current_ledger = list(payload.get("query_ledger", []))
+            matched = False
+            for item in current_ledger:
+                if str(item.get("query_id")) == str(query_id):
+                    item.update(
+                        {
+                            "splunk_job_id": execution.splunk_job_id,
+                            "status": "completed",
+                            "completed_at_utc": _rfc3339(_now()),
+                            "result_count": len(execution.rows),
+                            "result_bytes": execution.result_bytes,
+                            "truncated": execution.truncated,
+                            "available_result_count": execution.available_result_count,
+                            "retrieval_stop_reason": execution.retrieval_stop_reason,
+                            "result_pages": execution.result_pages,
+                        }
+                    )
+                    matched = True
+                    break
+            if not matched:
+                raise Conflict("completed query is missing from the checkpoint")
+            queries = [
+                item for item in list(payload.get("queries", []))
+                if str(item.get("query_id")) != str(query_id)
+            ]
+            queries.append(query_record)
+            retained_evidence = [
+                item for item in list(payload.get("evidence", []))
+                if str(item.get("query_id")) != str(query_id)
+            ]
+            retained_evidence.extend(evidence_values)
+            payload.update(
+                {
+                    "query_ledger": current_ledger,
+                    "queries": queries,
+                    "evidence": retained_evidence,
+                    "usage": counters.model_dump(mode="json"),
+                }
+            )
+            self._update(
+                lease.owner_id,
+                lease.hunt_id,
+                expected_state=HuntState.RUNNING.value,
+                results=payload,
+                updated_at_utc=_now(),
+            )
+
+
+    def _assess_execution_round(
+        self, *, lease: Any, plan: HuntPlan, policy: SPLPolicy,
+        discovery_scope: Mapping[str, Any], counters: BudgetCounters,
+        token: _HuntCancellationToken, deadline: datetime, require_lease: Callable[[], None],
+    ) -> bool:
+        """Assess new results and checkpoint bounded, grounded follow-up decisions."""
+        open_question_ids = [question.question_id for question in plan.questions]
+        assert self.model_adapter is not None
+        require_lease()
+        current = self._owned_row(lease.owner_id, lease.hunt_id)
+        adaptive_results = (
+            dict(current["results"] or {})
+            if isinstance(current["results"], Mapping)
+            else {}
+        )
+        if not adaptive_results.get("adaptive_complete"):
+            # Source starvation is a result-selection problem. Narrow the
+            # existing search deterministically before asking the model to
+            # assess it; keep the original predicates, pipeline and bounds.
+            source_coverage = query_source_coverage(adaptive_results)
+            available_queries = self.budget_limits.max_splunk_queries - counters.splunk_queries
+            if (available_queries > 0 and counters.model_calls + 1 < self.budget_limits.max_model_calls
+                    and counters.agent_cycles < self.budget_limits.max_agent_cycles):
+                ledger = list(adaptive_results.get("query_ledger", []))
+                by_query = {str(item.get("query_id")): item for item in ledger}
+                coverage_ledger: list[dict[str, Any]] = []
+                for coverage in source_coverage:
+                    for source in coverage["sources"]:
+                        if (not source["needs_source_check"] or source["coverage_query_id"] is not None
+                                or coverage["query_id"] not in by_query or len(coverage_ledger) >= available_queries):
+                            continue
+                        original = QueryProposal.model_validate(by_query[coverage["query_id"]]["proposal"])
+                        parsed = parse_spl(original.spl)
+                        pair = [source["index"], source["sourcetype"]]
+                        constrained = (
+                            f'search ({parsed.command_segments[0][1]}) AND index="{pair[0]}" AND sourcetype="{pair[1]}"'
+                            + "".join(f" | {command} {args}".rstrip() for command, args in parsed.command_segments[1:])
+                        )
+                        proposal = original.model_copy(update={
+                            "spl": constrained,
+                            "purpose": f"Check {pair[0]} ({pair[1]}) omitted from truncated query {coverage['query_id']}",
+                        })
+                        validation = policy.validate(proposal)
+                        if not validation.allowed:
+                            raise AdapterError(FailureCategory.QUERY_POLICY_REJECTED,
+                                               "Source coverage search rejected: " + ", ".join(validation.reason_codes),
+                                               operation="splunk.validate_query")
+                        coverage_ledger.append({
+                            "query_id": str(validation.query_id), "proposal": proposal.model_dump(mode="json"),
+                            "status": "planned", "phase": "source_coverage",
+                            "source_query_id": coverage["query_id"], "source_pair": pair,
+                            "decision_source": "application_source_coverage",
+                        })
+                if coverage_ledger:
+                    adaptive_results.update({
+                        "query_ledger": [*ledger, *coverage_ledger], "usage": counters.model_dump(mode="json"),
+                        "adaptive_status": "source_coverage_planned", "adaptive_complete": False,
+                    })
+                    require_lease()
+                    self._update(lease.owner_id, lease.hunt_id, expected_state=HuntState.RUNNING.value,
+                                 results=adaptive_results, updated_at_utc=_now())
+                    return True
+            completed_queries = [
+                item
+                for item in adaptive_results.get("queries", [])
+                if isinstance(item, Mapping) and item.get("status") == "completed"
+            ]
+            assessed_query_ids = {
+                str(value) for value in adaptive_results.get("assessed_query_ids", [])
+            }
+            pending_query_ids = {
+                str(item.get("query_id"))
+                for item in completed_queries
+                if item.get("query_id")
+                and str(item.get("query_id")) not in assessed_query_ids
+            }
+            outstanding_questions = _pending_investigation_questions(plan, adaptive_results)
+            follow_up_questions: list[dict[str, Any]] = []
+            assessments_payload: list[dict[str, Any]] = []
+            adaptive_status = "no_unassessed_queries"
+            can_run_adaptive_round = (
+                bool(pending_query_ids or outstanding_questions)
+                and counters.agent_cycles < self.budget_limits.max_agent_cycles
+                and counters.model_calls + (2 if pending_query_ids else 1) < self.budget_limits.max_model_calls
+                and counters.splunk_queries < self.budget_limits.max_splunk_queries
+            )
+            if can_run_adaptive_round:
+                counters.record_cycle()
+                adaptive_runner = StrictModelRunner(
+                    self.model_adapter,
+                    counters=counters,
+                    limits=self.budget_limits,
+                    deadline=deadline,
+                    cancellation_token=token,
+                )
+                assessment_context = _assessment_context(
+                    plan, adaptive_results, query_ids=pending_query_ids,
+                    threat_intelligence=str(current["threat_intelligence"] or ""),
+                    limit=self.budget_limits.max_representative_events,
+                )
+                assessment_context["discovery_scope"] = discovery_scope
+                assessment_context["usage"] = counters.model_dump(mode="json")
+                assessment_context["budget_limits"] = self.budget_limits.model_dump(mode="json")
+                # Validation and repair must use the same evidence snapshot the model saw.
+                assessment_results = {
+                    **adaptive_results,
+                    "evidence": [
+                        evidence
+                        for group in assessment_context["completed_queries"]
+                        for evidence in group["retained_evidence"]
+                    ],
+                }
+                assessments = adaptive_runner.run(
+                    TypeAdapter(list[QueryAssessment]),
+                    user_payload=assessment_context,
+                    contract_name="QueryAssessment[]",
+                ) if pending_query_ids else []
+                try:
+                    assessments_payload, follow_up_questions = _materialize_follow_up_questions(
+                        assessments, assessment_results, query_ids=pending_query_ids
+                    )
+                except Validation as exc:
+                    counters.model_output_checks[-1].grounding_valid = False
+                    rejection = {
+                        "reason": str(exc),
+                        "assessments": [item.model_dump(mode="json") for item in assessments],
+                        "repair_outcome": "pending",
+                    }
+                    adaptive_results.setdefault("assessment_validation_rejections", []).append(rejection)
+                    self._update(
+                        lease.owner_id, lease.hunt_id,
+                        expected_state=HuntState.RUNNING.value,
+                        results=adaptive_results, updated_at_utc=_now(),
+                    )
+                    try:
+                        repair_context = _assessment_repair_context(
+                            assessment_context, assessments, assessment_results,
+                        )
+                        repair_query_ids = {str(value) for value in repair_context["validation_errors"]}
+                        rejection["repair_query_ids"] = sorted(repair_query_ids)
+                        repaired = adaptive_runner.repair_once(
+                            TypeAdapter(list[QueryAssessment]),
+                            user_payload=repair_context,
+                            previous_output=[
+                                item.model_dump(mode="json") for item in assessments
+                                if str(item.query_id) in repair_query_ids
+                            ],
+                            repair_instruction=(
+                                "Correct only the failed assessments in completed_queries, using "
+                                "their validation_errors. Return one assessment per supplied query; "
+                                "do not return or revise other assessments. Preserve each exact "
+                                "query_id; the application derives question_id. Each citation must be copied from that "
+                                "query's allowed_evidence_ids. Each entity value must equal a complete scalar "
+                                "value in this query's supplied rows; the application derives entity result_row_refs. "
+                                "Do not return entity result_row_refs or add facts. "
+                                "Return exactly {\"QueryAssessment\": [...]} as JSON."
+                            ),
+                            contract_name="QueryAssessment[]",
+                        )
+                        rejection["repaired_assessments"] = [item.model_dump(mode="json") for item in repaired]
+                        _materialize_follow_up_questions(
+                            repaired, assessment_results, query_ids=repair_query_ids,
+                        )
+                        corrected_by_query = {str(item.query_id): item for item in repaired}
+                        corrected_by_query.update({
+                            str(item.query_id): item for item in assessments
+                            if str(item.query_id) not in repair_query_ids
+                        })
+                        assessments = [
+                            corrected_by_query[str(group["query_id"])]
+                            for group in assessment_context["completed_queries"]
+                        ]
+                        assessments_payload, follow_up_questions = _materialize_follow_up_questions(
+                            assessments, assessment_results, query_ids=pending_query_ids
+                        )
+                        rejection["repair_outcome"] = "accepted"
+                    except (Validation, ModelContractError) as repair_error:
+                        counters.model_output_checks[-1].grounding_valid = False
+                        rejection["repair_outcome"] = "rejected"
+                        rejection["repair_reason"] = str(repair_error)
+                        raise
+                    finally:
+                        self._update(
+                            lease.owner_id, lease.hunt_id,
+                            expected_state=HuntState.RUNNING.value,
+                            results=adaptive_results, updated_at_utc=_now(),
+                        )
+                if pending_query_ids:
+                    counters.model_output_checks[-1].grounding_valid = True
+                assessed_query_ids.update(pending_query_ids)
+                remaining_queries = (
+                    self.budget_limits.max_splunk_queries - counters.splunk_queries
+                )
+                questions_for_decision = _pending_investigation_questions(
+                    plan, adaptive_results, follow_up_questions,
+                )[:remaining_queries]
+                adaptive_results["latest_assessment_round"] = {
+                    "query_assessments": assessments_payload,
+                    "follow_up_questions": follow_up_questions,
+                }
+                self._update(
+                    lease.owner_id, lease.hunt_id,
+                    expected_state=HuntState.RUNNING.value,
+                    results=adaptive_results, updated_at_utc=_now(),
+                )
+                adaptive_status = "assessed"
+                if questions_for_decision:
+                    follow_up_ids = [item["question_id"] for item in questions_for_decision]
+                    preferred_ids = {
+                        str(ref) for question in questions_for_decision
+                        for ref in question.get("source_evidence_ids", [])
+                    }
+                    pivot_evidence, _ = _balanced_evidence_sample(
+                        adaptive_results.get("evidence", []), completed_queries,
+                        preferred_evidence_ids=preferred_ids,
+                        limit=self.budget_limits.max_targeted_events,
+                    )
+                    follow_up_context: dict[str, Any] = {
+                        "approved_plan": plan.model_dump(mode="json"),
+                        "discovery_scope": discovery_scope,
+                        "follow_up_questions": questions_for_decision,
+                        "query_assessments": assessments_payload,
+                        "completed_queries": [
+                            {key: query[key] for key in ("query_id", "question_id", "purpose", "spl", "earliest_utc", "latest_utc", "result_count", "truncated") if key in query}
+                            for query in completed_queries
+                        ],
+                        "source_coverage": query_source_coverage(adaptive_results, supplied_evidence=pivot_evidence),
+                        "retained_evidence": [dict(item) for item in pivot_evidence],
+                        "advisory_iocs": query_ioc_context(str(current["threat_intelligence"] or "")),
+                        "proposal_rules": [
+                            "Use only follow_up_questions question IDs and the approved discovery scope.",
+                            "Questions marked approved_question are unsearched parts of the approved plan and take priority. Query them using discovered telemetry, advisory_iocs, and available evidence; they do not require a source_evidence_ids pivot.",
+                            "Use only discovered indexes, sourcetypes, fields, representative schemas, and the approved UTC range.",
+                            "Match advisory_iocs.file_hashes directly in a shared hash field without an additional algorithm/type predicate. Ground other categorical filters in supplied context or retained telemetry; discover unknown values with a bounded aggregate instead of guessing.",
+                            "Use relevant literal entities from grounded_entities OR the matching question's source_evidence_ids in retained_evidence. Inspect those rows (including JSON _raw) for hosts, users, or IPs suited to the target source; you are not limited to the assessment's extracted entity types.",
+                            "Use a follow-up to examine related hosts, users, source or destination IPs, processes, or activity before or after the observed lead when that is the useful unanswered pivot.",
+                            "Cover the relevant behavior and scope question only; do not attempt every ATT&CK tactic or add arbitrary extra searches.",
+                            "Do not repeat a completed query or invent fields, values, telemetry, identifiers, or scope.",
+                            "Return exactly one FollowUpDecision for every follow-up question: proposal with skip_reason=null, or proposal=null with a specific skip_reason explaining the telemetry, scope, duplicate-query, or evidence limitation. Never silently omit a question or return an empty list.",
+                            "A skipped question may return after additional queries complete. Reassess it against the current evidence; a previous dependency deferral does not mean the question was answered or permanently removed.",
+                            "Prefer a useful bounded query when the supplied evidence and discovered schema support it. An incomplete entity list alone is not a reason to skip: inspect the cited rows for the needed pivot.",
+                        ],
+                        "remaining_budget": {
+                            "splunk_queries": remaining_queries,
+                            "model_calls": self.budget_limits.max_model_calls - counters.model_calls,
+                            "agent_cycles": self.budget_limits.max_agent_cycles - counters.agent_cycles,
+                        },
+                    }
+                    decision_contract = _follow_up_decision_contract(follow_up_ids)
+                    decisions = adaptive_runner.run(
+                        decision_contract,
+                        user_payload=follow_up_context,
+                        contract_name="FollowUpDecision[]",
+                    )
+                    by_question = {decision.question_id: decision for decision in decisions}
+                    decisions = [by_question[identifier] for identifier in follow_up_ids]
+                    follow_up_proposals = [d.proposal for d in decisions if d.proposal is not None]
+                    proposal_errors = _follow_up_proposal_errors(
+                        follow_up_proposals, questions_for_decision,
+                        evidence=follow_up_context["retained_evidence"],
+                    )
+                    rejected: list[dict[str, Any]] = [
+                        {"proposal": proposal.model_dump(mode="json"), "reason_codes": [proposal_errors[proposal.question_id]]}
+                        for proposal in follow_up_proposals if proposal.question_id in proposal_errors
+                    ]
+                    allowed_question_ids = [*open_question_ids, *follow_up_ids]
+                    for proposal in follow_up_proposals:
+                        validation = policy.validate(
+                            proposal, open_question_ids=allowed_question_ids
+                        )
+                        if not validation.allowed:
+                            rejected.append({
+                                "query_id": str(validation.query_id),
+                                "proposal": proposal.model_dump(mode="json"),
+                                "reason_codes": list(validation.reason_codes),
+                                "query_policy_version": validation.query_policy_version,
+                            })
+                    if rejected:
+                        self._persist_policy_rejections(
+                            lease.owner_id,
+                            lease.hunt_id,
+                            rejected,
+                            expected_state=HuntState.RUNNING.value,
+                        )
+                        rejected_ids = {item["proposal"]["question_id"] for item in rejected}
+                        accepted_decisions = [decision for decision in decisions if decision.question_id not in rejected_ids]
+                        repair_ids = [identifier for identifier in follow_up_ids if identifier in rejected_ids]
+                        repaired_decisions = adaptive_runner.repair_once(
+                            _follow_up_decision_contract(repair_ids),
+                            user_payload={
+                                **follow_up_context,
+                                "follow_up_questions": [item for item in questions_for_decision if item["question_id"] in rejected_ids],
+                                "accepted_proposals": [decision.proposal.model_dump(mode="json") for decision in accepted_decisions if decision.proposal is not None],
+                                "policy_reason_codes": sorted({
+                                    code for item in rejected for code in item["reason_codes"]
+                                }),
+                                "rejected_proposals": rejected,
+                            },
+                            previous_output=[d.model_dump(mode="json") for d in decisions if d.question_id in rejected_ids],
+                            repair_instruction=(
+                                "Correct only the rejected follow-up decisions. The application preserves accepted_proposals; "
+                                "do not return, change, or duplicate them. They are planned, not completed searches. "
+                                "Address each proposal's own reason codes using its question ID, evidence-grounded values, "
+                                "approved scope, and policy-allowed read-only SPL. A duplicate rejection applies only to "
+                                "that proposal, not to all queries for the question. Return exactly "
+                                "{\"FollowUpDecision\": [...]} as JSON, one decision for each supplied follow_up_question, "
+                                "with either a valid proposal or a specific skip_reason."
+                            ),
+                            contract_name="FollowUpDecision[]",
+                        )
+                        merged_decisions = {d.question_id: d for d in [*accepted_decisions, *repaired_decisions]}
+                        decisions = [merged_decisions[identifier] for identifier in follow_up_ids]
+                        follow_up_proposals = [d.proposal for d in decisions if d.proposal is not None]
+                        proposal_errors = _follow_up_proposal_errors(
+                            follow_up_proposals, questions_for_decision,
+                            evidence=follow_up_context["retained_evidence"],
+                        )
+                        if proposal_errors:
+                            self._persist_policy_rejections(
+                                lease.owner_id, lease.hunt_id,
+                                [{"proposal": proposal.model_dump(mode="json"), "reason_codes": [proposal_errors[proposal.question_id]]}
+                                 for proposal in follow_up_proposals if proposal.question_id in proposal_errors],
+                                expected_state=HuntState.RUNNING.value,
+                            )
+                            raise Validation("; ".join(sorted(set(proposal_errors.values()))))
+                    # Exact duplicate execution is an application decision.
+                    # The policy cache identity includes normalized SPL, UTC
+                    # bounds and result limits; changed windows/caps are new work.
+                    seen_queries: dict[tuple[str, str], str] = {}
+                    completed_ids = {str(query["query_id"]) for query in completed_queries}
+                    for entry in adaptive_results.get("query_ledger", []):
+                        if str(entry.get("query_id")) not in completed_ids or not isinstance(entry.get("proposal"), Mapping):
+                            continue
+                        prior = QueryProposal.model_validate(entry["proposal"])
+                        prior_validation = policy.validate(prior)
+                        if prior_validation.allowed and prior_validation.cache_key:
+                            seen_queries[(prior_validation.cache_key, prior.result_mode.value)] = f"completed query {entry['query_id']}"
+                    duplicate_skips: dict[str, str] = {}
+                    follow_up_ledger: list[dict[str, Any]] = []
+                    final_rejections: list[dict[str, Any]] = []
+                    for proposal in follow_up_proposals:
+                        validation = policy.validate(
+                            proposal, open_question_ids=allowed_question_ids
+                        )
+                        if not validation.allowed:
+                            final_rejections.append({
+                                "query_id": str(validation.query_id),
+                                "proposal": proposal.model_dump(mode="json"),
+                                "reason_codes": list(validation.reason_codes),
+                                "query_policy_version": validation.query_policy_version,
+                            })
+                            continue
+                        assert validation.cache_key is not None
+                        identity = (validation.cache_key, proposal.result_mode.value)
+                        if identity in seen_queries:
+                            duplicate_skips[proposal.question_id] = (
+                                f"Application skipped an identical search already covered by {seen_queries[identity]}; "
+                                "SPL, time bounds, result mode and limits are unchanged. This question was not separately searched."
+                            )
+                            continue
+                        seen_queries[identity] = f"planned question {proposal.question_id}"
+                        follow_up_ledger.append({
+                            "query_id": str(validation.query_id),
+                            "proposal": proposal.model_dump(mode="json"),
+                            "status": "planned",
+                            "phase": "adaptive_follow_up",
+                        })
+                    if final_rejections:
+                        self._persist_policy_rejections(
+                            lease.owner_id,
+                            lease.hunt_id,
+                            final_rejections,
+                            expected_state=HuntState.RUNNING.value,
+                        )
+                        reason_codes = sorted({
+                            code for item in final_rejections for code in item["reason_codes"]
+                        })
+                        raise AdapterError(
+                            FailureCategory.QUERY_POLICY_REJECTED,
+                            "SPL follow-up query rejected by deterministic policy: "
+                            + ", ".join(reason_codes),
+                            operation="splunk.validate_query",
+                        )
+                    current = self._owned_row(lease.owner_id, lease.hunt_id)
+                    adaptive_results = (
+                        dict(current["results"] or {})
+                        if isinstance(current["results"], Mapping)
+                        else {}
+                    )
+                    adaptive_results["query_ledger"] = [
+                        *list(adaptive_results.get("query_ledger", [])),
+                        *follow_up_ledger,
+                    ]
+                    adaptive_results.setdefault("follow_up_decisions", []).extend(
+                        ({"question_id": d.question_id, "proposal": None, "skip_reason": duplicate_skips[d.question_id],
+                          "decision_source": "application_duplicate_suppression"}
+                         if d.question_id in duplicate_skips else {
+                             **d.model_dump(mode="json"),
+                             "considered_query_ids": sorted(str(query["query_id"]) for query in completed_queries),
+                         })
+                        for d in decisions
+                    )
+                    adaptive_status = (
+                        "follow_up_planned" if follow_up_ledger else "no_follow_up_query"
+                    )
+            elif pending_query_ids or outstanding_questions:
+                adaptive_status = "budget_reserved_for_synthesis"
+            existing_assessments = list(adaptive_results.get("query_assessments", []))
+            existing_questions = list(adaptive_results.get("follow_up_questions", []))
+            adaptive_results.update({
+                "query_assessments": [*existing_assessments, *assessments_payload],
+                "follow_up_questions": [*existing_questions, *follow_up_questions],
+                "assessed_query_ids": sorted(assessed_query_ids),
+                "usage": counters.model_dump(mode="json"),
+            })
+            adaptive_results["pending_question_ids"] = [
+                item["question_id"] for item in _pending_investigation_questions(plan, adaptive_results)
+            ]
+            if adaptive_status == "no_follow_up_query" and adaptive_results["pending_question_ids"]:
+                adaptive_status = "questions_pending"
+            continue_investigation = adaptive_status in {"follow_up_planned", "questions_pending"}
+            adaptive_results["adaptive_complete"] = not continue_investigation
+            adaptive_results["adaptive_status"] = adaptive_status
+            self._update(
+                lease.owner_id,
+                lease.hunt_id,
+                expected_state=HuntState.RUNNING.value,
+                results=adaptive_results,
+                updated_at_utc=_now(),
+            )
+            if continue_investigation:
+                # Re-enter through the durable checkpoint for planned searches
+                # or questions deferred beyond an explicitly skipped batch.
+                return True
+
+        return False
 
     def execute_job(self, lease: Any) -> None:
         """Run or resume one fenced production job from its durable checkpoint."""
@@ -655,7 +1531,7 @@ class WorkflowService:
         if approval.get("execution_config_snapshot_id") != config_snapshot.get("snapshot_id") or approval.get("execution_config_sha256") != config_snapshot.get("sha256"):
             raise Conflict("approved execution configuration binding is invalid")
         self._validate_execution_snapshot(config_snapshot)
-        plan = HuntPlan.model_validate(row["plan"])
+        plan = HuntPlan.model_validate(self._validate_plan(row["plan"]))
         if str(plan.execution_config_snapshot_id) != str(config_snapshot.get("snapshot_id")):
             raise Conflict("plan execution configuration binding is invalid")
         token = _HuntCancellationToken(self, lease)
@@ -667,22 +1543,6 @@ class WorkflowService:
                 generation=getattr(lease, "generation", None),
                 deployment_scope_id=getattr(lease, "deployment_scope_id", None),
             )
-
-        def report_content(results: Mapping[str, Any]) -> dict[str, Any]:
-            evidence = list(results.get("evidence", []))
-            queries = list(results.get("queries", []))
-            return {
-                "hypothesis": row["hypothesis"],
-                "objective_and_scope": row["objective"],
-                "data_sources_used": ["Configured Splunk"],
-                "findings": [],
-                "selected_evidence": evidence,
-                "entities": [],
-                "timeline": [],
-                "coverage_and_limitations": list(plan.coverage_limitations),
-                "conclusion_and_disposition": "Evidence is retained for analyst review; findings require contract-grounded synthesis.",
-                "query_appendix": queries,
-            }
 
         counters = BudgetCounters()
         try:
@@ -697,7 +1557,7 @@ class WorkflowService:
                     report_id=str(uuid4()),
                     report_version=1,
                     report_state=HuntState.REPORT_DRAFT.value,
-                    report_content=report_content(results),
+                    report_content=_execution_report_content(row, plan, results),
                     updated_at_utc=_now(),
                 )
                 return
@@ -716,37 +1576,41 @@ class WorkflowService:
                 max_bytes=self.budget_limits.max_cached_bytes_per_query,
                 timeout_seconds=self.budget_limits.splunk_query_timeout_seconds,
             )
+            open_question_ids = [question.question_id for question in plan.questions]
+            discovery_scope = {
+                "indexes": sorted(policy.discovered_indexes),
+                "sourcetypes": sorted(policy.discovered_sourcetypes),
+                "fields": sorted(policy.discovered_fields),
+                "representative_schemas": _json_copy(
+                    discovery.get("representative_schemas", {})
+                    if isinstance(discovery.get("representative_schemas", {}), Mapping)
+                    else {}
+                ),
+                "approved_indexes": sorted(policy.approved_indexes),
+                "approved_sourcetypes": sorted(policy.approved_sourcetypes),
+                "earliest_utc": _rfc3339(policy.approved_earliest_utc),
+                "latest_utc": _rfc3339(policy.approved_latest_utc),
+                "query_execution_rules": [
+                    "Allowed pipeline commands are search, where, fields, table, stats, timechart, sort, head, dedup, rename, eval, regex. No other commands are supported.",
+                    "Set time bounds only in earliest_utc/latest_utc proposal fields within the approved range; do not put earliest/latest in SPL.",
+                    "Use a simple read-only pipeline with exact positive index and sourcetype predicates. Subsearches, macros, joins, and placeholder variables are unsupported.",
+                    "Correlate sources through separate queries using literal entities observed in completed searches; defer dependent questions until those results exist.",
+                    "requested_fields lists discovered input fields, not generated stats/eval output aliases. Keep requested fields from discovery_scope.fields even when the SPL produces aggregates.",
+                    "Every query must explicitly constrain BOTH indexes and sourcetypes; list exactly those values in proposal metadata. For multiple sources use OR predicates, never append/subsearches or index/sourcetype IN predicates.",
+                    "SPL search evaluates OR before AND. Parenthesize each compound source alternative: ((index=one sourcetype=first) OR (index=two sourcetype=second)). Every alternative must constrain both source fields, and the source conditions must be satisfiable. Use only real approved values in place of this illustrative syntax.",
+                    "For an unsearched approved question about activity, scope, or spread, survey the approved time range with bounded aggregates or representative results before narrowing to a lead. A lead's observed timestamps are not the boundaries of related activity. Narrow pivots must consider useful activity before and after the lead, stay within approval, and explain their time choice in purpose. Empty results establish only what that exact search and window returned, not absence throughout the approved range.",
+                ],
+                "approved_scope_predicate_example": "(" + " OR ".join(
+                    f'index="{value}"' for value in sorted(policy.approved_indexes)
+                ) + ") AND (" + " OR ".join(
+                    f'sourcetype="{value}"' for value in sorted(policy.approved_sourcetypes)
+                ) + ")",
+            }
             if state == HuntState.QUEUED.value:
-                runner = StrictModelRunner(
-                    self.model_adapter,
-                    counters=counters,
-                    limits=self.budget_limits,
-                    cancellation_token=token,
+                ledger = self._draft_execution_ledger(
+                    lease=lease, row=row, plan=plan, policy=policy, discovery_scope=discovery_scope,
+                    open_question_ids=open_question_ids, counters=counters, token=token,
                 )
-                proposals = runner.run(
-                    TypeAdapter(list[QueryProposal]),
-                    user_payload={
-                        "approved_plan": plan.model_dump(mode="json"),
-                        "remaining_budget": self.budget_limits.model_dump(mode="json"),
-                    },
-                    contract_name="QueryProposal[]",
-                )
-                ledger: list[dict[str, Any]] = []
-                for proposal in proposals:
-                    validation = policy.validate(proposal)
-                    if not validation.allowed:
-                        raise AdapterError(
-                            FailureCategory.QUERY_POLICY_REJECTED,
-                            "SPL query rejected by deterministic policy",
-                            operation="splunk.validate_query",
-                        )
-                    ledger.append(
-                        {
-                            "query_id": str(validation.query_id),
-                            "proposal": proposal.model_dump(mode="json"),
-                            "status": "planned",
-                        }
-                    )
                 started = _now()
                 progress: dict[str, Any] = {
                     "findings": [],
@@ -759,6 +1623,9 @@ class WorkflowService:
                     "mode": "production",
                     "execution_started_at_utc": _rfc3339(started),
                 }
+                checkpoint = self._owned_row(row["owner_id"], lease.hunt_id)
+                if isinstance(checkpoint["results"], Mapping) and isinstance(checkpoint["results"].get("query_policy_rejections"), list):
+                    progress["query_policy_rejections"] = _json_copy(checkpoint["results"]["query_policy_rejections"])
                 require_lease()
                 self._update(
                     row["owner_id"],
@@ -787,6 +1654,13 @@ class WorkflowService:
 
             deadline = started.astimezone(timezone.utc) + timedelta(
                 seconds=self.budget_limits.hard_hunt_seconds
+            )
+            query_start_deadline = started.astimezone(timezone.utc) + timedelta(
+                seconds=self.budget_limits.query_start_cutoff_seconds
+            )
+            investigation_deadline = min(
+                query_start_deadline + timedelta(seconds=self.budget_limits.max_inflight_query_seconds_after_cutoff),
+                deadline - timedelta(seconds=self.budget_limits.synthesis_allowance_seconds),
             )
 
             def on_submitted(query_id: UUID, sid: str, proposal: QueryProposal) -> None:
@@ -822,100 +1696,64 @@ class WorkflowService:
                     updated_at_utc=_now(),
                 )
 
+            def on_rejected(proposal: QueryProposal, validation: Any) -> None:
+                self._persist_policy_rejections(
+                    row["owner_id"],
+                    lease.hunt_id,
+                    [{
+                        "query_id": str(validation.query_id),
+                        "proposal": proposal.model_dump(mode="json"),
+                        "reason_codes": list(validation.reason_codes),
+                        "query_policy_version": validation.query_policy_version,
+                    }],
+                    expected_state=HuntState.RUNNING.value,
+                )
+
+            runtime_question_ids = [*open_question_ids]
+            for item in progress.get("follow_up_questions", []):
+                if isinstance(item, Mapping) and isinstance(item.get("question_id"), str):
+                    runtime_question_ids.append(item["question_id"])
             executor = ProductionHuntExecutor(
                 self.splunk_connector,
                 policy,
                 counters=counters,
                 limits=self.budget_limits,
                 cancellation_token=token,
-                deadline=deadline,
+                deadline=investigation_deadline,
                 on_submitted=on_submitted,
+                on_rejected=on_rejected,
+                open_question_ids=runtime_question_ids,
                 poll_interval_seconds=self.splunk_poll_interval_seconds,
             )
-            checkpoint = self._owned_row(row["owner_id"], lease.hunt_id)
-            checkpoint_results = dict(checkpoint["results"] or {}) if isinstance(checkpoint["results"], Mapping) else {}
-            checkpoint_ledger = list(checkpoint_results.get("query_ledger", []))
-            for position in range(len(checkpoint_ledger)):
-                current = self._owned_row(row["owner_id"], lease.hunt_id)
-                payload = dict(current["results"] or {}) if isinstance(current["results"], Mapping) else {}
-                current_ledger = list(payload.get("query_ledger", []))
-                if position >= len(current_ledger):
-                    raise Conflict("query checkpoint changed during recovery")
-                entry = current_ledger[position]
-                status = str(entry.get("status", ""))
-                if status == "completed":
-                    continue
-                if status not in {"planned", "submitted"} or not isinstance(entry.get("proposal"), Mapping):
-                    raise Conflict("query checkpoint is not recoverable")
-                proposal = QueryProposal.model_validate(entry["proposal"])
-                query_id = UUID(str(entry.get("query_id")))
-                existing_sid = entry.get("splunk_job_id") if status == "submitted" else None
-                if existing_sid is not None and not isinstance(existing_sid, str):
-                    raise Conflict("recorded Splunk job ID is malformed")
-                execution = executor.execute_query(
-                    proposal,
-                    query_id=query_id,
-                    existing_job_id=existing_sid,
-                )
-                evidence = executor.evidence_for_query(
-                    execution, hunt_id=UUID(lease.hunt_id), proposal=proposal
-                )
-                evidence_values = [item.model_dump(mode="json") for item in evidence]
-                query_record = {
-                    "query_id": str(execution.query_id),
-                    "splunk_job_id": execution.splunk_job_id,
-                    "purpose": proposal.purpose,
-                    "spl": proposal.spl,
-                    "status": "completed",
-                    "result_count": len(execution.rows),
-                    "result_bytes": execution.result_bytes,
-                    "truncated": execution.truncated,
-                }
+            self._run_checkpoint_queries(
+                lease=lease, executor=executor, counters=counters, require_lease=require_lease,
+                query_start_deadline=query_start_deadline,
+            )
+
+            if _now() < query_start_deadline:
+                continue_investigation = False
+                try:
+                    continue_investigation = self._assess_execution_round(
+                        lease=lease, plan=plan, policy=policy, discovery_scope=discovery_scope,
+                        counters=counters, token=token, deadline=query_start_deadline, require_lease=require_lease,
+                    )
+                except AdapterError as exc:
+                    if exc.category != FailureCategory.HARD_TIMEOUT or _now() < query_start_deadline:
+                        raise
+                if continue_investigation:
+                    self.execute_job(lease)
+                    return
+            if _now() >= query_start_deadline:
                 require_lease()
                 current = self._owned_row(row["owner_id"], lease.hunt_id)
-                payload = dict(current["results"] or {}) if isinstance(current["results"], Mapping) else {}
-                current_ledger = list(payload.get("query_ledger", []))
-                matched = False
-                for item in current_ledger:
-                    if str(item.get("query_id")) == str(query_id):
-                        item.update(
-                            {
-                                "splunk_job_id": execution.splunk_job_id,
-                                "status": "completed",
-                                "completed_at_utc": _rfc3339(_now()),
-                                "result_count": len(execution.rows),
-                                "result_bytes": execution.result_bytes,
-                                "truncated": execution.truncated,
-                            }
-                        )
-                        matched = True
-                        break
-                if not matched:
-                    raise Conflict("completed query is missing from the checkpoint")
-                queries = [
-                    item for item in list(payload.get("queries", []))
-                    if str(item.get("query_id")) != str(query_id)
-                ]
-                queries.append(query_record)
-                retained_evidence = [
-                    item for item in list(payload.get("evidence", []))
-                    if str(item.get("query_id")) != str(query_id)
-                ]
-                retained_evidence.extend(evidence_values)
-                payload.update(
-                    {
-                        "query_ledger": current_ledger,
-                        "queries": queries,
-                        "evidence": retained_evidence,
-                        "usage": counters.model_dump(mode="json"),
-                    }
+                stopped_results = dict(current["results"] or {})
+                stopped_results.update(
+                    adaptive_complete=True, adaptive_status="time_reserved_for_synthesis",
+                    usage=counters.model_dump(mode="json"),
                 )
                 self._update(
-                    row["owner_id"],
-                    lease.hunt_id,
-                    expected_state=HuntState.RUNNING.value,
-                    results=payload,
-                    updated_at_utc=_now(),
+                    row["owner_id"], lease.hunt_id, expected_state=HuntState.RUNNING.value,
+                    results=stopped_results, updated_at_utc=_now(),
                 )
 
             if token.is_cancelled():
@@ -923,6 +1761,30 @@ class WorkflowService:
             require_lease()
             current = self._owned_row(row["owner_id"], lease.hunt_id)
             results = dict(current["results"] or {}) if isinstance(current["results"], Mapping) else {}
+            synthesis_runner = StrictModelRunner(
+                self.model_adapter,
+                counters=counters,
+                limits=self.budget_limits,
+                deadline=deadline,
+                cancellation_token=token,
+            )
+            answer = synthesis_runner.run(
+                _question_synthesis_contract(plan),
+                user_payload=_synthesis_context(
+                    plan=plan,
+                    threat_intelligence=str(row["threat_intelligence"] or ""),
+                    results=results,
+                    limit=self.budget_limits.max_targeted_events,
+                ),
+                contract_name="QuestionSynthesis",
+            )
+            try:
+                results.update(_materialize_question_answers(answer, plan, results))
+            except Validation:
+                counters.model_output_checks[-1].grounding_valid = False
+                raise
+            counters.model_output_checks[-1].grounding_valid = True
+            results["usage"] = counters.model_dump(mode="json")
             self._update(
                 row["owner_id"],
                 lease.hunt_id,
@@ -940,10 +1802,15 @@ class WorkflowService:
                 report_id=str(uuid4()),
                 report_version=1,
                 report_state=HuntState.REPORT_DRAFT.value,
-                report_content=report_content(results),
+                report_content=_execution_report_content(row, plan, results),
                 updated_at_utc=_now(),
             )
-        except Exception:
+        except Exception as exc:
+            diagnostic = failure_metadata(exc)
+            logging.getLogger(__name__).error(
+                "hunt execution failed hunt_id=%s job_id=%s category=%s error_type=%s",
+                lease.hunt_id, lease.job_id, diagnostic["category"], diagnostic["error_type"],
+            )
             try:
                 require_lease()
                 current = self._owned_row(row["owner_id"], lease.hunt_id)
@@ -951,6 +1818,7 @@ class WorkflowService:
                     failure_results = dict(current["results"] or {}) if isinstance(current["results"], Mapping) else {}
                     failure_results["usage"] = counters.model_dump(mode="json")
                     failure_results["mode"] = "production"
+                    failure_results["failure"] = diagnostic
                     self._update(
                         row["owner_id"],
                         lease.hunt_id,
@@ -990,8 +1858,7 @@ class WorkflowService:
         if row["report_state"] != HuntState.REPORT_DRAFT.value or row["report_version"] != expected_version:
             raise Conflict("report is finalized or its version is stale")
         content = _validate_report_content(row["report_content"], row["results"])
-        body = json.dumps(content, ensure_ascii=False, sort_keys=True)
-        pdf = _minimal_pdf(row["title"], body)
+        pdf = _formatted_pdf(row["title"], content)
         self._update(owner_id, hunt_id, expected_state=HuntState.REPORT_DRAFT.value, expected_report_state=HuntState.REPORT_DRAFT.value, expected_report_version=expected_version, state=HuntState.FINALIZED.value, report_state=HuntState.FINALIZED.value, report_pdf=pdf, updated_at_utc=_now())
         return self.report(owner_id, hunt_id)
 
@@ -1007,8 +1874,18 @@ class WorkflowService:
         required = {"hypothesis", "objective", "scope", "questions", "query_strategy", "coverage_limitations"}
         if not isinstance(normalized, dict) or required.difference(normalized):
             raise Validation("plan is missing required fields")
-        if not normalized["questions"] or not isinstance(normalized["scope"], dict):
+        if not isinstance(normalized["questions"], list) or not normalized["questions"] or not isinstance(normalized["scope"], dict):
             raise Validation("plan requires scope and at least one question")
+        question_ids = [
+            question.get("question_id") if isinstance(question, Mapping) else None
+            for question in normalized["questions"]
+        ]
+        if any(
+            not isinstance(value, str) or not value.strip() or value != value.strip()
+            or value.casefold() == "unknown"
+            for value in question_ids
+        ) or len(set(question_ids)) != len(question_ids):
+            raise Validation("plan question IDs must be nonempty, unique, and not unknown")
         return normalized
 
     def _execution_binding_payload(self) -> dict[str, Any]:
@@ -1032,13 +1909,14 @@ class WorkflowService:
             row = connection.execute(select(hunts).where(hunts.c.hunt_id == hunt_id, hunts.c.owner_id == owner_id)).mappings().first()
         if row is None:
             raise NotFound("hunt not found")
-        return row
+        return dict(row)
 
     def _update(
         self,
         owner_id: str,
         hunt_id: str,
         *,
+        connection: Connection | None = None,
         expected_state: str | None = None,
         expected_plan_version: int | None = None,
         expected_report_state: str | None = None,
@@ -1046,6 +1924,8 @@ class WorkflowService:
         actor_type: str = "system",
         action: str | None = None,
         detail: str | None = None,
+        audit_outcome: str = "success",
+        audit_metadata: Mapping[str, Any] | None = None,
         **values: Any,
     ) -> None:
         predicate = (hunts.c.hunt_id == hunt_id) & (hunts.c.owner_id == owner_id)
@@ -1057,7 +1937,7 @@ class WorkflowService:
             predicate &= hunts.c.report_state == expected_report_state
         if expected_report_version is not None:
             predicate &= hunts.c.report_version == expected_report_version
-        with self.engine.begin() as connection:
+        with (self.engine.begin() if connection is None else nullcontext(connection)) as connection:
             previous = connection.execute(
                 select(
                     hunts.c.state,
@@ -1099,9 +1979,12 @@ class WorkflowService:
                     object_id=hunt_id,
                     prior_state=prior_state,
                     resulting_state=resulting_state,
-                    outcome="success",
+                    outcome=audit_outcome,
                     detail=(detail or None),
-                    metadata={"changed_fields": changed_fields},
+                    metadata=bounded_audit_metadata({
+                        "changed_fields": changed_fields,
+                        **(dict(audit_metadata) if audit_metadata is not None else {}),
+                    }),
                     timestamp_utc=values.get("updated_at_utc") or _now(),
                 ))
 

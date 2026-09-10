@@ -56,11 +56,27 @@ export interface Hunt {
   [key: string]: unknown;
 }
 
+export interface HuntSummary {
+  hunt_id: string;
+  title: string;
+  hypothesis: string;
+  state: string;
+  created_at_utc: string;
+  updated_at_utc: string;
+}
+
 export interface HuntResults {
   findings: JsonObject[];
   evidence: JsonObject[];
   entities: JsonObject[];
   timeline: JsonObject[];
+  question_answers?: Array<{
+    question_id: string;
+    question: string;
+    summary: string;
+    finding_ids: string[];
+    limitations: string[];
+  }>;
   mode?: string | null;
 }
 
@@ -158,8 +174,18 @@ export const workflowApi = {
     csrfToken = session.csrf_token ?? csrfToken ?? readCookie("threat_hunting_csrf") ?? readCookie("csrf_token");
     return session;
   },
+  me: async () => {
+    const identity = await request<User & { csrf_token?: string }>("/api/auth/me");
+    const { csrf_token, ...user } = identity;
+    csrfToken = csrf_token ?? csrfToken ?? readCookie("threat_hunting_csrf") ?? readCookie("csrf_token");
+    return { user, csrf_token } satisfies Session;
+  },
   logout: () => request<void>("/api/auth/logout", undefined, { method: "POST" }),
-  listHunts: (token: string | undefined) => request<Hunt[]>("/api/hunts", token),
+  listHunts: (token: string | undefined, page: { limit?: number; cursor?: string } = {}) => {
+    const params = new URLSearchParams({ limit: String(page.limit ?? 50) });
+    if (page.cursor) params.set("cursor", page.cursor);
+    return request<HuntSummary[]>(`/api/hunts?${params}`, token);
+  },
   getHunt: (token: string | undefined, id: string) =>
     request<Hunt>(`/api/hunts/${id}`, token),
   jobStatus: (token: string | undefined, id: string) =>

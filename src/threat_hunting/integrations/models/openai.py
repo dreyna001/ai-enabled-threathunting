@@ -76,6 +76,7 @@ class OpenAIModelAdapter(BaseModelAdapter):
         model_name: str,
         *,
         api_key: SecretStr | str | None = None,
+        reasoning_effort: str | None = None,
         endpoint: str | None = None,
         verify_tls: bool = True,
         ca_bundle_path: str | Path | None = None,
@@ -95,7 +96,11 @@ class OpenAIModelAdapter(BaseModelAdapter):
             raise ValueError("TLS verification cannot be disabled without a CA or explicit lab override")
         if timeout_seconds <= 0 or timeout_seconds > 600:
             raise ValueError("timeout_seconds is outside the supported bound")
+        super().__init__()
         self.model_name = model_name
+        if reasoning_effort is not None and reasoning_effort not in {"none", "low", "medium", "high", "xhigh", "max"}:
+            raise ValueError("unsupported reasoning_effort")
+        self.reasoning_effort = reasoning_effort
         self.api_key = _as_secret(api_key)
         self.endpoint = endpoint
         self._endpoint_origin = endpoint_origin
@@ -109,13 +114,14 @@ class OpenAIModelAdapter(BaseModelAdapter):
         if self._client is not None:
             return self._client
         try:
-            from openai import OpenAI  # type: ignore[import-not-found]
+            from openai import OpenAI
         except ImportError as exc:
             raise AdapterError(FailureCategory.INVALID_CONFIGURATION, "the openai package is not installed", operation="connect") from exc
         kwargs: dict[str, Any] = {
             "api_key": self.api_key.get_secret_value() if self.api_key else None,
             "base_url": self.endpoint,
             "timeout": self.timeout_seconds,
+            "max_retries": 0,
         }
         # OpenAI's client accepts an httpx client for custom CA bundles.  Keep
         # the import optional and fail clearly if a custom bundle is unusable.
@@ -160,23 +166,16 @@ class OpenAIModelAdapter(BaseModelAdapter):
         cancellation_token: Any = None,
     ) -> ModelResponse:
         payload = self._request_payload(request, self.model_name)
-        client = self._get_client()
-
+        if self.reasoning_effort is not None:
+            payload["reasoning_effort"] = self.reasoning_effort
+            if self.reasoning_effort != "none":
+                payload.pop("temperature", None)
         def call() -> Any:
-            chat = getattr(client, "chat", None)
-            completions = getattr(chat, "completions", None) if chat is not None else None
-            create = getattr(completions, "create", None) if completions is not None else None
-            if not callable(create):
-                responses = getattr(client, "responses", None)
-                create = getattr(responses, "create", None) if responses is not None else None
-            if not callable(create):
-                raise RuntimeError("OpenAI client does not expose a supported completion method")
-            try:
-                return create(timeout=timeout_seconds or self.timeout_seconds, **payload)
-            except TypeError:
-                # Simple fakes and older SDKs may not accept a per-call timeout;
-                # the surrounding bounded call still enforces one.
-                return create(**payload)
+            client = self._get_client()
+            return client.chat.completions.create(
+                timeout=timeout_seconds if timeout_seconds is not None else self.timeout_seconds,
+                **payload,
+            )
 
         response = self._bounded_call(
             "complete",
@@ -198,11 +197,13 @@ class OpenAIModelAdapter(BaseModelAdapter):
         message = _get(first, "message", first)
         text = _content_text(_get(message, "content", output_text if isinstance(output_text, str) else ""))
         tool_calls_raw = _get(message, "tool_calls", []) or []
-        tool_calls = [dict(call) for call in tool_calls_raw if isinstance(call, Mapping)]
+        tool_calls: list[Mapping[str, Any]] = [dict(call) for call in tool_calls_raw if isinstance(call, Mapping)]
         response_model = _get(response, "model", self.model_name)
         usage = _usage_from_mapping(_get(response, "usage"))
         request_id = _get(response, "id") or _get(response, "request_id")
         finish_reason = _get(first, "finish_reason") if first is not None else _get(response, "stop_reason")
+        if _get(message, "refusal"):
+            finish_reason = "refusal"
         return ModelResponse(
             provider=self.provider,
             model_name=str(response_model or self.model_name),

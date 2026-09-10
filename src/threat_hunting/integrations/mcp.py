@@ -426,7 +426,10 @@ class MCPConnector:
         request_id: str | None,
         cancellation_token: Any = None,
         allow_cancelled: bool = False,
+        timeout_seconds: float | None = None,
     ) -> Any:
+        if timeout_seconds is not None and timeout_seconds <= 0:
+            raise AdapterError(FailureCategory.HARD_TIMEOUT, "MCP operation deadline exceeded", operation=operation)
         if not allow_cancelled and _is_cancelled(cancellation_token):
             raise AdapterError(FailureCategory.CANCELLED, "operation cancelled", operation=operation)
         callback = getattr(self._transport, "call_tool", None)
@@ -435,6 +438,7 @@ class MCPConnector:
         if not callable(callback):
             raise AdapterError(FailureCategory.INVALID_CONFIGURATION, "MCP transport is not callable", operation=operation)
         kwargs: dict[str, Any] = {}
+        parameters: Mapping[str, inspect.Parameter]
         try:
             parameters = inspect.signature(callback).parameters
             accepts_kwargs = any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values())
@@ -443,7 +447,7 @@ class MCPConnector:
             accepts_kwargs = True
         for name, value in (
             ("request_id", request_id),
-            ("timeout_seconds", self.config.timeout_seconds),
+            ("timeout_seconds", min(timeout_seconds, self.config.timeout_seconds) if timeout_seconds is not None else self.config.timeout_seconds),
             ("cancellation_token", cancellation_token),
         ):
             if accepts_kwargs or name in parameters:
@@ -820,6 +824,7 @@ class MCPConnector:
         *,
         max_bytes: int | None = None,
         cancellation_token: Any = None,
+        timeout_seconds: float | None = None,
     ) -> list[Mapping[str, Any]]:
         """Fetch one bounded result page and account for its size."""
 
@@ -834,6 +839,7 @@ class MCPConnector:
             {"job_id": provider_job, "page": page, "limit": limit},
             request_id=record.request_id if record else None,
             cancellation_token=cancellation_token,
+            timeout_seconds=timeout_seconds,
         ))
         if isinstance(value, Mapping):
             for key in ("results", "items", "records", "data"):

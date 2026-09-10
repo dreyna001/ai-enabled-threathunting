@@ -27,8 +27,15 @@ class Job:
         return [{"_time": "2026-01-01T00:30:00Z", "host": "host-1", "event_id": "evt-1"}]
 
 
+class CatalogJob(Job):
+    def results(self, **_: object) -> list[dict[str, str]]:
+        return [{"sourcetype": "syslog", "count": "1"}]
+
+
 class Jobs(dict[str, Job]):
     def create(self, _query: str, **_: object) -> Job:
+        if _query.startswith("| tstats "):
+            return CatalogJob()
         job = Job()
         job.name = str(_.get("id", job.name))
         self[job.name] = job
@@ -48,7 +55,7 @@ class Splunk:
         }.get(path, {"entry": []})
 
 
-def _model() -> FakeModelAdapter:
+def _model(*, invalid_pivot: str | None = None, invalid_citation: bool = False, draft_question_ids: tuple[str, ...] = ("q1",)) -> FakeModelAdapter:
     def response(request):
         context = json.loads(request.messages[0]["content"])
         if "HuntPlan" in (request.system or ""):
@@ -67,14 +74,36 @@ def _model() -> FakeModelAdapter:
                 "scope": {"earliest_utc": earliest.isoformat().replace("+00:00", "Z"), "latest_utc": latest.isoformat().replace("+00:00", "Z"), "indexes": ["main"], "sourcetypes": ["syslog"]},
                 "intelligence_refs": [],
                 "data_sources": [{"index": "main", "sourcetypes": ["syslog"], "purpose": "authentication"}],
-                "questions": [{"question_id": "q1", "question": "Which hosts generated events?", "rationale": "Identify affected hosts.", "expected_information_gain": "Host pivot."}],
+                "questions": [{"question_id": question_id, "question": "Which hosts generated events?", "rationale": "Identify affected hosts.", "expected_information_gain": "Host pivot."} for question_id in draft_question_ids],
                 "query_strategy": ["Start with one bounded representative query."],
                 "coverage_limitations": [],
                 "created_at_utc": latest.isoformat().replace("+00:00", "Z"),
             })
-        if "QueryProposal[]" in (request.system or ""):
+        if "QueryProposal[]" in (request.system or "") or "FollowUpDecision[]" in (request.system or ""):
             plan = context["approved_plan"]
             scope = plan["scope"]
+            if context.get("follow_up_questions"):
+                question = context["follow_up_questions"][0]
+                bad_pivot = invalid_pivot == "always" or (
+                    invalid_pivot == "once" and not context.get("rejected_proposals")
+                )
+                return json.dumps([{
+                    "question_id": question["question_id"],
+                    "skip_reason": None,
+                    "proposal": {
+                    "question_id": question["question_id"],
+                    "purpose": "Pivot from the observed host to related events.",
+                    "expected_information_gain": "Identify related activity on the observed host.",
+                    "spl": f"search index=main sourcetype=syslog host={'unobserved-host' if bad_pivot else 'host-1'} | head 1",
+                    "earliest_utc": scope["earliest_utc"],
+                    "latest_utc": scope["latest_utc"],
+                    "indexes": ["main"],
+                    "sourcetypes": ["syslog"],
+                    "requested_fields": ["host", "event_id"],
+                    "result_mode": "targeted",
+                    "max_results": 1,
+                    },
+                }])
             return json.dumps([{
                 "question_id": "q1",
                 "purpose": "Find representative authentication events.",
@@ -88,12 +117,86 @@ def _model() -> FakeModelAdapter:
                 "result_mode": "representative",
                 "max_results": 1,
             }])
+        if "QueryAssessment[]" in (request.system or ""):
+            query = context["completed_queries"][0]
+            evidence = query["retained_evidence"][0]
+            citation = evidence["evidence_id"]
+            if invalid_citation and len(request.messages) == 1:
+                citation = query["query_id"]
+            elif invalid_citation:
+                assert "unknown evidence_candidate_row_refs label" in request.messages[-1]["content"]
+                assert citation in query["allowed_evidence_ids"]
+            proposed_next_question = (
+                {
+                    "question": "What related activity occurred on host-1?",
+                    "rationale": "Expand from the observed host into surrounding activity.",
+                    "expected_information_gain": "Related processes and events on the target asset.",
+                }
+                if query["question_id"] == "q1"
+                else None
+            )
+            return json.dumps([{
+                "query_id": query["query_id"],
+                "question_id": query["question_id"],
+                "answered_question": True,
+                "material_progress": True,
+                "summary": "The query identified host-1 for a bounded follow-up.",
+                "new_entities": [{
+                    "entity_type": "host",
+                    "value": "host-1",
+                    "result_row_refs": [evidence["evidence_id"]],
+                }],
+                "evidence_candidate_row_refs": [citation],
+                "coverage_changes": [],
+                "limitations": [],
+                "proposed_next_question": proposed_next_question,
+            }])
+        if "Required contract: QuestionSynthesis." in (request.system or ""):
+            evidence = context["retained_evidence"][0]
+            query = context["completed_queries"][0]
+            finding = {
+                "title": "Representative event observed",
+                "classification": "supported_observation",
+                "statement": "The completed query returned a retained event for host-1.",
+                "confidence": "low",
+                "evidence_ids": [evidence["evidence_id"]],
+                "query_ids": [],
+                "inference": "unknown",
+                "limitations": ["One representative event does not establish incident scope."],
+            }
+            searched = {item.get("question_id") for item in context["completed_queries"]}
+            return json.dumps({question["answer_slot"]: (
+                {"summary": "An event for host-1 was retained.", "findings": [finding], "limitations": []} if question["question_id"] in searched
+                else {"summary": "This question remains unanswered.", "findings": [], "limitations": ["No completed search answered this question."]})
+                               for question in context["approved_plan"]["questions"]})
         raise AssertionError("unexpected model contract")
 
-    return FakeModelAdapter(responses=[response, response])
+    return FakeModelAdapter(responses=[response] * 8)
 
 
-def test_injected_production_adapters_persist_discovery_snapshots_and_results() -> None:
+def test_discovery_exposes_token_cutoff_without_repair() -> None:
+    from threat_hunting.services.workflow import IntegrationUnavailable
+
+    engine = create_engine("sqlite+pysqlite://", poolclass=StaticPool)
+    workflow_metadata.create_all(engine)
+    jobs_metadata.create_all(engine)
+    model = FakeModelAdapter(responses=[{"text": "", "finish_reason": "length"}])
+    service = WorkflowService(
+        engine,
+        splunk_connector=SplunkConnector(
+            SplunkConnectionConfig(endpoint="https://splunk.example", token="test-token"), client=Splunk(),
+        ),
+        model_adapter=model,
+    )
+    hunt = service.create_hunt("owner-1", title="Budget test", hypothesis="h", objective="o")
+    with pytest.raises(IntegrationUnavailable, match="token limit"):
+        service.discover("owner-1", str(hunt["hunt_id"]))
+    assert model.call_count == 1
+    assert service.get_hunt("owner-1", str(hunt["hunt_id"]))["state"] == "failed"
+
+
+@pytest.mark.parametrize("draft_question_ids", [("q1",), ("unknown",)])
+def test_injected_production_adapters_persist_discovery_snapshots_and_results(draft_question_ids: tuple[str, ...]) -> None:
     engine = create_engine("sqlite+pysqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
     workflow_metadata.create_all(engine)
     jobs_metadata.create_all(engine)
@@ -101,7 +204,7 @@ def test_injected_production_adapters_persist_discovery_snapshots_and_results() 
     service = WorkflowService(
         engine,
         splunk_connector=splunk,
-        model_adapter=_model(),
+        model_adapter=(model := _model(draft_question_ids=draft_question_ids)),
         budget_limits=BudgetLimits(),
         execution_config={"provider": "fake", "model_name": "test", "provider_data_boundary": "local", "provider_data_handling_approval_ref": None, "spl_policy_version": "1.0", "splunk_poll_interval_seconds": 0.1},
     )
@@ -136,12 +239,269 @@ def test_injected_production_adapters_persist_discovery_snapshots_and_results() 
     result = service.results("owner-1", str(hunt["hunt_id"]))
     assert result["mode"] == "production"
     assert result["queries"][0]["status"] == "completed"
+    assert len(result["queries"]) == 2
     assert result["evidence"][0]["selected_result"]["host"] == "host-1"
+    assert result["adaptive_status"] == "assessed"
+    assert result["adaptive_complete"] is True
+    assert len(result["query_assessments"]) == 2
+    assert result["follow_up_questions"][0]["source_question_id"] == "q1"
+    assert result["query_ledger"][1]["phase"] == "adaptive_follow_up"
+    assert result["findings"][0]["classification"] == "supported_observation"
     assert service.get_hunt("owner-1", str(hunt["hunt_id"]))["state"] == "report_draft"
+    proposal_request = next(request for request in model.requests if "QueryProposal[]" in (request.system or ""))
+    proposal_context = json.loads(proposal_request.messages[0]["content"])
+    assert proposal_context["discovery_scope"]["fields"] == ["event_id", "host"]
+    assert proposal_context["discovery_scope"]["query_execution_rules"]
+    assert proposal_context["discovery_scope"]["representative_schemas"] == {"syslog": ["host", "event_id"]}
+    assert proposal_context["open_question_ids"] == ["q1"]
+    assert "Use only discovery_scope.fields" in proposal_context["proposal_rules"][1]
+    follow_up_request = next(
+        request
+        for request in model.requests
+        if "FollowUpDecision[]" in (request.system or "")
+        and "follow_up_questions" in json.loads(request.messages[0]["content"])
+    )
+    follow_up_context = json.loads(follow_up_request.messages[0]["content"])
+    assert "Never silently omit a question" in " ".join(follow_up_context["proposal_rules"])
+    assert result["follow_up_decisions"][0]["proposal"] is not None
+    synthesis_request = next(request for request in model.requests if "Required contract: QuestionSynthesis." in (request.system or ""))
+    synthesis_context = json.loads(synthesis_request.messages[0]["content"])
+    assert synthesis_context["retained_evidence"][0]["evidence_id"] == "E1"
+    assert synthesis_context["retained_evidence"][0]["selected_result"] == result["evidence"][0]["selected_result"]
+    assert result["findings"][0]["evidence_ids"] == [result["evidence"][0]["evidence_id"]]
+    assert "prior_assessments" not in synthesis_context
+    assert len(result["query_assessments"]) == 2  # Retained for investigation/audit, outside final synthesis.
+    assert result["question_answers"][0]["question_id"] == "q1"
+    assert result["question_answers"][0]["finding_ids"] == [result["findings"][0]["finding_id"]]
+
+
+@pytest.mark.parametrize("draft_ids", [("unknown",) * 6, ("duplicate", "duplicate"), ("q2", "q1")])
+def test_discovery_assigns_question_ids_before_review(draft_ids: tuple[str, ...]) -> None:
+    engine = create_engine("sqlite+pysqlite://", poolclass=StaticPool)
+    workflow_metadata.create_all(engine)
+    jobs_metadata.create_all(engine)
+    model = _model(draft_question_ids=draft_ids)
+    service = WorkflowService(
+        engine,
+        splunk_connector=SplunkConnector(
+            SplunkConnectionConfig(endpoint="https://splunk.example", token="test-token"), client=Splunk(),
+        ),
+        model_adapter=model,
+    )
+    hid = str(service.create_hunt("owner-1", title="Question identity", hypothesis="h", objective="o")["hunt_id"])
+
+    discovered = service.discover("owner-1", hid)
+
+    expected_ids = [f"q{number}" for number in range(1, len(draft_ids) + 1)]
+    questions = discovered["plan"]["questions"]
+    assert [question["question_id"] for question in questions] == expected_ids
+    assert all(question["question"] == "Which hosts generated events?" for question in questions)
+    assert model.call_count == 1
+    approved = service.approve("owner-1", hid, "reviewed")
+    assert [question["question_id"] for question in approved["plan"]["questions"]] == expected_ids
+
+
+def test_discovery_with_no_questions_fails_without_leaving_hunt_discovering() -> None:
+    from threat_hunting.services.workflow import IntegrationUnavailable
+
+    engine = create_engine("sqlite+pysqlite://", poolclass=StaticPool)
+    workflow_metadata.create_all(engine)
+    jobs_metadata.create_all(engine)
+    model = _model(draft_question_ids=())
+    service = WorkflowService(
+        engine,
+        splunk_connector=SplunkConnector(
+            SplunkConnectionConfig(endpoint="https://splunk.example", token="test-token"), client=Splunk(),
+        ),
+        model_adapter=model,
+    )
+    hid = str(service.create_hunt("owner-1", title="Empty plan", hypothesis="h", objective="o")["hunt_id"])
+    with pytest.raises(IntegrationUnavailable, match="production discovery failed"):
+        service.discover("owner-1", hid)
+    assert service.get_hunt("owner-1", hid)["state"] == "failed"
+    assert model.call_count == 1
+
+
+@pytest.mark.parametrize("invalid_pivot,invalid_citation", [("once", False), ("always", False), (None, True)])
+def test_adaptive_validation_repairs_once_or_rejects(invalid_pivot: str | None, invalid_citation: bool) -> None:
+    from threat_hunting.services.workflow import Validation
+
+    engine = create_engine("sqlite+pysqlite://", poolclass=StaticPool)
+    workflow_metadata.create_all(engine)
+    jobs_metadata.create_all(engine)
+    service = WorkflowService(
+        engine,
+        splunk_connector=SplunkConnector(
+            SplunkConnectionConfig(endpoint="https://splunk.example", token="test-token"),
+            client=Splunk(),
+        ),
+        model_adapter=_model(invalid_pivot=invalid_pivot, invalid_citation=invalid_citation),
+        budget_limits=BudgetLimits(),
+        execution_config={"provider": "fake", "model_name": "test"},
+    )
+    hid = str(service.create_hunt("owner-1", title="Pivot repair", hypothesis="h", objective="o")["hunt_id"])
+    service.discover("owner-1", hid)
+    service.approve("owner-1", hid, "reviewed")
+    service.execute("owner-1", hid)
+    lease = service.jobs.claim("worker-1")
+    assert lease is not None
+    if invalid_pivot == "always":
+        with pytest.raises(Validation, match="evidence-grounded pivot"):
+            service.execute_job(lease)
+    else:
+        service.execute_job(lease)
+    result = service.results("owner-1", hid)
+    assert result["usage"]["model_repair_attempts"] == (2 if invalid_citation else 1)
+    if invalid_citation:
+        # Unknown labels are rejected at the response boundary before semantic checks.
+        checks = result["usage"]["model_output_checks"]
+        assert sum(check["contract_valid"] is False for check in checks) == 2
+        assert all(check["contract_valid"] for check in checks if check["repair"])
+    if invalid_pivot:
+        assert "unobserved-host" in result["query_policy_rejections"][0]["proposal"]["spl"]
+    if invalid_pivot == "always":
+        assert result["latest_assessment_round"]["query_assessments"]
+        assert result["latest_assessment_round"]["follow_up_questions"][0]["grounded_entities"]
+    assert all("unobserved-host" not in query["spl"] for query in result["queries"])
+    assert len(result["queries"]) == (1 if invalid_pivot == "always" else 2)
+    assert service.get_hunt("owner-1", hid)["state"] == (
+        "failed" if invalid_pivot == "always" else "report_draft"
+    )
 
 
 class SimulatedWorkerCrash(BaseException):
     pass
+
+
+@pytest.mark.parametrize("repair_output", ["correct", "wrong_citation", "extra_assessment", "missing_assessment", "duplicate_assessment"])
+def test_cross_query_assessment_repair_preserves_valid_output_and_remains_fail_closed(repair_output: str) -> None:
+    from threat_hunting.services.workflow import Validation
+
+    base_model = _model(draft_question_ids=("q1", "q2"))
+    initial_assessments = []
+
+    def response(request):
+        context = json.loads(request.messages[0]["content"])
+        if "QueryProposal[]" in (request.system or ""):
+            first = json.loads(base_model.complete(request).text)[0]
+            return json.dumps([first, {
+                **first,
+                "question_id": "q2",
+                "spl": "search index=main sourcetype=syslog host=host-1 | head 1",
+            }])
+        if "QueryAssessment[]" not in (request.system or ""):
+            return base_model.complete(request)
+        assessments = [{
+            "query_id": query["query_id"],
+            "question_id": query["question_id"],
+            "answered_question": True,
+            "material_progress": True,
+            "summary": f"Observed host-1 in {query['question_id']}.",
+            "new_entities": [{
+                "entity_type": "host", "value": "host-1",
+                "result_row_refs": query["allowed_evidence_ids"].copy(),
+            }],
+            "evidence_candidate_row_refs": query["allowed_evidence_ids"].copy(),
+            "coverage_changes": [], "limitations": [], "proposed_next_question": None,
+        } for query in context["completed_queries"]]
+        if len(request.messages) == 1:
+            assert len(assessments) == 2
+            assessments[1]["new_entities"][0]["result_row_refs"].extend(
+                assessments[0]["evidence_candidate_row_refs"]
+            )
+            initial_assessments.extend(assessments)
+        else:
+            assert [query["question_id"] for query in context["completed_queries"]] == ["q2"]
+            prior = json.loads(request.messages[1]["content"])
+            assert len(prior) == 1 and prior[0]["summary"] == initial_assessments[1]["summary"]
+            assert prior[0]["query_id"] == "Q1"
+            assert "UNAVAILABLE" in prior[0]["new_entities"][0]["result_row_refs"]
+            assert "retained_evidence" not in context
+            assert set(context["validation_errors"]) == {"Q1"}
+            assert all(
+                row["query_id"] == "Q1"
+                for query in context["completed_queries"] for row in query["retained_evidence"]
+            )
+            if repair_output == "wrong_citation":
+                assessments[0]["new_entities"][0]["result_row_refs"].extend(
+                    ["E9999"]
+                )
+            elif repair_output == "extra_assessment":
+                assessments.append({**initial_assessments[0], "summary": "Unrequested rewrite."})
+            elif repair_output == "missing_assessment":
+                assessments = []
+            elif repair_output == "duplicate_assessment":
+                assessments.append(assessments[0])
+        return json.dumps({"QueryAssessment": assessments})
+
+    model = FakeModelAdapter(responses=[response] * 6)
+    engine = create_engine("sqlite+pysqlite://", poolclass=StaticPool)
+    workflow_metadata.create_all(engine)
+    jobs_metadata.create_all(engine)
+    service = WorkflowService(
+        engine,
+        splunk_connector=SplunkConnector(
+            SplunkConnectionConfig(endpoint="https://splunk.example", token="test-token"), client=Splunk(),
+        ),
+        model_adapter=model,
+        budget_limits=BudgetLimits(),
+        execution_config={"provider": "fake", "model_name": "test"},
+    )
+    hid = str(service.create_hunt("owner-1", title="Citation repair", hypothesis="h", objective="o")["hunt_id"])
+    service.discover("owner-1", hid)
+    service.approve("owner-1", hid, "reviewed")
+    service.execute("owner-1", hid)
+    lease = service.jobs.claim("worker-1")
+    assert lease is not None
+    if repair_output == "correct":
+        service.execute_job(lease)
+    else:
+        from threat_hunting.services.orchestration import ModelContractError
+        with pytest.raises((Validation, ModelContractError)):
+            service.execute_job(lease)
+    results = service.results("owner-1", hid)
+    assert results["usage"]["model_repair_attempts"] == 1
+    assert len(results["queries"]) == 2
+    rejection = results["assessment_validation_rejections"][0]
+    assert rejection["repair_query_ids"] == [rejection["assessments"][1]["query_id"]]
+    if repair_output == "correct":
+        assert service.get_hunt("owner-1", hid)["state"] == "report_draft"
+        assert results["query_assessments"][0] == rejection["assessments"][0]
+        assert results["query_assessments"][1]["new_entities"][0]["result_row_refs"] == rejection["assessments"][1]["evidence_candidate_row_refs"]
+        assert rejection["repair_outcome"] == "accepted"
+        assert model.call_count == 5  # Plan, queries, assessment, one repair, synthesis.
+    else:
+        assert service.get_hunt("owner-1", hid)["state"] == "failed"
+        assert rejection["repair_outcome"] == "rejected"
+        assert model.call_count == 4  # No extra retries or synthesis of invalid assessments.
+
+
+def test_assessment_citations_are_query_scoped_and_filter_before_sampling() -> None:
+    from types import SimpleNamespace
+    from threat_hunting.services.investigation import _assessment_context
+
+    plan = SimpleNamespace(
+        hypothesis="h", objective="o", questions=[],
+        scope=SimpleNamespace(model_dump=lambda **_: {}),
+    )
+    results = {
+        "queries": [
+            {"query_id": q, "question_id": q, "status": "completed", "result_count": count}
+            for q, count in [("old", 100), ("new", 1), ("empty", 0)]
+        ],
+        "evidence": [
+            {"evidence_id": f"old-{i}", "query_id": "old", "selected_result": {}}
+            for i in range(100)
+        ] + [{"evidence_id": "new-row", "query_id": "new", "selected_result": {"host": "host-1"}}],
+    }
+    context = _assessment_context(plan, results, query_ids={"new", "empty"})
+    assert {q["query_id"]: q["allowed_evidence_ids"] for q in context["completed_queries"]} == {
+        "new": ["new-row"], "empty": [],
+    }
+    assert "retained_evidence" not in context
+    assert [
+        e["evidence_id"] for q in context["completed_queries"] for e in q["retained_evidence"]
+    ] == ["new-row"]
 
 
 class RecoverableJob(Job):
@@ -160,9 +520,15 @@ class RecoverableJobs(dict[str, RecoverableJob]):
         super().__init__()
         self.create_calls = 0
 
-    def create(self, _query: str, **_: object) -> RecoverableJob:
+    def create(self, _query: str, **_: object) -> Job:
+        if _query.startswith("| tstats "):
+            return CatalogJob()
+        if _query.endswith("| fieldsummary"):
+            # Planning discovery precedes the worker crash being simulated.
+            return Job()
         self.create_calls += 1
         job = RecoverableJob()
+        job.crash_on_status = self.create_calls == 1
         job.name = str(_.get("id", job.name))
         self[job.name] = job
         return job
@@ -238,8 +604,77 @@ def test_expired_worker_resumes_recorded_sid_without_duplicate_submission() -> N
 
     service.execute_job(replacement)
 
-    assert client.jobs.create_calls == 1
+    assert client.jobs.create_calls == 2
     results = service.results("owner-1", hunt_id)
     assert results["query_ledger"][0]["status"] == "completed"
+    assert results["query_ledger"][1]["status"] == "completed"
     assert results["queries"][0]["splunk_job_id"] == recorded_sid
     assert service.get_hunt("owner-1", hunt_id)["state"] == "report_draft"
+
+
+@pytest.mark.parametrize("elapsed", [780, 1190])
+def test_elapsed_cutoff_skips_new_queries_and_preserves_synthesis(monkeypatch: pytest.MonkeyPatch, elapsed: int) -> None:
+    """Clock advancement exercises the persisted workflow without waiting 20 minutes."""
+    from copy import deepcopy
+    from uuid import uuid4
+    from threat_hunting.services import workflow, orchestration
+
+    clock = [datetime.now(timezone.utc)]
+    start = clock[0]
+    monkeypatch.setattr(workflow, "_now", lambda: clock[0])
+    monkeypatch.setattr(orchestration, "_utc_now", lambda: clock[0])
+    engine = create_engine("sqlite+pysqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    workflow_metadata.create_all(engine)
+    jobs_metadata.create_all(engine)
+    model = _model(draft_question_ids=("q1", "q2"))
+    service = WorkflowService(
+        engine, model_adapter=model,
+        splunk_connector=SplunkConnector(SplunkConnectionConfig(endpoint="https://splunk.example", token="test-token"), client=Splunk()),
+        budget_limits=BudgetLimits(query_start_cutoff_seconds=780, synthesis_allowance_seconds=300,
+                                   max_model_call_timeout_seconds=300),
+        execution_config={"provider": "fake", "model_name": "test"},
+    )
+    hid = str(service.create_hunt("owner-1", title="Elapsed limit", hypothesis="h", objective="o")["hunt_id"])
+    service.discover("owner-1", hid)
+    service.approve("owner-1", hid, "reviewed")
+    service.execute("owner-1", hid)
+    lease = service.jobs.claim("worker-1")
+    assert lease is not None
+    draft = service._draft_execution_ledger
+
+    def two_queries(**kwargs):
+        ledger = draft(**kwargs)
+        second = deepcopy(ledger[0])
+        second["query_id"] = str(uuid4())
+        second["proposal"]["question_id"] = "q2"
+        return [*ledger, second]
+
+    monkeypatch.setattr(service, "_draft_execution_ledger", two_queries)
+    execute = orchestration.ProductionHuntExecutor.execute_query
+
+    def elapsed_after_retained_query(executor, *args, **kwargs):
+        result = execute(executor, *args, **kwargs)
+        clock[0] = start + timedelta(seconds=elapsed)
+        return result
+
+    monkeypatch.setattr(orchestration.ProductionHuntExecutor, "execute_query", elapsed_after_retained_query)
+    complete = model.complete
+    synthesis_timeouts = []
+
+    def record_timeout(request, **kwargs):
+        if "Required contract: QuestionSynthesis." in (request.system or ""):
+            synthesis_timeouts.append(kwargs["timeout_seconds"])
+        return complete(request, **kwargs)
+
+    monkeypatch.setattr(model, "complete", record_timeout)
+    service.execute_job(lease)
+    result = service.results("owner-1", hid)
+    assert service.get_hunt("owner-1", hid)["state"] == "report_draft"
+    assert result["usage"]["splunk_queries"] == 1
+    assert result["usage"]["model_calls"] == 2  # proposal and synthesis; no late assessment
+    assert [q["status"] for q in result["query_ledger"]] == ["completed", "skipped_time_cutoff"]
+    assert result["adaptive_status"] == "time_reserved_for_synthesis"
+    assert len(result["evidence"]) == len(result["findings"]) == 1
+    assert synthesis_timeouts == [min(300, 1200 - elapsed)]
+    from threat_hunting.services.reports import _derive_report_limitations
+    assert any("time cutoff" in text for text in _derive_report_limitations(result))

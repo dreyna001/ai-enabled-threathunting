@@ -5,8 +5,10 @@ import ipaddress
 
 from datetime import datetime, timezone
 from typing import Any
+from uuid import UUID
 
-from fastapi import APIRouter, Cookie, Depends, Header, HTTPException, Request, Response, status
+from fastapi import APIRouter, Cookie, Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
+from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel, ConfigDict, Field
 
 from threat_hunting.auth.service import AccountService, CSRF_COOKIE, SESSION_COOKIE
@@ -15,9 +17,6 @@ from threat_hunting.services.workflow import Conflict, IntegrationUnavailable, N
 
 
 router = APIRouter(prefix="/api", tags=["workflow"])
-_service: WorkflowService | None = None
-_auth: AccountService | None = None
-_uploads: UploadService | None = None
 
 
 class StrictRequest(BaseModel):
@@ -51,6 +50,15 @@ class CreateHuntRequest(StrictRequest):
     synthetic_data: str = Field(default="", max_length=50_000)
 
 
+class HuntSummary(BaseModel):
+    hunt_id: UUID
+    title: str
+    hypothesis: str
+    state: str
+    created_at_utc: datetime
+    updated_at_utc: datetime
+
+
 class SavePlanRequest(StrictRequest):
     expected_version: int = Field(ge=1)
     plan: dict[str, Any]
@@ -77,23 +85,24 @@ class FinalizeReportRequest(StrictRequest):
     expected_version: int = Field(ge=1)
 
 
-def configure_workflow_service(service: WorkflowService) -> None:
-    global _service, _auth, _uploads
-    _service = service
-    _auth = AccountService(service.engine)
+def configure_workflow_service(application: FastAPI, service: WorkflowService) -> None:
+    """Bind shared dependencies to this application, never module globals."""
     from pathlib import Path
     import os
-    _uploads = UploadService(
+    application.state.workflow_service = service
+    application.state.auth_service = AccountService(service.engine)
+    application.state.upload_service = UploadService(
         service.engine,
         Path(os.getenv("THREAT_HUNTING_UPLOAD_ROOT", "runtime/uploads")),
         limits=service.upload_limits,
     )
 
 
-def workflow_service() -> WorkflowService:
-    if _service is None:
+def workflow_service(request: Request) -> WorkflowService:
+    service = getattr(request.app.state, "workflow_service", None)
+    if service is None:
         raise HTTPException(status_code=503, detail="workflow service is not configured")
-    return _service
+    return service
 
 
 def _translate(exc: Exception) -> HTTPException:
@@ -108,11 +117,11 @@ def _translate(exc: Exception) -> HTTPException:
     return HTTPException(status_code=500, detail="workflow operation failed")
 
 
-def auth_service(service: WorkflowService = Depends(workflow_service)) -> AccountService:
-    global _auth
-    if _auth is None:
-        _auth = AccountService(service.engine)
-    return _auth
+def auth_service(request: Request) -> AccountService:
+    service = getattr(request.app.state, "auth_service", None)
+    if service is None:
+        raise HTTPException(status_code=503, detail="authentication service is not configured")
+    return service
 
 
 def current_user_id(
@@ -122,6 +131,7 @@ def current_user_id(
     csrf_cookie: str | None = Cookie(default=None, alias=CSRF_COOKIE),
     csrf_header: str | None = Header(default=None, alias="X-CSRF-Token"),
     service: WorkflowService = Depends(workflow_service),
+    auth: AccountService = Depends(auth_service),
 ) -> str:
     token = session_cookie
     bearer = False
@@ -136,7 +146,7 @@ def current_user_id(
         if request.method not in {"GET", "HEAD", "OPTIONS"}:
             if not csrf_cookie or not csrf_header or csrf_cookie != csrf_header:
                 raise HTTPException(status_code=403, detail="CSRF validation failed")
-        return auth_service(service).authenticate(token, csrf_token=csrf_cookie if request.method not in {"GET", "HEAD", "OPTIONS"} else None)
+        return auth.authenticate(token, csrf_token=csrf_cookie if request.method not in {"GET", "HEAD", "OPTIONS"} else None)
     except HTTPException:
         raise
     except (Validation, ValueError, PermissionError) as exc:
@@ -144,9 +154,9 @@ def current_user_id(
 
 
 @router.post("/auth/login")
-def login(payload: LoginRequest, response: Response, http_request: Request, service: WorkflowService = Depends(workflow_service)) -> dict[str, Any]:
+def login(payload: LoginRequest, response: Response, http_request: Request, service: WorkflowService = Depends(workflow_service), auth: AccountService = Depends(auth_service)) -> dict[str, Any]:
     try:
-        session, user = auth_service(service).login(payload.username, payload.password, client_key=_login_client_key(http_request))
+        session, user = auth.login(payload.username, payload.password, client_key=_login_client_key(http_request))
     except PermissionError as exc:
         raise HTTPException(status_code=429, detail=str(exc)) from exc
     except (Validation, ValueError) as exc:
@@ -157,10 +167,10 @@ def login(payload: LoginRequest, response: Response, http_request: Request, serv
     max_age = max(1, int((session.expires_at - datetime.now(timezone.utc)).total_seconds()))
     response.set_cookie(SESSION_COOKIE, session.token, httponly=True, secure=secure, samesite="lax", max_age=max_age, path="/")
     response.set_cookie(CSRF_COOKIE, session.csrf_token, httponly=False, secure=secure, samesite="lax", max_age=max_age, path="/")
-    payload: dict[str, Any] = {"user": user, "csrf_token": session.csrf_token, "expires_at": session.expires_at.isoformat()}
+    result: dict[str, Any] = {"user": user, "csrf_token": session.csrf_token, "expires_at": session.expires_at.isoformat()}
     if service.local_demo:
-        payload.update({"access_token": session.token, "token_type": "bearer"})
-    return payload
+        result.update({"access_token": session.token, "token_type": "bearer"})
+    return result
 
 
 @router.get("/auth/me")
@@ -177,17 +187,25 @@ def me(user_id: str = Depends(current_user_id), csrf_cookie: str | None = Cookie
 
 
 @router.post("/auth/logout")
-def logout(response: Response, user_id: str = Depends(current_user_id), session_cookie: str | None = Cookie(default=None, alias=SESSION_COOKIE), service: WorkflowService = Depends(workflow_service)) -> dict[str, str]:
+def logout(response: Response, user_id: str = Depends(current_user_id), session_cookie: str | None = Cookie(default=None, alias=SESSION_COOKIE), service: WorkflowService = Depends(workflow_service), auth: AccountService = Depends(auth_service)) -> dict[str, str]:
     if session_cookie:
-        auth_service(service).logout(session_cookie)
+        auth.logout(session_cookie)
     response.delete_cookie(SESSION_COOKIE, path="/")
     response.delete_cookie(CSRF_COOKIE, path="/")
     return {"status": "logged_out"}
 
 
-@router.get("/hunts")
-def list_hunts(user_id: str = Depends(current_user_id), service: WorkflowService = Depends(workflow_service)) -> list[dict[str, Any]]:
-    return service.list_hunts(user_id)
+@router.get("/hunts", response_model=list[HuntSummary])
+def list_hunts(
+    limit: int = Query(default=50, ge=1, le=100),
+    cursor: UUID | None = Query(default=None),
+    user_id: str = Depends(current_user_id),
+    service: WorkflowService = Depends(workflow_service),
+) -> list[dict[str, Any]]:
+    try:
+        return service.list_hunts(user_id, limit=limit, cursor=str(cursor) if cursor else None)
+    except Exception as exc:
+        raise _translate(exc) from exc
 
 
 @router.post("/hunts", status_code=201)
@@ -217,12 +235,11 @@ def cancel(hunt_id: str, user_id: str = Depends(current_user_id), service: Workf
         raise _translate(exc) from exc
 
 
-def upload_service(service: WorkflowService = Depends(workflow_service)) -> UploadService:
-    global _uploads
-    if _uploads is None:
-        from pathlib import Path
-        _uploads = UploadService(service.engine, Path("runtime/uploads"), limits=service.upload_limits)
-    return _uploads
+def upload_service(request: Request) -> UploadService:
+    service = getattr(request.app.state, "upload_service", None)
+    if service is None:
+        raise HTTPException(status_code=503, detail="upload service is not configured")
+    return service
 
 
 @router.get("/hunts/{hunt_id}/uploads")
@@ -257,12 +274,12 @@ async def _read_bounded_upload(request: Request, max_bytes: int) -> bytes:
 @router.post("/hunts/{hunt_id}/uploads", status_code=201)
 async def create_upload(hunt_id: str, request: Request, filename: str | None = None, user_id: str = Depends(current_user_id), service: WorkflowService = Depends(workflow_service), uploads: UploadService = Depends(upload_service)) -> dict[str, Any]:
     try:
-        service.get_hunt(user_id, hunt_id)
+        await run_in_threadpool(service.get_hunt, user_id, hunt_id)
         supplied_name = filename or request.headers.get("X-Filename")
         if not supplied_name:
             raise UploadError("filename is required")
         body = await _read_bounded_upload(request, uploads.limits.per_file_bytes)
-        return uploads.save(user_id, hunt_id, supplied_name, body, content_type=request.headers.get("content-type"))
+        return await run_in_threadpool(uploads.save, user_id, hunt_id, supplied_name, body, content_type=request.headers.get("content-type"))
     except Exception as exc:
         if isinstance(exc, UploadError):
             raise HTTPException(status_code=422, detail=str(exc)) from exc

@@ -72,6 +72,13 @@ class ModelSettings(StrictModel):
     model_name: str = Field(min_length=1, max_length=200)
     endpoint: str | None = None
     data_boundary: Literal["external", "local"] = "external"
+    reasoning_effort: Literal["none", "low", "medium", "high", "xhigh", "max"] | None = None
+
+    @model_validator(mode="after")
+    def reasoning_requires_openai(self) -> "ModelSettings":
+        if self.reasoning_effort is not None and self.provider != "openai":
+            raise ValueError("reasoning_effort currently requires the openai provider")
+        return self
 
 
 class SplunkSettings(StrictModel):
@@ -80,10 +87,11 @@ class SplunkSettings(StrictModel):
 
 
 class HuntLimitSettings(StrictModel):
+    # Legacy field accepted for existing YAML files; execution uses elapsed time.
     query_start_cutoff_utc: time = time(hour=20)
-    hard_completion_minutes: PositiveInt = 12
+    hard_completion_minutes: PositiveInt = 20
     agent_cycles: PositiveInt = 8
-    query_count: PositiveInt = 12
+    query_count: PositiveInt = 50
     per_hunt_query_concurrency: PositiveInt = 2
     search_job_timeout_seconds: PositiveInt = 120
     splunk_poll_interval_seconds: PositiveFloat = Field(default=1.0, gt=0, le=30)
@@ -94,16 +102,19 @@ class HuntLimitSettings(StrictModel):
     per_query_byte_limit: PositiveInt = 262_144_000
     per_hunt_row_limit: PositiveInt = 50_000
     per_hunt_byte_limit: PositiveInt = 1_073_741_824
-    representative_event_limit: PositiveInt = 100
+    representative_event_limit: PositiveInt = 500
     targeted_event_limit: PositiveInt = 500
     model_calls: PositiveInt = 12
     model_call_timeout_seconds: PositiveInt = 120
     context_characters: PositiveInt = 500_000
     input_tokens: PositiveInt = 500_000
     output_tokens: PositiveInt = 96_000
+    output_tokens_per_call: PositiveInt = 8_000
 
     @model_validator(mode="after")
     def validate_limit_relationships(self) -> "HuntLimitSettings":
+        if self.output_tokens_per_call > self.output_tokens:
+            raise ValueError("per-call output tokens cannot exceed the per-hunt output budget")
         if self.per_hunt_query_concurrency > self.deployment_query_concurrency:
             raise ValueError("per-hunt query concurrency cannot exceed deployment concurrency")
         if self.per_query_row_limit > self.per_hunt_row_limit:
@@ -211,10 +222,10 @@ class ExecutionSettings(StrictModel):
             "service_subject": "mcp_service_subject",
         }
         for key, nested_value in nested.items():
-            target = aliases.get(key, key)
-            if target in normalized and normalized[target] != nested_value:
-                raise ValueError(f"conflicting execution MCP setting: {target}")
-            normalized[target] = nested_value
+            nested_target = aliases.get(key, key)
+            if nested_target in normalized and normalized[nested_target] != nested_value:
+                raise ValueError(f"conflicting execution MCP setting: {nested_target}")
+            normalized[nested_target] = nested_value
         return normalized
 
     @field_validator("mcp_url")

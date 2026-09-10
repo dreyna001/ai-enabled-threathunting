@@ -81,6 +81,48 @@ def test_openai_adapter_allows_explicit_lab_tls_override() -> None:
     assert adapter.verify_tls is False
 
 
+@pytest.mark.parametrize("model_name,effort", [("gpt-5.1", "high"), ("gpt-5.6-terra", "high"), ("gpt-5.1", "none")])
+def test_reasoning_setting_is_forwarded_on_every_call(model_name: str, effort: str) -> None:
+    from threat_hunting.config import ModelSettings
+
+    settings = ModelSettings(provider="openai", model_name=model_name, reasoning_effort=effort)
+    adapter = ModelFactory.create(settings, client=FakeOpenAIClient())
+    model_request = ModelRequest(
+        messages=[{"role": "user", "content": "Return JSON"}],
+        temperature=0,
+        max_output_tokens=2048,
+        response_format={"type": "json_object"},
+    )
+    for _ in range(2):
+        adapter.complete(model_request)
+        payload = FakeOpenAIClient.last_payload
+        assert payload["model"] == model_name
+        assert payload["reasoning_effort"] == effort
+        assert payload["max_completion_tokens"] == 2048
+        assert payload["response_format"] == {"type": "json_object"}
+        if effort == "none":
+            assert payload["temperature"] == 0
+        else:
+            assert "temperature" not in payload
+
+
+def test_unconfigured_reasoning_preserves_temperature() -> None:
+    adapter = OpenAIModelAdapter("gpt-4.1", client=FakeOpenAIClient())
+    adapter.complete(ModelRequest(messages=[{"role": "user", "content": "hi"}], temperature=0))
+    assert FakeOpenAIClient.last_payload["temperature"] == 0
+    assert "reasoning_effort" not in FakeOpenAIClient.last_payload
+
+
+@pytest.mark.parametrize("provider,effort", [("openai", "invalid"), ("bedrock", "high")])
+def test_invalid_reasoning_configuration_is_rejected(provider: str, effort: str) -> None:
+    from threat_hunting.config import ModelSettings
+
+    with pytest.raises(ValueError):
+        ModelSettings(provider=provider, model_name="test", reasoning_effort=effort)
+    with pytest.raises(ValueError):
+        ModelConfiguration(provider=provider, model_name="test", reasoning_effort=effort)
+
+
 def test_model_request_rejects_caller_supplied_system_message() -> None:
     with pytest.raises(ValueError, match="system field"):
         ModelRequest(messages=[{"role": "system", "content": "untrusted"}])

@@ -14,6 +14,8 @@ from threat_hunting.config import (
     load_splunk_token,
 )
 from threat_hunting.domain.budgets import BudgetLimits
+from threat_hunting.domain.contracts import QUERY_RESULT_LIMITS
+from threat_hunting.domain.spl_policy import POLICY_VERSION
 from threat_hunting.integrations.models.factory import ModelConfiguration, ModelFactory
 from threat_hunting.integrations.splunk import SplunkConnectionConfig, SplunkConnector
 from threat_hunting.services.jobs import JobLease
@@ -25,11 +27,14 @@ def budget_limits_from_settings(settings: RuntimeSettings) -> BudgetLimits:
     """Translate immutable runtime limits to the domain budget contract."""
 
     limits = settings.hunt_limits
+    hard_seconds = limits.hard_completion_minutes * 60
+    synthesis_seconds = min(limits.model_call_timeout_seconds, hard_seconds - 2)
+    inflight_seconds = min(limits.search_job_timeout_seconds, 120, hard_seconds - synthesis_seconds - 1)
     return BudgetLimits(
-        hard_hunt_seconds=limits.hard_completion_minutes * 60,
-        query_start_cutoff_seconds=min(480, max(1, limits.hard_completion_minutes * 60 - 1)),
-        max_inflight_query_seconds_after_cutoff=min(limits.search_job_timeout_seconds, 120),
-        synthesis_allowance_seconds=min(120, limits.hard_completion_minutes * 60 - 1),
+        hard_hunt_seconds=hard_seconds,
+        query_start_cutoff_seconds=hard_seconds - synthesis_seconds - inflight_seconds,
+        max_inflight_query_seconds_after_cutoff=inflight_seconds,
+        synthesis_allowance_seconds=synthesis_seconds,
         max_agent_cycles=limits.agent_cycles,
         max_splunk_queries=limits.query_count,
         max_concurrent_splunk_jobs=limits.per_hunt_query_concurrency,
@@ -40,6 +45,7 @@ def budget_limits_from_settings(settings: RuntimeSettings) -> BudgetLimits:
         max_model_calls=limits.model_calls,
         max_model_input_tokens=limits.input_tokens,
         max_model_output_tokens=limits.output_tokens,
+        max_model_output_tokens_per_call=limits.output_tokens_per_call,
         max_model_call_timeout_seconds=limits.model_call_timeout_seconds,
         max_cached_rows_per_query=limits.per_query_row_limit,
         max_cached_bytes_per_query=limits.per_query_byte_limit,
@@ -70,6 +76,7 @@ def build_production_adapters(settings: RuntimeSettings) -> tuple[SplunkConnecto
             app_namespace=settings.splunk.app_namespace,
             max_discovery_items=1_000,
             max_discovery_bytes=8 * 1024 * 1024,
+            representative_event_limit=100,
         )
     )
     api_key = load_optional_secret_file(MODEL_API_KEY_FILE_ENV, label="model API key")
@@ -81,6 +88,7 @@ def build_production_adapters(settings: RuntimeSettings) -> tuple[SplunkConnecto
         ModelConfiguration(
             provider=settings.model.provider,
             model_name=settings.model.model_name,
+            reasoning_effort=settings.model.reasoning_effort,
             endpoint=settings.model.endpoint,
             api_key=api_key,
             verify_tls=settings.tls.verify,
@@ -111,6 +119,7 @@ def build_production_service(engine: Engine, settings: RuntimeSettings) -> Workf
         execution_config={
             "provider": settings.model.provider,
             "model_name": settings.model.model_name,
+            "reasoning_effort": settings.model.reasoning_effort,
             "endpoint": settings.model.endpoint or "configured_provider_default",
             "provider_data_boundary": settings.model.data_boundary,
             "provider_data_handling_approval_ref": settings.execution.provider_data_handling_approval_ref,
@@ -118,8 +127,9 @@ def build_production_service(engine: Engine, settings: RuntimeSettings) -> Workf
             "splunk_app_namespace": settings.splunk.app_namespace,
             "splunk_poll_interval_seconds": settings.hunt_limits.splunk_poll_interval_seconds,
             "hunt_limits": settings.hunt_limits.model_dump(mode="json"),
-            "prompt_contract_version": "1.0",
-            "spl_policy_version": "2026-01",
+            "prompt_contract_version": "1.22",
+            "spl_policy_version": POLICY_VERSION,
+            "query_result_limits": dict(QUERY_RESULT_LIMITS),
             "image_version": settings.image_version,
         },
     )

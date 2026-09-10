@@ -3,10 +3,11 @@ from __future__ import annotations
 from pathlib import Path
 
 from fastapi.testclient import TestClient
+import pytest
 
-from threat_hunting.config import RuntimeSettings
+from threat_hunting.config import ConfigurationError, RuntimeSettings
 from threat_hunting.health import check_readiness
-from threat_hunting.main import create_app
+from threat_hunting.main import _cookie_secure_override, create_app
 
 
 class ReadyDatabase:
@@ -53,6 +54,16 @@ def test_liveness_does_not_require_dependencies() -> None:
     assert response.json() == {"status": "live", "checks": []}
 
 
+def test_cookie_secure_override_is_explicit_and_validated(monkeypatch) -> None:
+    monkeypatch.setenv("THREAT_HUNTING_COOKIE_SECURE", "false")
+    assert _cookie_secure_override() is False
+    monkeypatch.setenv("THREAT_HUNTING_COOKIE_SECURE", "true")
+    assert _cookie_secure_override() is True
+    monkeypatch.setenv("THREAT_HUNTING_COOKIE_SECURE", "invalid")
+    with pytest.raises(ConfigurationError, match="must be true or false"):
+        _cookie_secure_override()
+
+
 def test_readiness_passes_when_all_checks_pass(tmp_path: Path) -> None:
     database = ReadyDatabase()
     result = check_readiness(
@@ -88,4 +99,3 @@ def test_readiness_fails_when_free_space_reserve_is_unavailable(tmp_path: Path) 
     )
     assert result.status == "not_ready"
     assert any(check.name == "persistent_storage" and check.status == "fail" for check in result.checks)
-

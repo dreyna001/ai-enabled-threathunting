@@ -6,7 +6,7 @@ import hashlib
 import secrets
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Callable
 from uuid import uuid4
 
 from argon2 import PasswordHasher
@@ -100,7 +100,7 @@ class LoginRateLimiter:
         self, connection: Any, *, bucket_hash: str, max_failures: int, now: datetime
     ) -> None:
         if connection.dialect.name == "postgresql":
-            insert = postgresql_insert
+            insert: Callable[..., Any] = postgresql_insert
         elif connection.dialect.name == "sqlite":
             insert = sqlite_insert
         else:

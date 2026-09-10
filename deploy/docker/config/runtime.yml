@@ -31,17 +31,18 @@ splunk:
 
 model:
   provider: openai
-  model_name: gpt-4.1
+  model_name: gpt-5.1
+  reasoning_effort: none
   endpoint: null
   # Change to external and set execution.provider_data_handling_approval_ref
   # before any customer data is sent to a provider outside this deployment.
   data_boundary: external
 
 hunt_limits:
-  query_start_cutoff_utc: "20:00:00"
-  hard_completion_minutes: 12
+  # Elapsed execution time; reserve one model call and up to 120s for an in-flight search.
+  hard_completion_minutes: 20
   agent_cycles: 8
-  query_count: 12
+  query_count: 50
   per_hunt_query_concurrency: 2
   search_job_timeout_seconds: 120
   splunk_transport_timeout_seconds: 30
@@ -51,13 +52,15 @@ hunt_limits:
   per_query_byte_limit: 262144000
   per_hunt_row_limit: 50000
   per_hunt_byte_limit: 1073741824
-  representative_event_limit: 100
+  representative_event_limit: 500
   targeted_event_limit: 500
   model_calls: 12
-  model_call_timeout_seconds: 120
+  model_call_timeout_seconds: 300
   context_characters: 500000
   input_tokens: 500000
   output_tokens: 96000
+  # Includes reasoning and visible answer tokens; the total hunt budget still applies.
+  output_tokens_per_call: 24000
 
 retention:
   hunt_days: 90

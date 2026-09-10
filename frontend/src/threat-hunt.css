@@ -33,8 +33,9 @@ code, pre, .vs-code { font-family: "Roboto Mono", ui-monospace, monospace; }
 .vs-muted, .vs-empty { color: #8b949e; }
 .vs-card > label { display: grid; gap: 0.4rem; margin: 1rem 0; font-weight: 600; }
 .vs-card input, .vs-card textarea { width: 100%; padding: 0.65rem; border: 1px solid #30363d; background: #0d1117; color: #e6edf3; }
+.vs-card textarea { max-height: 18rem; overflow: auto; resize: vertical; }
 .vs-code { font-size: 0.78rem; }
-pre { overflow: auto; padding: 0.75rem; border: 1px solid #30363d; background: #0d1117; white-space: pre-wrap; }
+pre { max-height: 18rem; overflow: auto; padding: 0.75rem; border: 1px solid #30363d; background: #0d1117; white-space: pre-wrap; }
 .vs-actions { display: flex; flex-wrap: wrap; gap: 0.6rem; margin-top: 1rem; }
 .vs-badge, .vs-card header > span { padding: 0.35rem 0.55rem; border: 1px solid #30363d; background: #1c2129; color: #8cbcff; text-transform: capitalize; }
 .vs-error, .vs-warning { padding: 0.75rem; border: 1px solid; }
@@ -43,6 +44,9 @@ pre { overflow: auto; padding: 0.75rem; border: 1px solid #30363d; background: #
 .vs-steps { display: grid; grid-template-columns: repeat(6, 1fr); margin: 1.5rem 0; }
 .vs-steps span { padding: 0.6rem; border-bottom: 2px solid #1f6feb; text-align: center; }
 .vs-results { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+.vs-scroll-panel, .vs-result-items { height: min(18rem, 50vh); overflow-y: scroll; overscroll-behavior: contain; -webkit-overflow-scrolling: touch; border: 1px solid #30363d; scrollbar-gutter: stable; }
+.vs-scroll-panel pre, .vs-result-items pre { max-height: none; margin: 0; border-width: 0 0 1px; }
+.vs-scroll-panel pre:last-child, .vs-result-items pre:last-child { border-bottom: 0; }
 .vs-hunt-row { display: flex; width: 100%; align-items: center; justify-content: space-between; margin: 0.5rem 0; border-color: #30363d; background: #161b22; color: #e6edf3; text-align: left; }
 .vs-hunt-row small { display: block; margin-top: 0.25rem; color: #8b949e; }
 

@@ -64,6 +64,291 @@ def test_discovery_uses_metadata_only_and_normalizes_catalog() -> None:
     assert "search/jobs" not in client.get_calls
 
 
+def test_indexed_source_catalog_includes_sources_without_saved_configuration() -> None:
+    class IndexedClient(FakeSplunkClient):
+        def search(self, query, **kwargs):
+            self.search_calls += 1
+            assert query == '| tstats count WHERE (index="main") BY sourcetype | head 1000'
+            assert kwargs["earliest_time"] == "0"
+            assert kwargs["latest_time"].endswith("Z")
+            return [{"sourcetype": "lab:normalized:endpoint", "count": "70"}]
+
+    client = IndexedClient()
+    result = make_connector(client).discover(include_indexed_sources=True)
+    assert set(result.sourcetypes) == {"syslog", "lab:normalized:endpoint"}
+    assert client.search_calls == 1
+    assert "count" not in result.fields
+    assert any("configured" in note and "indexed" in note for note in result.coverage_limitations)
+
+
+@pytest.mark.parametrize("rows", [[], [{"sourcetype": "observed", "count": "1"}]])
+def test_successful_indexed_probe_establishes_tstats_without_data_model_metadata(rows) -> None:
+    class Client(FakeSplunkClient):
+        def get(self, path, **kwargs):
+            return {"entry": []} if path == "data/models" else super().get(path, **kwargs)
+
+        def search(self, *args, **kwargs):
+            return rows
+
+    result = make_connector(Client()).discover(include_indexed_sources=True)
+    assert result.tstats_available is True
+    assert not any("availability was not exposed" in note for note in result.coverage_limitations)
+    assert result.accelerated_data_models == ()
+
+
+@pytest.mark.parametrize("no_indexes", [False, True])
+def test_failed_or_unexecuted_indexed_probe_does_not_establish_tstats(no_indexes) -> None:
+    class Client(FakeSplunkClient):
+        def get(self, path, **kwargs):
+            return {"entry": []} if path == "data/models" else super().get(path, **kwargs)
+
+        def search(self, *args, **kwargs):
+            raise PermissionError("denied")
+
+    client = Client()
+    if no_indexes:
+        client.indexes = []
+    result = make_connector(client).discover(include_indexed_sources=True)
+    assert result.tstats_available is None
+    assert any("availability was not exposed" in note for note in result.coverage_limitations)
+
+
+def test_indexed_source_discovery_failure_is_observable_and_keeps_configured_metadata() -> None:
+    class DeniedClient(FakeSplunkClient):
+        def search(self, *args, **kwargs):
+            raise PermissionError("denied")
+
+    result = make_connector(DeniedClient()).discover(include_indexed_sources=True)
+    assert result.sourcetypes == ("syslog",)
+    assert result.complete is False
+    assert any("indexed_sourcetypes" in error for error in result.errors)
+
+
+def test_indexed_source_discovery_rejects_catalog_values_containing_spl() -> None:
+    client = FakeSplunkClient()
+    client.indexes = [{"name": 'main\" | collect index=other'}]
+    result = make_connector(client).discover(include_indexed_sources=True)
+    assert client.search_calls == 0
+    assert result.complete is False
+    assert any("indexed_sourcetypes" in error for error in result.errors)
+
+
+def test_indexed_source_discovery_cancels_a_job_created_during_cancellation() -> None:
+    token = CancellationToken()
+
+    class Job:
+        cancelled = False
+
+        def cancel(self):
+            self.cancelled = True
+
+    job = Job()
+
+    class Client(FakeSplunkClient):
+        def search(self, *args, **kwargs):
+            token.cancel()
+            return job
+
+    with pytest.raises(AdapterError) as error:
+        make_connector(Client()).discover(include_indexed_sources=True, cancellation_token=token)
+    assert error.value.category is FailureCategory.CANCELLED
+    assert job.cancelled
+
+
+def test_indexed_source_limit_marks_catalog_partial():
+    class Client(FakeSplunkClient):
+        def search(self, *args, **kwargs):
+            return [{"sourcetype": "source:one"}]
+
+    connector = SplunkConnector(SplunkConnectionConfig(endpoint="https://splunk.example", token="unit-test-token", max_discovery_items=1), client=Client())
+    result = connector.discover(include_indexed_sources=True)
+    assert result.complete is False
+    assert any("indexed sourcetype result limit" in note for note in result.coverage_limitations)
+
+
+def test_discovery_can_read_bounded_representative_search_schema_for_approved_scope() -> None:
+    class SchemaClient(FakeSplunkClient):
+        def get(self, path: str, **kwargs: object) -> object:
+            if path == "saved/sourcetypes":
+                return {"entry": [{"name": "syslog"}]}
+            return super().get(path, **kwargs)
+
+        def search(self, query: str, **kwargs: object) -> object:
+            self.search_calls += 1
+            assert query == 'search index="main" sourcetype="syslog" | head 1 | fieldsummary'
+            assert kwargs == {
+                "earliest_time": "2024-01-01T00:00:00Z",
+                "latest_time": "2024-01-02T00:00:00Z",
+                "output_mode": "json",
+                "max_count": 1_000,
+            }
+            return [{"field": "host"}, {"field": "src_ip"}]
+
+    client = SchemaClient()
+    result = make_connector(client).discover(
+        approved_indexes=("main",),
+        approved_sourcetypes=("syslog",),
+        earliest_utc="2024-01-01T00:00:00Z",
+        latest_utc="2024-01-02T00:00:00Z",
+    )
+
+    assert result.representative_schemas == {"syslog": ("host", "src_ip")}
+    assert {"host", "src_ip"}.issubset(result.fields)
+    assert client.search_calls == 1
+
+
+def test_discovery_keeps_metadata_schema_without_representative_search() -> None:
+    client = FakeSplunkClient()
+    result = make_connector(client).discover(
+        approved_indexes=("main",),
+        approved_sourcetypes=("syslog",),
+        earliest_utc="2024-01-01T00:00:00Z",
+        latest_utc="2024-01-02T00:00:00Z",
+    )
+
+    assert result.representative_schemas["syslog"] == ("host", "message")
+    assert client.search_calls == 0
+
+
+def test_scoped_schema_discovery_uses_exact_pairs_and_hunt_dates() -> None:
+    class HistoricalClient(FakeSplunkClient):
+        def __init__(self):
+            super().__init__()
+            self.indexes = [{"name": name, "content": {"earliestTime": "2026-01-01T00:00:00Z", "latestTime": "2026-01-12T00:10:00Z"}}
+                            for name in ("endpoint", "auth", "dns", "network")]
+            self.queries = []
+
+        def get(self, path, **kwargs):
+            if path == "saved/sourcetypes":
+                return {"entry": [{"name": name} for name in ("process:events", "auth:events", "dns:events", "network:events")]}
+            return super().get(path, **kwargs)
+
+        def search(self, query, **kwargs):
+            self.queries.append(query)
+            assert kwargs["earliest_time"] == "2026-01-01T00:00:00Z"
+            assert kwargs["latest_time"] == "2026-01-05T00:00:00Z"
+            return [{"field": "host"}, {"field": "dest_ip"}, {"field": "dest_port"}]
+
+    client = HistoricalClient()
+    pairs = [("endpoint", "process:events"), ("auth", "auth:events"), ("dns", "dns:events"), ("network", "network:events")]
+    result = make_connector(client).discover(
+        approved_indexes=[pair[0] for pair in pairs], approved_sourcetypes=[pair[1] for pair in pairs],
+        source_pairs=pairs, earliest_utc="2026-01-01T00:00:00Z", latest_utc="2026-01-05T00:00:00Z",
+    )
+    assert len(client.queries) == 4  # No 4x4 cross-product starving later sources.
+    assert client.queries == [f'search index="{index}" sourcetype="{source}" | head 1 | fieldsummary' for index, source in pairs]
+    assert "dest_port" in result.representative_schemas["network:events"]
+    assert any("sample" in item and "exhaustive" in item for item in result.coverage_limitations)
+
+
+def test_explicit_source_pairs_cannot_expand_the_discovery_scope() -> None:
+    client = FakeSplunkClient()
+    with pytest.raises(AdapterError):
+        make_connector(client).discover(
+            approved_indexes=["main"], approved_sourcetypes=["syslog"], source_pairs=[("secret", "syslog")],
+            earliest_utc="2024-01-01T00:00:00Z", latest_utc="2024-01-02T00:00:00Z",
+        )
+    assert client.search_calls == 0
+
+
+def test_explicit_pairs_sample_each_index_even_when_the_sourcetype_has_metadata() -> None:
+    class SharedSourceClient(FakeSplunkClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.indexes = [{"name": "main"}, {"name": "archive"}]
+
+        def search(self, query: str, **kwargs: object) -> object:
+            self.search_calls += 1
+            return [{"field": "dest_port" if 'index="archive"' in query else "src_ip"}]
+
+    client = SharedSourceClient()
+    result = make_connector(client).discover(
+        approved_indexes=["main", "archive"], approved_sourcetypes=["syslog"],
+        source_pairs=[("main", "syslog"), ("archive", "syslog")],
+        earliest_utc="2024-01-01T00:00:00Z", latest_utc="2024-01-02T00:00:00Z",
+    )
+    assert client.search_calls == 2
+    assert {"host", "message", "src_ip", "dest_port"}.issubset(result.representative_schemas["syslog"])
+
+
+def test_production_discovery_derives_source_pairs_from_covered_index_events() -> None:
+    class CoveredIndexClient(FakeSplunkClient):
+        def get(self, path: str, **kwargs: object) -> object:
+            if path == "saved/sourcetypes":
+                return {"entry": [{"name": "syslog"}]}
+            return super().get(path, **kwargs)
+
+        def search(self, query: str, **kwargs: object) -> object:
+            self.search_calls += 1
+            assert kwargs["earliest_time"] == "2024-01-01T00:00:00Z"
+            assert kwargs["latest_time"] == "2024-01-02T00:00:00Z"
+            if query == 'search index="main" | head 1':
+                return [{"sourcetype": "syslog", "host": "host-1", "process": "pwsh"}]
+            assert query == 'search index="main" sourcetype="syslog" | head 1 | fieldsummary'
+            return [{"field": "host"}, {"field": "process"}]
+
+    client = CoveredIndexClient()
+    result = make_connector(client).discover(include_representative_schemas=True)
+
+    assert result.representative_schemas["syslog"] == ("host", "process")
+    assert client.search_calls == 2
+
+
+def test_representative_schema_waits_for_delayed_read_only_job() -> None:
+    class DelayedJob:
+        def __init__(self) -> None:
+            self.polls = 0
+            self.cancel_calls = 0
+
+        def is_done(self) -> bool:
+            return self.polls >= 2
+
+        def refresh(self) -> None:
+            self.polls += 1
+
+        def results(self, **_: object) -> list[dict[str, str]]:
+            assert self.polls >= 2
+            return [{"field": "host"}, {"field": "process"}]
+
+        def cancel(self) -> None:
+            self.cancel_calls += 1
+
+    class DelayedClient(FakeSplunkClient):
+        def get(self, path: str, **kwargs: object) -> object:
+            if path == "saved/sourcetypes":
+                return {"entry": [{"name": "syslog"}]}
+            return super().get(path, **kwargs)
+
+        def search(self, _query: str, **_kwargs: object) -> object:
+            self.search_calls += 1
+            return DelayedJob()
+
+    client = DelayedClient()
+    result = make_connector(client).discover(
+        approved_indexes=("main",),
+        approved_sourcetypes=("syslog",),
+        earliest_utc="2024-01-01T00:00:00Z",
+        latest_utc="2024-01-02T00:00:00Z",
+    )
+
+    assert result.representative_schemas["syslog"] == ("host", "process")
+    assert client.search_calls == 1
+
+
+def test_representative_schema_discovery_requires_exact_bounded_scope() -> None:
+    client = FakeSplunkClient()
+    with pytest.raises(AdapterError) as caught:
+        make_connector(client).discover(
+            approved_indexes=("main OR index=other",),
+            approved_sourcetypes=("syslog",),
+            earliest_utc="2024-01-01T00:00:00Z",
+            latest_utc="2024-01-02T00:00:00Z",
+        )
+
+    assert caught.value.category is FailureCategory.VALIDATION_FAILURE
+    assert client.search_calls == 0
+
+
 def test_discovery_requests_json_metadata_responses() -> None:
     class JsonClient(FakeSplunkClient):
         def get(self, path: str, **kwargs: object) -> object:
@@ -359,6 +644,70 @@ def test_streamed_results_are_read_with_the_policy_byte_cap() -> None:
 
     assert caught.value.category is FailureCategory.BUDGET_EXHAUSTED
     assert response.requested_size == 65
+
+
+def test_fetch_results_requests_json_records() -> None:
+    class Job:
+        def __init__(self) -> None:
+            self.kwargs: dict[str, object] | None = None
+
+        def results(self, **kwargs: object) -> bytes:
+            self.kwargs = kwargs
+            return b'{"results": [{"host": "host-1", "event_id": "evt-1"}]}'
+
+    client = CancellableClient()
+    job = Job()
+    client.jobs["job-123"] = job
+
+    rows = make_connector(client).fetch_results("job-123", page=1, limit=25)
+
+    assert rows == [{"host": "host-1", "event_id": "evt-1"}]
+    assert job.kwargs == {"offset": 25, "count": 25, "output_mode": "json"}
+
+
+def test_page_deadline_bounds_body_read_and_late_body_is_not_returned():
+    entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+
+    class Body:
+        def read(self, _size=None):
+            entered.set()
+            release.wait(timeout=2)
+            finished.set()
+            return b'{"results":[{"event_id":"late"}]}'
+
+    class Job:
+        def results(self, **kwargs):
+            return Body()
+
+    client = CancellableClient()
+    client.jobs["job-123"] = Job()
+    try:
+        with pytest.raises(AdapterError) as error:
+            make_connector(client).fetch_results("job-123", timeout_seconds=0.05)
+        assert error.value.category is FailureCategory.HARD_TIMEOUT
+        assert entered.is_set()
+        # Caller timeout does not stop the underlying reader. Release and join
+        # its completion explicitly; its late result must never be accepted.
+        assert not finished.is_set()
+    finally:
+        release.set()
+        assert finished.wait(timeout=2)
+
+
+def test_result_body_failure_is_not_an_empty_success():
+    class Body:
+        def read(self, _size=None):
+            raise TimeoutError("read failed")
+
+    class Job:
+        def results(self, **kwargs):
+            return Body()
+
+    client = CancellableClient()
+    client.jobs["job-123"] = Job()
+    with pytest.raises(AdapterError) as error:
+        make_connector(client).fetch_results("job-123")
+    assert error.value.category is FailureCategory.HARD_TIMEOUT
 
 
 def test_tls_and_endpoint_validation_rejects_unsafe_configuration() -> None:

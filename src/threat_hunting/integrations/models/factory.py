@@ -25,6 +25,7 @@ class ModelConfiguration:
     ca_bundle_path: Path | None = None
     allow_insecure: bool = False
     timeout_seconds: float = 120.0
+    reasoning_effort: str | None = None
 
     def __post_init__(self) -> None:
         normalized = self.provider.lower().strip()
@@ -35,6 +36,10 @@ class ModelConfiguration:
         if not self.model_name.strip():
             raise ValueError("model_name must not be empty")
         object.__setattr__(self, "provider", normalized)
+        if self.reasoning_effort is not None and (
+            normalized != "openai" or self.reasoning_effort not in {"none", "low", "medium", "high", "xhigh", "max"}
+        ):
+            raise ValueError("reasoning_effort requires openai and a supported effort")
         object.__setattr__(self, "api_key", _as_secret(self.api_key))
         if self.endpoint is not None and normalized in {
             ModelProvider.OPENAI.value,
@@ -61,6 +66,7 @@ class ModelFactory:
             return OpenAIModelAdapter(
                 config.model_name,
                 api_key=config.api_key,
+                reasoning_effort=config.reasoning_effort,
                 endpoint=config.endpoint,
                 verify_tls=config.verify_tls,
                 ca_bundle_path=config.ca_bundle_path,
@@ -106,9 +112,10 @@ class ModelFactory:
             return ModelConfiguration(**dict(configuration))
         # Runtime ModelSettings is a strict Pydantic model.  Access fields by
         # name instead of importing config into the integration boundary.
-        values = {
+        values: dict[str, Any] = {
             "provider": getattr(configuration, "provider", None),
             "model_name": getattr(configuration, "model_name", None),
+            "reasoning_effort": getattr(configuration, "reasoning_effort", None),
                 "endpoint": getattr(configuration, "endpoint", None),
         }
         if not values["provider"] or not values["model_name"]:

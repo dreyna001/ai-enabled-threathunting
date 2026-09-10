@@ -41,7 +41,7 @@ def test_query_and_result_counters_include_failed_submissions() -> None:
 
 def test_budget_rejects_unsafe_limit_combinations() -> None:
     with pytest.raises(ValidationError):
-        BudgetLimits(query_start_cutoff_seconds=720)
+        BudgetLimits(query_start_cutoff_seconds=1200)
     with pytest.raises(ValidationError):
         BudgetLimits(max_model_output_tokens_per_call=100_000)
     with pytest.raises(ValidationError):
@@ -73,4 +73,3 @@ def test_failure_record_cannot_claim_a_different_retry_class() -> None:
         retry_number=1,
     )
     assert record.category is FailureCategory.RATE_LIMITED
-

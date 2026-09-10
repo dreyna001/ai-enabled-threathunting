@@ -37,12 +37,31 @@ def test_scope_isolation_and_generation_fence_stale_completion() -> None:
         service.complete(old)
 
 
-def test_long_handler_renews_lease_before_completion() -> None:
+def test_long_handler_renews_lease_before_completion(monkeypatch) -> None:
     service = _service(lease_seconds=1)
+    clock = [datetime(2026, 9, 8, tzinfo=timezone.utc)]
+    start = clock[0]
+    monkeypatch.setattr("threat_hunting.services.jobs._now", lambda: clock[0])
     service.enqueue("owner", "hunt", idempotency_key="hunt")
-    assert process_one(service, "worker", handler=lambda _lease: time.sleep(1.4))
+    heartbeat = service.heartbeat
+    renewed = threading.Event()
+
+    def advance_and_renew(lease):
+        clock[0] += timedelta(seconds=0.4)
+        current = heartbeat(lease)
+        if clock[0] - start > timedelta(seconds=1):
+            renewed.set()
+        return current
+
+    monkeypatch.setattr(service, "heartbeat", advance_and_renew)
+    def handler(_lease):
+        assert renewed.wait(timeout=10)
+
+    assert process_one(service, "worker", handler=handler)
+    assert clock[0] - start > timedelta(seconds=1)
     status = service.get_for_owner("owner", "hunt")
     assert status is not None and status["status"] == "completed"
+    service.engine.dispose()
 
 
 def test_expired_lease_cannot_complete_job() -> None:

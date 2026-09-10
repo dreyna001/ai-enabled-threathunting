@@ -7,12 +7,11 @@ import re
 from collections.abc import Mapping, Sequence
 from typing import Any, Protocol
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, Response, status
 from sqlalchemy import text
 
 
 router = APIRouter(tags=["evidence"])
-_service: "EvidenceAccessService | None" = None
 _SAFE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
@@ -25,15 +24,16 @@ class EvidenceAccessService(Protocol):
     def download(self, *, hunt_id: str, evidence_id: str, owner_id: str) -> bytes: ...
 
 
-def configure_evidence_service(service: EvidenceAccessService) -> None:
-    global _service
-    _service = service
+def configure_evidence_service(application: FastAPI, service: EvidenceAccessService) -> None:
+    """Bind the service to one application instance."""
+    application.state.evidence_service = service
 
 
-def get_evidence_service() -> EvidenceAccessService:
-    if _service is None:
+def get_evidence_service(request: Request) -> EvidenceAccessService:
+    service = getattr(request.app.state, "evidence_service", None)
+    if service is None:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="evidence service is not configured")
-    return _service
+    return service
 
 
 def current_user_id(request: Request) -> str:

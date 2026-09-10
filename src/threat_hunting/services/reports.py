@@ -10,10 +10,13 @@ from __future__ import annotations
 
 import hashlib
 import html
+import ipaddress
+import textwrap
 import json
 import os
 import re
 import tempfile
+from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -21,6 +24,10 @@ from pathlib import Path
 from typing import Any, Protocol
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from threat_hunting.domain.contracts import HuntPlan
+from threat_hunting.domain.errors import Validation
+from threat_hunting.services.evidence import evidence_time_bounds, query_source_coverage
 
 from sqlalchemy import text
 
@@ -235,6 +242,18 @@ def validate_report_content(
     check_ids("finding_ids", available_finding_ids)
     check_ids("evidence_ids", available_evidence_ids)
     check_ids("query_ids", available_query_ids)
+    if "question_answers" in normalized:
+        answers = normalized["question_answers"]
+        if not isinstance(answers, list):
+            raise ReportValidationError("question_answers must be an array")
+        for answer in answers:
+            if (not isinstance(answer, Mapping)
+                    or any(not isinstance(answer.get(key), str) or not answer[key].strip() for key in ("question_id", "question", "summary"))
+                    or any(not isinstance(answer.get(key), list) or not all(isinstance(value, str) and value.strip() for value in answer[key]) for key in ("finding_ids", "limitations"))
+                    or not (answer["finding_ids"] or answer["limitations"])):
+                raise ReportValidationError("question answers require a summary and finding references or limitations")
+            if available_finding_ids is not None and not set(answer["finding_ids"]).issubset(available_finding_ids):
+                raise ReportValidationError("question answer references unavailable findings")
     if str(normalized.get("disposition")) == "supported" and not normalized["evidence_ids"]:
         raise ReportValidationError("supported reports require retained evidence citations")
     for entry in normalized["query_appendix"]:
@@ -295,7 +314,13 @@ def render_report_html(content: Mapping[str, Any], *, display_timezone: str = "U
         "hypothesis": f"<p>{esc(content['hypothesis'])}</p>",
         "objective": f"<p>{esc(content['objective_and_scope'])}</p>",
         "sources": f"<ul>{list_items(content['data_sources_used'])}</ul>",
-        "findings": f"<ul>{list_items(findings)}</ul>",
+        "findings": f"<ul>{list_items(findings)}</ul>" + (
+            "<h3>Approved question answers</h3>" + "".join(
+                f"<ul>{list_items(_question_answer_text(answer))}</ul>"
+                for answer in content["question_answers"]
+            )
+            if "question_answers" in content else ""
+        ),
         "evidence": f"<ul>{list_items(evidence)}</ul>",
         "entities": f"<ul>{list_items(entities)}</ul>",
         "timeline": f"<ul>{''.join(timeline_rows) or '<li>None recorded</li>'}</ul>",
@@ -536,3 +561,467 @@ class ReportService:
 __all__ = [
     "DownloadedArtifact", "FileArtifactStore", "FinalizedReport", "ReportConflict", "ReportError", "ReportForbidden", "ReportLocked", "ReportNotFound", "ReportPreview", "ReportRenderError", "ReportRepository", "ReportService", "ReportValidationError", "SecureWeasyPrintRenderer", "SqlReportRepository", "REQUIRED_SECTIONS", "render_report_html", "validate_report_content",
 ]
+
+
+REPORT_LIST_LIMITS = {
+    "selected_evidence": 20,
+    "entities": 20,
+    "timeline": 20,
+    "query_appendix": 12,
+}
+
+# Default draft detail selection only. Analysts may include more findings;
+# this never restricts stored findings or the answer to any approved question.
+REPORT_FINDING_DETAIL_TARGET = 10
+
+
+REPORT_EVIDENCE_FIELDS = {"evidence_id", "query_id", "index", "sourcetype", "event_time_utc"}
+
+
+REPORT_QUERY_FIELDS = {"query_id", "purpose", "spl", "status", "result_count", "truncated"}
+
+
+def _validate_report_content(content: Mapping[str, Any], results: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Validate bounded report structure and retained-evidence references."""
+
+    normalized = json.loads(json.dumps(content, ensure_ascii=False, default=str))
+    required = {"hypothesis", "objective_and_scope", "data_sources_used", "findings", "selected_evidence", "entities", "timeline", "coverage_and_limitations", "conclusion_and_disposition", "query_appendix"}
+    if not isinstance(normalized, dict) or required.difference(normalized):
+        raise Validation("report is missing required sections")
+    if len(json.dumps(normalized, ensure_ascii=False).encode("utf-8")) > 1024 * 1024:
+        raise Validation("report content exceeds the 1 MiB limit")
+    for key in ("hypothesis", "objective_and_scope", "conclusion_and_disposition"):
+        if not isinstance(normalized.get(key), str) or not normalized[key].strip():
+            raise Validation(f"report section {key!r} must contain text")
+    for key in ("data_sources_used", "findings", "selected_evidence", "entities", "timeline", "coverage_and_limitations", "query_appendix"):
+        if not isinstance(normalized.get(key), list):
+            raise Validation(f"report section {key!r} must be an array")
+    for key, limit in REPORT_LIST_LIMITS.items():
+        if len(normalized[key]) > limit:
+            raise Validation(f"report section {key!r} exceeds the {limit}-item limit")
+    if "question_answers" in (results or {}) or "question_answers" in normalized:
+        answers = normalized.get("question_answers")
+        if not isinstance(answers, list):
+            raise Validation("report question_answers must contain every approved question")
+        expected = {item["question_id"]: item for item in (results or {}).get("question_answers", [])}
+        answered: set[str] = set()
+        finding_ids = {str(item.get("finding_id")) for item in (results or {}).get("findings", normalized["findings"]) if isinstance(item, Mapping)}
+        for answer in answers:
+            if not isinstance(answer, dict) or set(answer) != {"question_id", "question", "summary", "finding_ids", "limitations"}:
+                raise Validation("report question answer has invalid fields")
+            question_id = answer["question_id"]
+            if (not isinstance(question_id, str) or not question_id.strip() or question_id in answered
+                    or not isinstance(answer["question"], str) or not answer["question"].strip()
+                    or (expected and (question_id not in expected or expected[question_id]["question"] != answer["question"]))):
+                raise Validation("report question answer does not match an approved question")
+            if (not isinstance(answer["finding_ids"], list) or not all(isinstance(value, str) and value in finding_ids for value in answer["finding_ids"])
+                    or not isinstance(answer["summary"], str) or not answer["summary"].strip()
+                    or not isinstance(answer["limitations"], list) or not all(isinstance(value, str) and value.strip() for value in answer["limitations"])
+                    or not (answer["finding_ids"] or answer["limitations"])):
+                raise Validation("each report question requires finding references or an explicit limitation")
+            if len(answer["finding_ids"]) != len(set(answer["finding_ids"])) or (
+                expected and set(answer["finding_ids"]) != set(expected[question_id]["finding_ids"])
+            ):
+                raise Validation("report question finding references must match the retained question answer")
+            answered.add(question_id)
+        if expected and answered != set(expected):
+            raise Validation("report question_answers must contain every approved question")
+    available_evidence = {str(item.get("evidence_id")) for item in (results or {}).get("evidence", [])}
+    if any(not isinstance(item, dict) or set(item).difference(REPORT_EVIDENCE_FIELDS) for item in normalized["selected_evidence"]):
+        raise Validation("selected evidence must contain citations only, not raw events")
+    cited_evidence = {str(item.get("evidence_id")) for item in normalized["selected_evidence"]}
+    if not cited_evidence.issubset(available_evidence):
+        raise Validation("report references unavailable evidence")
+    if any(not isinstance(item, dict) or set(item).difference(REPORT_QUERY_FIELDS) for item in normalized["query_appendix"]):
+        raise Validation("query appendix must contain query summaries only")
+    return normalized
+
+
+def _concise_report_content(
+    *,
+    hypothesis: str,
+    objective: str,
+    data_sources: list[str],
+    results: Mapping[str, Any],
+    coverage_and_limitations: list[str],
+    conclusion_and_disposition: str,
+) -> dict[str, Any]:
+    """Build the bounded report contract without copying raw events."""
+
+    def records(key: str, limit: int) -> list[dict[str, Any]]:
+        value = results.get(key, [])
+        return [dict(item) for item in value[:limit] if isinstance(item, Mapping)] if isinstance(value, list) else []
+
+    all_evidence = records("evidence", len(results.get("evidence", [])))
+    all_findings = records("findings", len(results.get("findings", [])))
+    by_id = {str(item.get("finding_id")): item for item in all_findings}
+    question_answers = records("question_answers", len(results.get("question_answers", [])))
+    # Select detailed findings across approved questions. All findings remain
+    # retained; each question also receives a concise summary independently of
+    # whether its detailed findings fit the report's presentation allowance.
+    selected_ids: list[str] = []
+    groups = [sorted(
+        item.get("finding_ids", []),
+        key=lambda identifier: by_id.get(identifier, {}).get("classification") != "hunt_lead",
+    ) for item in question_answers]
+    for position in range(max((len(group) for group in groups), default=0)):
+        for group in groups:
+            if position < len(group) and group[position] in by_id and group[position] not in selected_ids:
+                selected_ids.append(group[position])
+        if len(selected_ids) >= REPORT_FINDING_DETAIL_TARGET:
+            break
+    findings = (
+        [by_id[identifier] for identifier in selected_ids[:REPORT_FINDING_DETAIL_TARGET]]
+        if question_answers else all_findings[:REPORT_FINDING_DETAIL_TARGET]
+    )
+    for finding in findings:
+        for key in ("evidence_ids", "query_ids"):
+            if key in finding:
+                finding[key] = list(dict.fromkeys(finding[key]))
+    cited_ids = {
+        str(evidence_id)
+        for finding in findings
+        for evidence_id in finding.get("evidence_ids", [])
+    }
+    primary_evidence = [
+        item for item in all_evidence
+        if item.get("evidence_kind", "raw_event") == "raw_event" and item.get("event_time_utc") != "unknown"
+    ]
+    evidence_records = sorted(
+        primary_evidence,
+        key=lambda item: (str(item.get("evidence_id")) not in cited_ids, str(item.get("event_time_utc"))),
+    )[:REPORT_LIST_LIMITS["selected_evidence"]]
+    evidence = [
+        {key: item[key] for key in REPORT_EVIDENCE_FIELDS if key in item}
+        for item in evidence_records
+    ]
+    queries = [
+        {key: item[key] for key in REPORT_QUERY_FIELDS - {"spl"} if key in item}
+        for item in records("queries", REPORT_LIST_LIMITS["query_appendix"])
+    ]
+    entities: list[dict[str, Any]] = []
+    timeline: list[dict[str, Any]] = []
+    for item in evidence_records:
+        event = item.get("selected_result")
+        if not isinstance(event, Mapping):
+            continue
+        for field, entity_type in (("host", "host"), ("user", "user"), ("src_ip", "ip")):
+            value = event.get(field)
+            values = value if isinstance(value, list) else [value]
+            target_values = [item for item in values if not _is_loopback_endpoint(item)]
+            for entity in values:
+                if isinstance(entity, str) and entity and (not target_values or entity in target_values) and len(entities) < REPORT_LIST_LIMITS["entities"]:
+                    candidate = {"entity_type": entity_type, "value": entity}
+                    if candidate not in entities:
+                        entities.append(candidate)
+        timeline_event = {
+            "event_time_utc": item.get("event_time_utc", "unknown"),
+            "evidence_id": item.get("evidence_id"),
+            **{key: event[key] for key in ("host", "user", "src_ip", "action", "result", "process", "parent_process", "file_name", "file_hash", "file_hash_type") if key in event},
+        }
+        host = timeline_event.get("host")
+        host_values = host if isinstance(host, list) else [host]
+        target_hosts = [value for value in host_values if value and not _is_loopback_endpoint(value)]
+        if target_hosts:
+            timeline_event["host"] = target_hosts[0] if len(target_hosts) == 1 else target_hosts
+        timeline.append(timeline_event)
+    derived_limitations = _derive_report_limitations(results)
+    coverage = list(dict.fromkeys([*coverage_and_limitations, *derived_limitations]))
+    if len(all_findings) > len(findings):
+        coverage.append(f"All {len(all_findings)} retained findings remain available in the hunt results, independently of this report's detail selection.")
+    if derived_limitations and "full blast radius is not established" not in conclusion_and_disposition.casefold():
+        conclusion_and_disposition = (
+            f"{conclusion_and_disposition.rstrip()} "
+            "Investigation coverage is limited; the full blast radius is not established."
+        )
+    return {
+        "hypothesis": hypothesis,
+        "objective_and_scope": objective,
+        "data_sources_used": data_sources,
+        "findings": findings,
+        "selected_evidence": evidence,
+        "entities": entities or records("entities", REPORT_LIST_LIMITS["entities"]),
+        "timeline": timeline or records("timeline", REPORT_LIST_LIMITS["timeline"]),
+        "coverage_and_limitations": coverage,
+        "conclusion_and_disposition": conclusion_and_disposition,
+        "query_appendix": queries,
+        **({"question_answers": question_answers}
+           if "question_answers" in results else {}),
+    }
+
+
+def _is_loopback_endpoint(value: Any) -> bool:
+    """Identify a loopback collector address when an event also names a target host."""
+
+    if not isinstance(value, str):
+        return False
+    host = value.rsplit(":", 1)[0].strip("[]")
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return host.casefold() == "localhost"
+
+
+def _derive_report_limitations(results: Mapping[str, Any]) -> list[str]:
+    """Summarize incomplete coverage without copying execution diagnostics."""
+
+    if not any(key in results for key in {"queries", "query_assessments", "follow_up_questions", "adaptive_status", "question_answers"}):
+        return []
+    evidence_rows = [item for item in results.get("evidence", []) if isinstance(item, Mapping)]
+    limitations: list[str] = [evidence_time_bounds(evidence_rows)["limitation"]] if evidence_rows else []
+
+    def add(value: Any) -> None:
+        value = " ".join(str(value).split()).strip()
+        if value and value not in limitations:
+            limitations.append(value)
+
+    if any(item.get("limitations") for item in results.get("question_answers", [])):
+        add("Question-specific limitations remain; see the approved question answers.")
+
+    for coverage in query_source_coverage(results):
+        missing = [f"{source['index']} ({source['sourcetype']})" for source in coverage["sources"] if source["needs_source_check"]]
+        if missing:
+            add(f"Query {coverage['query_id']} has no identified retained rows from {', '.join(missing)} "
+                "in its truncated result and no completed source-specific check. This is unresolved coverage, not evidence of absence.")
+        if coverage["unidentified_retained_count"]:
+            add(f"Query {coverage['query_id']} retained {coverage['unidentified_retained_count']} row(s) "
+                "whose source pair cannot be established from the result projection and search scope.")
+
+    queries = [item for item in results.get("queries", []) if isinstance(item, Mapping)]
+    completed = [item for item in queries if item.get("status") == "completed"]
+    if queries and not completed:
+        add("No completed searches are available; the report has no completed telemetry coverage.")
+    if any(item.get("status") != "completed" for item in queries):
+        add("One or more approved searches did not complete; those telemetry results are outside report coverage.")
+
+    assessments = [item for item in results.get("query_assessments", []) if isinstance(item, Mapping)]
+    assessed_ids = {
+        str(item.get("query_id")) for item in assessments if item.get("query_id")
+    }
+    assessed_ids.update(
+        str(item) for item in results.get("assessed_query_ids", []) if item
+    )
+    completed_ids = {str(item.get("query_id")) for item in completed if item.get("query_id")}
+    if completed_ids and ("query_assessments" in results or "assessed_query_ids" in results):
+        if completed_ids.difference(assessed_ids):
+            add("One or more completed searches were not assessed; related findings and pivots may be incomplete.")
+    for item in assessments if "question_answers" not in results else []:
+        if item.get("answered_question") is False:
+            question_id = item.get("question_id", "unknown")
+            add(f"Approved hunt question {question_id} remains unanswered.")
+
+    follow_ups = [item for item in results.get("follow_up_questions", []) if isinstance(item, Mapping)]
+    follow_up_ids = {str(item.get("question_id")) for item in follow_ups if item.get("question_id")}
+    completed_question_ids = {str(item.get("question_id")) for item in completed if item.get("question_id")}
+    if follow_up_ids.difference(completed_question_ids):
+        add("One or more adaptive follow-up questions were not executed; blast-radius coverage may be incomplete.")
+    pending_ids = results.get("pending_question_ids", [])
+    if pending_ids:
+        add("Investigation questions still pending at stop: " + ", ".join(str(value) for value in pending_ids) + ".")
+    for decision in results.get("follow_up_decisions", []) if "question_answers" not in results else []:
+        if isinstance(decision, Mapping) and decision.get("skip_reason"):
+            add(f"Question {decision.get('question_id')}: {decision['skip_reason']}")
+
+    evidence = results.get("evidence", [])
+    evidence_truncated = any(
+        isinstance(item, Mapping) and isinstance(item.get("truncation"), Mapping)
+        and bool(item["truncation"].get("truncated")) for item in evidence
+    ) if isinstance(evidence, list) else False
+    if any(bool(item.get("truncated")) for item in queries) or evidence_truncated:
+        reasons = {
+            "query_row_limit": "per-query row limit", "hunt_row_limit": "per-hunt row limit",
+            "query_byte_limit": "per-query byte limit", "hunt_byte_limit": "per-hunt byte limit",
+            "query_timeout": "query time limit", "incomplete_page": "incomplete result page",
+        }
+        stops = sorted({reasons[item["retrieval_stop_reason"]] for item in queries if item.get("retrieval_stop_reason") in reasons})
+        add("One or more search results were truncated; conclusions cover retained results only."
+            + (" Retrieval stopped at: " + ", ".join(stops) + "." if stops else ""))
+
+    status = str(results.get("adaptive_status", ""))
+    if status == "time_reserved_for_synthesis":
+        add("Investigation stopped at its time cutoff to reserve time for the report; remaining questions were not assessed.")
+    elif status == "budget_reserved_for_synthesis":
+        add("Adaptive investigation stopped at the configured budget; remaining questions were not assessed.")
+    elif status == "no_follow_up_query":
+        add("No validated adaptive follow-up query was executed; blast-radius coverage is limited to completed searches.")
+
+    if any(item.get("status") == "timed_out" for item in results.get("query_ledger", [])):
+        add("One or more searches timed out; their missing results do not establish absence of activity.")
+    if any(item.get("status") == "skipped_time_cutoff" for item in results.get("query_ledger", [])):
+        add("Planned searches were not started because the investigation time cutoff was reached.")
+    if any(item.get("status") == "skipped_budget" for item in results.get("query_ledger", [])):
+        add("Planned searches were not started because a search or result-storage budget was exhausted; missing results do not establish absence of activity.")
+
+    for item in assessments if "question_answers" not in results else []:
+        for value in item.get("limitations", [])[:2] if isinstance(item.get("limitations"), list) else []:
+            if value:
+                add(f"Assessment limitation: {value}")
+    return limitations[:8]
+
+
+def _question_answer_text(answer: Mapping[str, Any]) -> list[str]:
+    """Readable answer text without serializing the full reference collection."""
+
+    return [
+        f"Question {answer['question_id']}: {answer['question']}",
+        f"Answer: {answer['summary']}",
+        f"{len(answer['finding_ids'])} finding(s) retained; full details are available in this hunt's results.",
+        *(f"Limitation: {item}" for item in answer["limitations"]),
+    ]
+
+
+def _formatted_pdf(title: str, content: Mapping[str, Any]) -> bytes:
+    """Render the bounded report contract as a readable, paginated PDF."""
+
+    def text(value: Any) -> list[str]:
+        return textwrap.wrap(str(value), width=88, break_long_words=True) or ["None recorded."]
+
+    def section(heading: str, values: Any) -> list[str]:
+        lines = text(heading.upper())
+        if isinstance(values, list):
+            if not values:
+                return [*lines, "- None recorded.", ""]
+            for value in values:
+                if isinstance(value, Mapping):
+                    value = "; ".join(f"{key}: {item}" for key, item in value.items())
+                wrapped = text(value)
+                lines.extend([f"- {wrapped[0]}", *[f"  {item}" for item in wrapped[1:]]])
+        else:
+            lines.extend(text(values))
+        return [*lines, ""]
+
+    lines = ["THREAT HUNTING REPORT", *text(title), ""]
+    for heading, key in (
+        ("Hunt hypothesis", "hypothesis"),
+        ("Objective and scope", "objective_and_scope"),
+        ("Data sources used", "data_sources_used"),
+        ("Approved question answers", "question_answers"),
+        ("Findings", "findings"),
+        ("Selected evidence citations", "selected_evidence"),
+        ("Entities", "entities"),
+        ("Timeline", "timeline"),
+        ("Coverage and limitations", "coverage_and_limitations"),
+        ("Conclusion and disposition", "conclusion_and_disposition"),
+        ("Query appendix", "query_appendix"),
+    ):
+        if key == "question_answers":
+            for answer in content.get(key, []):
+                lines.extend(section("Approved question answer", _question_answer_text(answer)))
+        elif key == "findings":
+            lines.append("SELECTED FINDING DETAILS")
+            for finding in content.get(key, []):
+                detail = dict(finding)
+                for reference_key in ("evidence_ids", "query_ids"):
+                    references = list(dict.fromkeys(detail.get(reference_key, [])))
+                    detail[reference_key] = ", ".join(str(value) for value in references[:3]) or "None"
+                    if len(references) > 3:
+                        detail[reference_key] += f"; {len(references)} total references in the hunt results"
+                lines.extend(section(str(detail.pop("title", "Finding")), [detail]))
+            if not content.get(key):
+                lines.extend(["None recorded.", ""])
+        else:
+            lines.extend(section(heading, content.get(key, [])))
+
+    pages = [lines[index:index + 50] for index in range(0, len(lines), 50)] or [["THREAT HUNTING REPORT"]]
+
+    def escape(value: str) -> str:
+        escaped = value.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+        return "".join(character if 32 <= ord(character) <= 126 else "?" for character in escaped)
+
+    streams = []
+    for page in pages:
+        commands = ["BT /F1 10 Tf 50 750 Td"]
+        for index, line in enumerate(page):
+            if index:
+                commands.append("0 -14 Td")
+            commands.append(f"({escape(line)}) Tj")
+        commands.append("ET")
+        streams.append("\n".join(commands).encode("ascii"))
+
+    font_number = 3 + len(pages) * 2
+    page_numbers = [3 + index * 2 for index in range(len(pages))]
+    objects: list[bytes] = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        f"<< /Type /Pages /Kids [{' '.join(f'{number} 0 R' for number in page_numbers)}] /Count {len(pages)} >>".encode(),
+    ]
+    for page_number, stream in zip(page_numbers, streams, strict=True):
+        objects.extend([
+            f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 {font_number} 0 R >> >> /Contents {page_number + 1} 0 R >>".encode(),
+            b"<< /Length " + str(len(stream)).encode() + b" >>\nstream\n" + stream + b"\nendstream",
+        ])
+    objects.append(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+    output = bytearray(b"%PDF-1.4\n")
+    offsets = [0]
+    for number, obj in enumerate(objects, 1):
+        offsets.append(len(output))
+        output.extend(f"{number} 0 obj\n".encode() + obj + b"\nendobj\n")
+    xref = len(output)
+    output.extend(f"xref\n0 {len(objects) + 1}\n0000000000 65535 f \n".encode())
+    output.extend(b"".join(f"{offset:010d} 00000 n \n".encode() for offset in offsets[1:]))
+    output.extend(f"trailer << /Size {len(objects) + 1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n".encode())
+    return bytes(output)
+
+
+def _execution_report_content(row: Mapping[str, Any], plan: HuntPlan, results: Mapping[str, Any]) -> dict[str, Any]:
+    evidence_count = len(results.get("evidence", [])) if isinstance(results.get("evidence"), list) else 0
+    completed_queries = [
+        item for item in results.get("queries", [])
+        if isinstance(item, Mapping) and item.get("status") == "completed"
+    ] if isinstance(results.get("queries"), list) else []
+    findings = results.get("findings", [])
+    cited_ids = {str(value) for finding in findings for value in finding.get("evidence_ids", [])}
+    classifications = Counter(str(finding.get("classification", "unknown")) for finding in findings)
+    classification_counts = ", ".join(f"{count} {name}" for name, count in sorted(classifications.items()))
+    conclusion = (
+        f"{len(findings)} finding(s) ({classification_counts}) cite {len(cited_ids)} distinct record(s); "
+        f"{evidence_count} record(s) were retained across {len(completed_queries)} completed search(es). "
+        "The observed telemetry does not by itself establish incident scope, impact, or attribution."
+        if results.get("findings")
+        else f"No supported findings were identified across {len(completed_queries)} completed search(es) and {evidence_count} retained record(s)."
+    )
+    completed_ids = {str(query.get("query_id")) for query in completed_queries}
+    query_scopes: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {}
+    time_limitations: list[str] = []
+    for entry in results.get("query_ledger", []):
+        if str(entry.get("query_id")) not in completed_ids:
+            continue
+        proposal = entry.get("proposal", {})
+        if proposal.get("earliest_utc") and proposal.get("latest_utc"):
+            start = _utc(datetime.fromisoformat(str(proposal["earliest_utc"]).replace("Z", "+00:00")))
+            end = _utc(datetime.fromisoformat(str(proposal["latest_utc"]).replace("Z", "+00:00")))
+            if start > plan.scope.earliest_utc or end < plan.scope.latest_utc:
+                time_limitations.append(
+                    f"Query {entry['query_id']} searched only {proposal['earliest_utc']} to {proposal['latest_utc']}. "
+                    "Any absence inferred from this search is limited to its filters and this subset of the approved time range."
+                )
+        indexes = tuple(sorted({str(value) for value in proposal.get("indexes", [])}))
+        sourcetypes = tuple(sorted({str(value) for value in proposal.get("sourcetypes", [])}))
+        if indexes and sourcetypes:
+            query_scopes[str(entry["query_id"])] = (indexes, sourcetypes)
+    searched_scopes = set(query_scopes.values())
+    # Older results may lack a ledger. Records establish only observed sources.
+    for evidence in results.get("evidence", []):
+        query_id = str(evidence.get("query_id"))
+        if query_id in completed_ids and query_id not in query_scopes and evidence.get("index") and evidence.get("sourcetype"):
+            searched_scopes.add(((str(evidence["index"]),), (str(evidence["sourcetype"]),)))
+    missing_sources = [
+        f"Planned source not searched: {source.index} ({sourcetype})."
+        for source in plan.data_sources for sourcetype in source.sourcetypes
+        if not any(source.index in indexes and sourcetype in kinds for indexes, kinds in searched_scopes)
+    ]
+    completed_questions = {str(query.get("question_id")) for query in completed_queries}
+    missing_questions = [
+        f"Approved hunt question {question.question_id} was not executed: {question.question}"
+        for question in plan.questions if question.question_id not in completed_questions
+    ]
+    return _concise_report_content(
+        hypothesis=row["hypothesis"],
+        objective=row["objective"],
+        data_sources=[
+            f"{', '.join(indexes)} ({'query sourcetypes: ' if len(indexes) > 1 else ''}{', '.join(kinds)})"
+            for indexes, kinds in sorted(searched_scopes)
+        ],
+        results=results,
+        coverage_and_limitations=[*plan.coverage_limitations, *missing_questions, *missing_sources, *time_limitations],
+        conclusion_and_disposition=conclusion,
+    )

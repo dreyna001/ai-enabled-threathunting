@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from contextlib import nullcontext
+import hashlib
 import threading
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
-from sqlalchemy import Boolean, Column, DateTime, Integer, JSON, MetaData, String, Table, Text, select, update
-from sqlalchemy.engine import Engine
+from sqlalchemy import Boolean, Column, DateTime, Integer, JSON, MetaData, String, Table, Text, func, select, update
+from sqlalchemy.engine import Connection, Engine
 
 metadata = MetaData()
 execution_jobs = Table(
@@ -86,11 +88,11 @@ class JobService:
         self.deployment_scope_id = deployment_scope_id
         self.max_active_hunts = max_active_hunts
 
-    def enqueue(self, owner_id: str, hunt_id: str, *, idempotency_key: str, payload: dict[str, object] | None = None, deployment_scope_id: str | None = None) -> dict[str, object]:
+    def enqueue(self, owner_id: str, hunt_id: str, *, idempotency_key: str, payload: dict[str, object] | None = None, deployment_scope_id: str | None = None, connection: Connection | None = None) -> dict[str, object]:
         now = _now()
         scope = deployment_scope_id or self.deployment_scope_id
-        values = {"job_id": str(uuid4()), "hunt_id": hunt_id, "owner_id": owner_id, "deployment_scope_id": scope, "status": "queued", "worker_id": None, "lease_expires_at_utc": None, "heartbeat_at_utc": None, "attempts": 0, "idempotency_key": idempotency_key, "payload": payload or {}, "cancel_requested": False, "last_error": None, "created_at_utc": now, "updated_at_utc": now}
-        with self.engine.begin() as connection:
+        values: dict[str, object] = {"job_id": str(uuid4()), "hunt_id": hunt_id, "owner_id": owner_id, "deployment_scope_id": scope, "status": "queued", "worker_id": None, "lease_expires_at_utc": None, "heartbeat_at_utc": None, "attempts": 0, "idempotency_key": idempotency_key, "payload": payload or {}, "cancel_requested": False, "last_error": None, "created_at_utc": now, "updated_at_utc": now}
+        with (self.engine.begin() if connection is None else nullcontext(connection)) as connection:
             existing = connection.execute(select(execution_jobs).where(execution_jobs.c.idempotency_key == idempotency_key)).mappings().first()
             if existing is not None:
                 return dict(existing)
@@ -103,6 +105,11 @@ class JobService:
         scope = deployment_scope_id or self.deployment_scope_id
         with self.engine.begin() as connection:
             if self.max_active_hunts is not None:
+                if connection.dialect.name == "postgresql":
+                    # Row locks cannot protect an empty active set. Serialize
+                    # admission per deployment, including across worker processes.
+                    lock_key = int.from_bytes(hashlib.sha256(f"hunt-admission:{scope}".encode()).digest()[:8], "big", signed=True)
+                    connection.execute(select(func.pg_advisory_xact_lock(lock_key)))
                 active_rows = connection.execute(select(execution_jobs.c.hunt_id).where(execution_jobs.c.status == "claimed", execution_jobs.c.deployment_scope_id == scope).with_for_update()).all()
                 if len({str(item[0]) for item in active_rows}) >= self.max_active_hunts:
                     return None

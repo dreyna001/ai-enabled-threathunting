@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import os
 import shutil
-from collections.abc import Iterable, Mapping, Protocol
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 from uuid import uuid4
 
 from sqlalchemy import text

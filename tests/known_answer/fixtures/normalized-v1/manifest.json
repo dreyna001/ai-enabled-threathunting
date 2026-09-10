@@ -1,0 +1,37 @@
+{
+  "fixture_version": "normalized-lab-20260909-v1",
+  "earliest_utc": "2026-01-05T00:00:00Z",
+  "latest_utc": "2026-01-09T00:00:00Z",
+  "content_hashes": {
+    "events.jsonl": "3705fc2a00f7b1c89ef984c73fee474a23846f1ecfdd5c069a2715f1cb46d31c",
+    "network-outage.jsonl": "20e28b5fe53d5fa31f3396a45f9bd43f080810042fd65aff038e16337b4e78c1"
+  },
+  "event_count": 689,
+  "outage_event_count": 676,
+  "counts_by_index": {
+    "th_real_v1_auth": 25,
+    "th_real_v1_endpoint": 70,
+    "th_real_v1_dns": 297,
+    "th_real_v1_network": 297
+  },
+  "inventory": {
+    "ws-17.corp.example": {
+      "ip": "10.40.8.17",
+      "user": "CORP\\j.smith"
+    },
+    "ws-18.corp.example": {
+      "ip": "10.40.8.18",
+      "user": "CORP\\a.chen"
+    },
+    "ops-03.corp.example": {
+      "ip": "10.40.9.3",
+      "user": "CORP\\m.rivera"
+    }
+  },
+  "outage_excluded_count": 13,
+  "advisory_indicator": {
+    "file_name": "HRsword.exe",
+    "sha256": "0E408AED1ACF902A9F97ABF71CF0DD354024109C5D52A79054C421BE35D93549",
+    "source_url": "https://www.cisa.gov/news-events/cybersecurity-advisories/aa23-352a"
+  }
+}

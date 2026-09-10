@@ -9,6 +9,8 @@ approved plan order.
 
 from __future__ import annotations
 
+from threat_hunting.domain.contracts import QueryValidationResult
+
 import hashlib
 import json
 import math
@@ -534,6 +536,7 @@ def estimate_selectivity(
     cid = candidate_id(hunt_id, proposal)
     basis: list[str] = []
     unknown: list[str] = []
+    validation: QueryValidationResult | None = None
     if policy is None:
         unknown.append("policy_unavailable")
     else:
@@ -777,7 +780,7 @@ def rank_query_candidates(
             if reason is not None
         )
         unknown_reasons = list(dict.fromkeys(unknown_reasons))
-        score = sum(components.values()) if not unknown_reasons and all(value is not None for value in components.values()) else None
+        score = sum(value for value in components.values() if value is not None) if not unknown_reasons and all(value is not None for value in components.values()) else None
         fallback_reason = None if score is not None else (unknown_reasons[0] if unknown_reasons else "ranking_input_unknown")
         ranked = RankedQueryCandidate(
             candidate_id=cid,

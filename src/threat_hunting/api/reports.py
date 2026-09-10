@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, Response, status
 from pydantic import BaseModel, ConfigDict, Field, StrictInt
 
 from threat_hunting.services.reports import (
@@ -20,7 +20,6 @@ from threat_hunting.services.reports import (
 
 
 router = APIRouter(tags=["reports"])
-_service: ReportService | None = None
 
 
 class ReportDraftRequest(BaseModel):
@@ -36,17 +35,16 @@ class FinalizeReportRequest(BaseModel):
     expected_version: StrictInt | None = Field(default=None, ge=1)
 
 
-def configure_report_service(service: ReportService) -> None:
-    """Set the application service during composition/startup."""
-
-    global _service
-    _service = service
+def configure_report_service(application: FastAPI, service: ReportService) -> None:
+    """Bind the service to one application instance."""
+    application.state.report_service = service
 
 
-def get_report_service() -> ReportService:
-    if _service is None:
+def get_report_service(request: Request) -> ReportService:
+    service = getattr(request.app.state, "report_service", None)
+    if service is None:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="report service is not configured")
-    return _service
+    return service
 
 
 def current_user_id(request: Request) -> str:
@@ -95,7 +93,7 @@ def save_report_draft(hunt_id: str, request: ReportDraftRequest, user_id: str = 
 @router.post("/hunts/{hunt_id}/report/finalize")
 def finalize_report(hunt_id: str, request: FinalizeReportRequest | None = None, user_id: str = Depends(current_user_id), service: ReportService = Depends(get_report_service)) -> Mapping[str, Any]:
     try:
-        expected = request.expected_version if request is not None else service.preview(hunt_id=hunt_id, owner_id=user_id).version
+        expected = request.expected_version if request is not None and request.expected_version is not None else service.preview(hunt_id=hunt_id, owner_id=user_id).version
         result = service.finalize(hunt_id=hunt_id, owner_id=user_id, expected_version=expected)
     except Exception as exc:
         _raise(exc)

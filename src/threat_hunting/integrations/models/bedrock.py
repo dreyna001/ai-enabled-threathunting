@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -61,6 +62,7 @@ class BedrockModelAdapter(BaseModelAdapter):
             raise ValueError("TLS verification cannot be disabled without an explicit lab override")
         if timeout_seconds <= 0 or timeout_seconds > 600:
             raise ValueError("timeout_seconds is outside the supported bound")
+        super().__init__()
         self.model_name = model_name
         self.region_name = region_name
         self.endpoint = endpoint
@@ -69,18 +71,21 @@ class BedrockModelAdapter(BaseModelAdapter):
         self.ca_bundle_path = Path(ca_bundle_path) if ca_bundle_path is not None else None
         self.timeout_seconds = timeout_seconds
         self._client = client
+        self._injected_client = client is not None
+        self._client_timeout: float | None = None
 
-    def _get_client(self) -> Any:
-        if self._client is not None:
+    def _get_client(self, timeout: float) -> Any:
+        if self._client is not None and (self._injected_client or self._client_timeout == timeout):
             return self._client
+        self._close_client()
         try:
-            import boto3  # type: ignore[import-not-found]
-            from botocore.config import Config  # type: ignore[import-not-found]
+            import boto3
+            from botocore.config import Config
         except ImportError as exc:
             raise AdapterError(FailureCategory.INVALID_CONFIGURATION, "the boto3 package is not installed", operation="connect") from exc
         config = Config(
-            connect_timeout=int(self.timeout_seconds),
-            read_timeout=int(self.timeout_seconds),
+            connect_timeout=min(timeout, 10.0),
+            read_timeout=timeout,
             retries={"max_attempts": 0, "mode": "standard"},
         )
         kwargs: dict[str, Any] = {
@@ -93,6 +98,7 @@ class BedrockModelAdapter(BaseModelAdapter):
             kwargs["endpoint_url"] = self.endpoint
         try:
             self._client = boto3.client(**kwargs)
+            self._client_timeout = timeout
         except Exception as exc:  # noqa: BLE001 - normalized without credential detail
             raise self.normalize_provider_error(exc, operation="connect") from exc
         return self._client
@@ -129,6 +135,15 @@ class BedrockModelAdapter(BaseModelAdapter):
             payload["inferenceConfig"] = inference
         if request.tools:
             payload["toolConfig"] = {"tools": [dict(tool) for tool in request.tools]}
+        if request.response_format and request.response_format.get("type") == "json_schema":
+            definition = request.response_format["json_schema"]
+            payload["outputConfig"] = {"textFormat": {
+                "type": "json_schema",
+                "structure": {"jsonSchema": {
+                    "name": definition["name"],
+                    "schema": json.dumps(definition["schema"], separators=(",", ":")),
+                }},
+            }}
         return payload
 
     def complete(
@@ -139,9 +154,8 @@ class BedrockModelAdapter(BaseModelAdapter):
         cancellation_token: Any = None,
     ) -> ModelResponse:
         payload = self._request_payload(request)
-        client = self._get_client()
-
         def call() -> Any:
+            client = self._get_client(timeout_seconds if timeout_seconds is not None else self.timeout_seconds)
             converse = getattr(client, "converse", None)
             if not callable(converse):
                 raise RuntimeError("Bedrock client does not expose converse")

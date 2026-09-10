@@ -39,6 +39,8 @@ from threat_hunting.domain.common import (
     utc_now,
     validate_sha256,
 )
+from threat_hunting.domain.spl_policy import parse_spl, source_pairs
+from threat_hunting.domain.errors import Validation
 
 from .schema import evidence_records
 
@@ -47,6 +49,76 @@ Identifier = StrictStr
 SchemaVersion = Literal["1.0"]
 EvidenceKindValue = Literal["raw_event", "aggregate_row"]
 NonNegativeInt = Field(ge=0)
+
+
+def result_source(row: Mapping[str, Any], pairs: frozenset[tuple[str, str]]) -> tuple[str, str]:
+    """Resolve projected source fields only when they identify one possible pair.
+
+    A single-source search also establishes omitted source fields. Ambiguous,
+    conflicting multivalue or contradictory projections remain unknown.
+    Repeated identical values still identify one source, not several events.
+    """
+    candidates = [pair for pair in pairs if all(
+        field not in row or row[field] == value
+        or isinstance(row[field], (list, tuple)) and bool(row[field]) and all(item == value for item in row[field])
+        for field, value in zip(("index", "sourcetype"), pair)
+    )]
+    return candidates[0] if len(candidates) == 1 else ("unknown", "unknown")
+
+
+def query_source_coverage(
+    results: Mapping[str, Any], *, supplied_evidence: Sequence[Mapping[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Measure identified retained sources and outstanding bounded source checks.
+
+    Counts describe selected rows, never source event totals or answered hunt
+    questions. Historical top-level evidence labels are not trusted: older
+    executions incorrectly copied the first proposal source onto every row.
+    """
+    ledger = [item for item in results.get("query_ledger", []) if isinstance(item, Mapping)]
+    proposals = {str(item.get("query_id")): item.get("proposal", {}) for item in ledger}
+    queries = [item for item in results.get("queries", []) if isinstance(item, Mapping) and item.get("status") == "completed"]
+    completed = {str(item.get("query_id")): item for item in queries}
+    evidence = [item for item in results.get("evidence", []) if isinstance(item, Mapping)]
+    coverage = []
+    for query in queries:
+        query_id = str(query.get("query_id"))
+        proposal = proposals.get(query_id, {})
+        spl = str(query.get("spl", proposal.get("spl", "")))
+        try:
+            pairs = source_pairs(spl)
+            raw_query = not parse_spl(spl).aggregates_events
+        except ValueError:
+            pairs, raw_query = frozenset(), False
+        mode = query.get("result_mode", proposal.get("result_mode"))
+        rows = [item for item in evidence if str(item.get("query_id")) == query_id]
+        identified = [result_source(item.get("selected_result", {}), pairs) for item in rows]
+        supplied = None if supplied_evidence is None else [
+            result_source(item.get("selected_result", {}), pairs)
+            for item in supplied_evidence if str(item.get("query_id")) == query_id
+        ]
+        sources = []
+        for pair in sorted(pairs):
+            checks = [item for item in ledger if item.get("phase") == "source_coverage"
+                      and str(item.get("source_query_id")) == query_id and item.get("source_pair") == list(pair)]
+            completed_check = next((item for item in checks if str(item.get("query_id")) in completed), None)
+            check = completed_check or (checks[0] if checks else None)
+            count = identified.count(pair)
+            missing = bool(query.get("truncated")) and raw_query and len(pairs) > 1 and count == 0
+            sources.append({
+                "index": pair[0], "sourcetype": pair[1], "identified_retained_count": count,
+                **({"supplied_count": supplied.count(pair)} if supplied is not None else {}),
+                "missing_from_truncated_result": missing,
+                "coverage_query_id": str(check["query_id"]) if check else None,
+                "coverage_query_completed": completed_check is not None,
+                "needs_source_check": missing and completed_check is None,
+            })
+        coverage.append({
+            "query_id": query_id, "question_id": query.get("question_id"), "result_mode": mode,
+            "query_truncated": query.get("truncated"), "source_scope_known": bool(pairs),
+            "unidentified_retained_count": identified.count(("unknown", "unknown")), "sources": sources,
+        })
+    return coverage
 
 
 class EvidenceIntegrityError(ValueError):
@@ -369,7 +441,7 @@ def build_evidence(
         "truncation": truncation_model,
     }
     digest = evidence_sha256(values)
-    return NormalizedEvidence(
+    return NormalizedEvidence.model_validate(dict(
         evidence_id=evidence_id or uuid4(),
         owner_id=owner_id,
         hunt_id=hunt_id,
@@ -386,7 +458,7 @@ def build_evidence(
         truncation=truncation_model,
         sha256=digest,
         dedupe_key=_evidence_dedupe_key(values),
-    )
+    ))
 
 
 def _db_timestamp(value: datetime | str) -> datetime | None:
@@ -455,7 +527,7 @@ class EvidenceRepository:
                     if existing is None:
                         raise
             if existing is not None:
-                return self._from_row(existing)
+                return self._from_row(dict(existing))
         return evidence
 
     def get(self, evidence_id: UUID, *, owner_id: UUID, hunt_id: UUID) -> NormalizedEvidence | None:
@@ -469,7 +541,7 @@ class EvidenceRepository:
                     evidence_records.c.hunt_id == str(hunt_id),
                 )
             ).mappings().first()
-        return None if row is None else self._from_row(row)
+        return None if row is None else self._from_row(dict(row))
 
     def _from_row(self, row: Mapping[str, Any]) -> NormalizedEvidence:
         event_time: datetime | str = row["event_time_utc"] or "unknown"
@@ -478,7 +550,7 @@ class EvidenceRepository:
         collected = row["collected_at_utc"]
         if isinstance(collected, datetime) and collected.tzinfo is None:
             collected = collected.replace(tzinfo=timezone.utc)
-        return NormalizedEvidence(
+        return NormalizedEvidence.model_validate(dict(
             evidence_id=UUID(str(row["evidence_id"])),
             owner_id=UUID(str(row["owner_id"])),
             hunt_id=UUID(str(row["hunt_id"])),
@@ -495,7 +567,7 @@ class EvidenceRepository:
             truncation=row["truncation"],
             sha256=row["sha256"],
             dedupe_key=row["dedupe_key"],
-        )
+        ))
 
 
 __all__ = [
@@ -509,3 +581,189 @@ __all__ = [
     "evidence_sha256",
     "verify_evidence_integrity",
 ]
+
+
+def raw_event_time(record: Mapping[str, Any]) -> datetime | None:
+    """Return a retained point-event timestamp; aggregates and naive times are unknown."""
+    if record.get("evidence_kind", "raw_event") != "raw_event":
+        return None
+    value = record.get("event_time_utc")
+    try:
+        stamp = datetime.fromisoformat(value.replace("Z", "+00:00")) if isinstance(value, str) else value
+        return ensure_utc(stamp) if isinstance(stamp, datetime) else None
+    except (ValueError, OverflowError):
+        return None
+
+
+def evidence_time_bounds(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Compute point-event bounds; samples and aggregate rows never prove continuity."""
+    times: list[datetime] = []
+    unknown = 0
+    aggregate = 0
+    for record in records:
+        if record.get("evidence_kind", "raw_event") != "raw_event":
+            aggregate += 1
+            continue
+        stamp = raw_event_time(record)
+        if stamp is None:
+            unknown += 1
+        else:
+            times.append(stamp)
+    first = min(times).isoformat().replace("+00:00", "Z") if times else "unknown"
+    last = max(times).isoformat().replace("+00:00", "Z") if times else "unknown"
+    note = (
+        f"Retained raw-event timestamps: {first} to {last} ({len(times)} record(s)). "
+        if times else "Retained records do not establish raw-event time bounds. "
+    )
+    if unknown or aggregate:
+        note += f"Excluded {unknown} record(s) with unknown time and {aggregate} aggregate row(s) from those bounds. "
+    note += "Point observations do not establish continuous activity or telemetry coverage throughout the approved hunt window."
+    return {
+        "first_observed_utc": first, "last_observed_utc": last,
+        "timestamped_record_count": len(times), "unknown_time_record_count": unknown,
+        "aggregate_row_count": aggregate, "continuous_coverage_established": False,
+        "limitation": note,
+    }
+
+
+def lookup_retained_evidence(
+    results: Mapping[str, Any], *, query_ids: set[str],
+    filters: Mapping[str, Any] | None = None,
+    earliest_utc: datetime | None = None, latest_utc: datetime | None = None,
+    offset: int = 0, limit: int = 500, max_rows: int = 500,
+    distinct_fields: Sequence[str] = ("host", "user", "src_ip", "dest_ip", "process_guid", "process", "session_id"),
+) -> dict[str, Any]:
+    """Look up raw retained rows without changing search or retention metadata.
+
+    Filters match complete typed scalar values, including members of multivalue
+    fields. Counts describe the matching retained subset, never incident scope.
+    The caller supplies the already owner-scoped hunt state; no external query
+    or database access is performed here.
+    """
+
+    completed = {str(item["query_id"]): item for item in results.get("queries", [])
+                 if isinstance(item, Mapping) and item.get("status") == "completed"}
+    if not query_ids or not query_ids.issubset(completed):
+        raise Validation("retained evidence lookup requires completed queries from this hunt")
+    if any(type(value) is not int for value in (offset, limit, max_rows)) or offset < 0 or min(limit, max_rows) <= 0:
+        raise Validation("retained evidence lookup requires a nonnegative offset and positive row limits")
+    for bound in (earliest_utc, latest_utc):
+        if bound is not None and (not isinstance(bound, datetime) or bound.tzinfo is None or bound.utcoffset() is None):
+            raise Validation("retained evidence lookup time bounds must include a timezone")
+    if earliest_utc is not None and latest_utc is not None and earliest_utc >= latest_utc:
+        raise Validation("retained evidence lookup requires an increasing time window")
+    filters = dict(filters or {})
+    if any(not isinstance(field, str) or not field.strip() for field in (*filters, *distinct_fields)):
+        raise Validation("retained evidence lookup field names must be nonempty strings")
+
+    def scalar_key(value: Any) -> tuple[str, str] | None:
+        if type(value) not in (str, int, float, bool) or isinstance(value, float) and not math.isfinite(value):
+            return None
+        return type(value).__name__, json.dumps(value, ensure_ascii=False)
+
+    if any(scalar_key(value) is None for value in filters.values()):
+        raise Validation("retained evidence lookup filters require finite scalar values")
+
+    retained = [item for item in results.get("evidence", [])
+                if isinstance(item, Mapping) and str(item.get("query_id")) in query_ids]
+    matching: list[tuple[datetime | None, int, Mapping[str, Any]]] = []
+    unknown_time_excluded = 0
+    aggregate_rows = 0
+    for position, item in enumerate(retained):
+        if item.get("evidence_kind", "raw_event") != "raw_event":
+            aggregate_rows += 1
+            continue
+        event = item.get("selected_result", {})
+        if not isinstance(event, Mapping):
+            continue
+        if any(scalar_key(value) not in {scalar_key(member) for member in (
+            event[field] if isinstance(event.get(field), (list, tuple)) else [event.get(field)]
+        )} for field, value in filters.items()):
+            continue
+        stamp = raw_event_time(item)
+        if earliest_utc is not None or latest_utc is not None:
+            if stamp is None:
+                unknown_time_excluded += 1
+                continue
+            if earliest_utc is not None and stamp < earliest_utc or latest_utc is not None and stamp >= latest_utc:
+                continue
+        matching.append((stamp, position, item))
+    matching.sort(key=lambda item: (item[0] is None, item[0] or datetime.max.replace(tzinfo=timezone.utc), item[1]))
+    rows = [item[2] for item in matching]
+    counts = []
+    for field in dict.fromkeys(distinct_fields):
+        values: set[tuple[str, str]] = set()
+        single_values: set[tuple[str, str]] = set()
+        missing = ambiguous = 0
+        for item in rows:
+            value = item["selected_result"].get(field)
+            members = value if isinstance(value, (list, tuple)) else [value]
+            keys = {key for member in members if (key := scalar_key(member)) is not None}
+            values.update(keys)
+            if not keys:
+                missing += 1
+            elif len(keys) == 1:
+                single_values.update(keys)
+            else:
+                ambiguous += 1
+        counts.append({"field": field, "distinct_literal_value_count": len(values),
+                       "distinct_unambiguous_value_count": len(single_values),
+                       "rows_with_missing_or_nonscalar_value": missing, "rows_with_multiple_distinct_values": ambiguous})
+    effective_limit = min(limit, max_rows)
+    page = rows[offset:offset + effective_limit]
+    next_offset = offset + len(page)
+    return {
+        "scope": {"query_ids": sorted(query_ids), "filters": filters,
+                  "earliest_utc": canonical_utc(earliest_utc) if earliest_utc else None,
+                  "latest_utc": canonical_utc(latest_utc) if latest_utc else None},
+        "query_coverage": [{"query_id": query_id, "result_count": completed[query_id].get("result_count"),
+                            "retained_evidence_count": sum(str(item.get("query_id")) == query_id for item in retained),
+                            "query_truncated": completed[query_id].get("truncated"),
+                            "available_result_count": completed[query_id].get("available_result_count"),
+                            "retrieval_stop_reason": completed[query_id].get("retrieval_stop_reason")}
+                           for query_id in sorted(query_ids)],
+        "matching_raw_record_count": len(rows), "aggregate_rows_excluded": aggregate_rows,
+        "unknown_time_rows_excluded_by_window": unknown_time_excluded,
+        "observed_time_bounds": evidence_time_bounds(rows), "distinct_fields": counts,
+        "offset": offset, "effective_limit": effective_limit,
+        "next_offset": next_offset if next_offset < len(rows) else None,
+        "records": [_json_value(item) for item in page],
+        "limitation": "Counts cover matching retained raw rows and literal field values, not all source events or confirmed affected entities. Multivalue fields remain ambiguous. Repeated records do not increase distinct literal counts. Missing values and truncated searches prevent complete scope claims.",
+    }
+
+
+def _flatten_scalar_values(value: Any) -> list[Any]:
+    """Return scalar values from a retained result without interpreting field semantics."""
+
+    if isinstance(value, Mapping):
+        return [item for nested in value.values() for item in _flatten_scalar_values(nested)]
+    if isinstance(value, list):
+        return [item for nested in value for item in _flatten_scalar_values(nested)]
+    if isinstance(value, str):
+        # Some Splunk configurations expose the complete JSON event as a
+        # single _raw string.  Parse only JSON containers so entity grounding
+        # can use their exact scalar values without accepting substrings from
+        # arbitrary text fields.
+        try:
+            parsed = json.loads(value)
+        except (json.JSONDecodeError, TypeError):
+            return [value]
+        if isinstance(parsed, Mapping):
+            return [
+                value,
+                *[
+                    item
+                    for nested in parsed.values()
+                    for item in _flatten_scalar_values(nested)
+                ],
+            ]
+        if isinstance(parsed, list):
+            return [
+                value,
+                *[
+                    item
+                    for nested in parsed
+                    for item in _flatten_scalar_values(nested)
+                ],
+            ]
+    return [value] if value is not None else []
