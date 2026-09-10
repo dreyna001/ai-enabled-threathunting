@@ -41,6 +41,72 @@ def _proposal(spl: str, *, indexes: list[str] | None = None) -> QueryProposal:
     )
 
 
+@pytest.mark.parametrize("pipeline", [
+    'invented="x"', 'invented IN ("x", "y")', 'invented<>"x"',
+    '"invented field"="x"',
+    '| where isnull(invented)', '| where host=invented',
+    '| where match(lower(invented), "x")', '| where \'invented field\'="x"',
+    '| eval found=if(isnotnull(invented), 1, 0)',
+    '| eval first=second, second=host',
+    '| where renamed="x" | rename host as renamed',
+    '| stats count(invented) as matches', '| stats count by invented',
+    '| rename invented as renamed', '| table invented', '| fields invented',
+    '| dedup invented', '| sort 0 -invented', '| regex invented="x"',
+    '| table 123', '| stats count by 123',
+    '| where \'host*\'="x"',
+    '| eval derived=host | rename derived as renamed | where derived="x"',
+])
+def test_query_text_cannot_hide_undiscovered_fields_from_metadata(pipeline: str) -> None:
+    result = _policy().validate(_proposal('search index=main sourcetype=sysmon ' + pipeline))
+    assert not result.allowed
+    assert "field_not_discovered" in result.reason_codes
+
+
+@pytest.mark.parametrize("pipeline", [
+    'host=unobserved_literal',
+    'host="invented=anything"',
+    'host IN ("invented", "other")',
+    '| where match(host, "invented=anything")',
+    '| eval first=host, second=lower(first) | where second!="x" | table second',
+    '| eval first=if(host="x", "invented", host) | where first="x"',
+    '| eval \'renamed field\'=host | where \'renamed field\'="x" | table "renamed field"',
+    '| rename host as renamed | where renamed="x" | table renamed',
+    '| stats count as matches values(host) as hosts by sourcetype | where matches>0 | table hosts matches',
+    '| stats count | where count>0',
+    '| stats dc(host) | where \'dc(host)\'>0',
+    '| timechart span=1h count by host limit=0',
+    '| fields host* | dedup 1 host keepempty=true | sort 0 -host',
+    '| regex host="unobserved_literal"',
+    '| head limit=10', '| head (host!="x") limit=10 keeplast=false',
+    '| eval host_copy=host | rename host_* as saved_* | where saved_copy="x"',
+    '| stats values(host*) | table "values(host)"',
+    '| stats values(host*) AS saved_* | table saved_',
+    '| eval copied=if(isnotnull(host), lower(host), "unknown") | stats count(eval(copied="x")) as matches',
+    '| stats perc95(_time) as percentile | where percentile>0',
+    '| eval value=pow(2, 3) | where value=8',
+])
+def test_discovered_fields_and_previously_defined_aliases_remain_valid(pipeline: str) -> None:
+    result = _policy().validate(_proposal('search index=main sourcetype=sysmon ' + pipeline))
+    assert result.allowed, result.reason_codes
+
+
+@pytest.mark.parametrize("pipeline", ['| eval derived="host', "| eval 'derived=host", '| eval bad+name=host'])
+def test_ambiguous_field_definition_is_rejected(pipeline: str) -> None:
+    result = _policy().validate(_proposal('search index=main sourcetype=sysmon ' + pipeline))
+    assert not result.allowed and "field_syntax_not_supported" in result.reason_codes
+
+
+@pytest.mark.parametrize("pipeline", [
+    '| where searchmatch("invented=x")',
+    '| eval related=lookup("outside.csv", host)',
+    '| eval value=customer_function(host)',
+    '| stats customer_function(host) as total',
+])
+def test_unapproved_functions_cannot_hide_fields_or_access_extra_sources(pipeline: str) -> None:
+    result = _policy().validate(_proposal('search index=main sourcetype=sysmon ' + pipeline))
+    assert not result.allowed and "function_not_allowed" in result.reason_codes
+
+
 def test_raw_projection_preserves_source_identity_and_time():
     proposal = _proposal("search index=main sourcetype=sysmon | table host | fields host | sort 0 host")
     result = _policy().validate(proposal)

@@ -360,15 +360,27 @@ def test_execution_sends_the_approved_window_as_splunk_search_job_parameters() -
     assert executor.execute_query(_proposal()).rows
 
 
-def test_production_executor_never_submits_policy_rejected_spl() -> None:
+@pytest.mark.parametrize("spl", [
+    "search index=other sourcetype=sysmon | head 1",
+    "search index=main sourcetype=sysmon invented=anything | head 1",
+    "search index=main sourcetype=sysmon | where isnull(invented) | head 1",
+    'search index=main sourcetype=sysmon | where searchmatch("invented=x") | head 1',
+    'search index=main sourcetype=sysmon | eval data=lookup("outside.csv", host) | head 1',
+])
+def test_production_executor_never_submits_policy_rejected_spl(spl: str) -> None:
     executor = _executor()
+    client = FakeSplunk()
+    executor.connector = SplunkConnector(
+        SplunkConnectionConfig(endpoint="https://splunk.example", token="unit-test-token"), client=client,
+    )
     proposal = _proposal()
-    proposal = proposal.model_copy(update={"spl": "search index=other sourcetype=sysmon | head 1"})
+    proposal = proposal.model_copy(update={"spl": spl})
 
     with pytest.raises(AdapterError) as error:
         executor.execute_query(proposal)
     assert error.value.category is FailureCategory.QUERY_POLICY_REJECTED
     assert executor.counters.splunk_queries == 0
+    assert not client.jobs
 
 
 def test_production_executor_reports_exact_policy_rejection_reasons() -> None:

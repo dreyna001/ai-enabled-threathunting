@@ -15,9 +15,21 @@ from uuid import uuid4
 from threat_hunting.domain.common import ensure_utc
 from threat_hunting.domain.contracts import QUERY_RESULT_LIMITS, EnforcedQueryLimits, QueryProposal, QueryValidationResult
 
-POLICY_VERSION = "1.4"
+POLICY_VERSION = "1.5"
 _SOURCE_FIELDS = ("index", "sourcetype", "_time", "_cd")
 BUILTIN_FIELDS = frozenset({"_time", "_raw", "host", "source", "sourcetype", "index"})
+ALLOWED_EVAL_FUNCTIONS = frozenset({
+    "abs", "case", "ceil", "cidrmatch", "coalesce", "cos", "exact", "exp", "false", "floor", "if", "in",
+    "isbool", "isint", "isnotnull", "isnull", "isnum", "isstr", "len", "like", "log", "lower", "ltrim", "match",
+    "max", "min", "mvappend", "mvcount", "mvdedup", "mvfilter", "mvfind", "mvindex", "mvjoin", "mvmap",
+    "mvsort", "mvzip", "now", "null", "nullif", "pow", "replace", "round", "rtrim", "sin", "split", "sqrt",
+    "strftime", "strptime", "substr", "tan", "tonumber", "tostring", "trim", "true", "upper", "validate",
+})
+ALLOWED_STATS_FUNCTIONS = frozenset({
+    "avg", "c", "count", "dc", "distinct_count", "earliest", "earliest_time", "estdc", "estdc_error",
+    "first", "last", "latest", "latest_time", "list", "max", "mean", "median", "min", "mode", "range",
+    "rate", "stdev", "stdevp", "sum", "sumsq", "values", "var", "varp",
+})
 _ALLOWED_COMMANDS = frozenset({"search", "where", "fields", "table", "stats", "timechart", "sort", "head", "dedup", "rename", "eval", "regex"})
 _COMMAND = re.compile(r"^\s*([A-Za-z][A-Za-z0-9_]*)\b(.*)$", re.DOTALL)
 _SCOPE_FIELD = re.compile(r"(?i)(?<![A-Za-z0-9_])(?P<field>index|sourcetype)\b")
@@ -25,6 +37,9 @@ _SCOPE_PREDICATE = re.compile(r"(?i)(?P<field>index|sourcetype)\s*=\s*(?:\"(?P<d
 _NEGATED_SCOPE = re.compile(r"(?i)(?:\bNOT\s*(?:\(\s*)*|(?<![A-Za-z0-9_])-\s*)(?P<field>index|sourcetype)\b")
 _INLINE_TIME = re.compile(r"(?i)(?:^|\s)(?:earliest|latest)\s*=")
 _SEARCH_TOKEN = re.compile(r'''\(|\)|(?:[^\s()"']+|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')+''')
+_QUOTED_TOKEN = r'"(?:\\.|[^"\\])*"' + r"|'(?:\\.|[^'\\])*'"
+_FIELD_TOKEN = re.compile(_QUOTED_TOKEN + r'''|<=|>=|!=|<>|[(),=<>!]|[^\s(),=<>!"']+''')
+_EXPRESSION_TOKEN = re.compile(_QUOTED_TOKEN + r"|\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|[A-Za-z_]\w*|[^\s]")
 
 
 @dataclass(frozen=True, slots=True)
@@ -208,6 +223,210 @@ def source_pairs(spl: str) -> frozenset[tuple[str, str]]:
     return frozenset((index, source) for index, source in branches if index is not None and source is not None)
 
 
+def _validate_field_references(parsed: ParsedSPL, discovered: frozenset[str]) -> None:
+    """Check source fields and track aliases in command/expression order.
+
+    Search compares fields to literal values; eval/where expressions can
+    reference fields on either side and use single quotes for field names.
+    Requested-field metadata cannot establish the validity of the SPL text.
+    """
+    known = set(discovered | BUILTIN_FIELDS)
+
+    def field_name(token: str) -> str:
+        if token.startswith(('"', "'")):
+            if len(token) < 2 or token[-1] != token[0]:
+                raise ValueError("field_syntax_not_supported")
+            return re.sub(r'''\\(["'\\])''', r"\1", token[1:-1])
+        return token
+
+    def require(token: str, *, wildcard: bool = False) -> None:
+        name = field_name(token)
+        if name not in known and not (wildcard and any(fnmatchcase(field, name) for field in known)):
+            raise ValueError("field_not_discovered")
+
+    def expression(value: str, *, aggregate: bool = False) -> None:
+        tokens = _EXPRESSION_TOKEN.findall(value)
+        for index, token in enumerate(tokens):
+            if token.startswith("'"):
+                require(token)
+            elif re.fullmatch(r"[A-Za-z_]\w*", token):
+                if token.upper() in {"AND", "OR", "NOT", "XOR", "IN", "LIKE", "TRUE", "FALSE", "NULL"}:
+                    continue
+                if index + 1 < len(tokens) and tokens[index + 1] == "(":
+                    if token.lower() not in ALLOWED_EVAL_FUNCTIONS and not (aggregate and token.lower() == "eval"):
+                        raise ValueError("function_not_allowed")
+                    continue  # Arguments are checked even inside nested calls.
+                require(token)
+
+    def aliases(source: str, target: str) -> tuple[set[str], set[str]]:
+        if source.count("*") != target.count("*") or source.count("*") > 32:
+            raise ValueError("field_syntax_not_supported")
+        matched = {name for name in known if fnmatchcase(name, source)}
+        renamed: set[str] = set()
+        source_parts, target_parts = source.split("*"), target.split("*")
+        for name in matched:
+            cursor = len(source_parts[0])
+            captures = []
+            for index, part in enumerate(source_parts[1:], 1):
+                suffix = "*".join(source_parts[index:])
+                # Match each remaining suffix with the stdlib's bounded glob
+                # implementation, avoiding an untrusted chain of regex .*
+                end = next(end for end in range(len(name), cursor - 1, -1)
+                           if fnmatchcase(name[end:], suffix))
+                captures.append(name[cursor:end])
+                cursor = end + len(part)
+            renamed.add(target_parts[0] + "".join(value + suffix for value, suffix in zip(captures, target_parts[1:])))
+        return matched, renamed
+
+    def field_list(tokens: list[str], *, options: set[str] | None = None, sorting: bool = False,
+                   wildcard: bool = False) -> None:
+        position = 0
+        while position < len(tokens):
+            token = tokens[position]
+            if (options and token.lower() in options and position + 2 < len(tokens)
+                    and tokens[position + 1] == "="):
+                position += 3
+                continue
+            position += 1
+            if token in {",", "+", "-", "(", ")"} or (sorting and position == 1 and token.isdigit()):
+                continue
+            if sorting and token.lower() in {"asc", "desc", "sortby"}:
+                continue
+            if sorting and token.lower() in {"auto", "ip", "num", "str"} and position < len(tokens) and tokens[position] == "(":
+                continue
+            require(token.lstrip("+-"), wildcard=wildcard)
+
+    aggregate_options = {"allnum", "partitions", "delim", "dedup_splitvals"}
+    chart_options = aggregate_options | {"span", "minspan", "bins", "limit", "useother", "usenull", "cont", "fixedrange", "partial", "sep", "format", "nullstr", "otherstr", "start", "end", "aligntime"}
+    for command, args in parsed.command_segments:
+        matches = list(_FIELD_TOKEN.finditer(args))
+        offset = 0
+        for match in matches:
+            if args[offset:match.start()].strip():
+                raise ValueError("field_syntax_not_supported")
+            offset = match.end()
+        if args[offset:].strip():
+            raise ValueError("field_syntax_not_supported")
+        tokens = [match.group() for match in matches]
+        if command == "search":
+            for index, token in enumerate(tokens[:-1]):
+                if tokens[index + 1] in {"=", "!=", "<>", "<", ">", "<=", ">="} or tokens[index + 1].upper() == "IN":
+                    require(token)
+        elif command == "where":
+            expression(args)
+        elif command == "eval":
+            # Only top-level commas separate assignments; commas in function
+            # arguments and quoted values cannot create an alias early.
+            start = depth = 0
+            for index, token in enumerate([*tokens, ","]):
+                if token == "(":
+                    depth += 1
+                elif token == ")":
+                    depth -= 1
+                if depth < 0 or depth > 32:
+                    raise ValueError("field_syntax_not_supported")
+                if token != "," or depth:
+                    continue
+                assignment = tokens[start:index]
+                if len(assignment) < 3 or assignment[1] != "=":
+                    raise ValueError("field_syntax_not_supported")
+                if not assignment[0].startswith(('"', "'")) and not re.fullmatch(r"[A-Za-z_]\w*", assignment[0]):
+                    raise ValueError("field_syntax_not_supported")
+                expression(" ".join(assignment[2:]))
+                known.add(field_name(assignment[0]))
+                start = index + 1
+            if depth:
+                raise ValueError("field_syntax_not_supported")
+        elif command == "rename":
+            renamed: set[str] = set()
+            removed: set[str] = set()
+            position = 0
+            while position < len(tokens):
+                if tokens[position] == ",":
+                    position += 1
+                    continue
+                if position + 2 >= len(tokens) or tokens[position + 1].lower() != "as":
+                    raise ValueError("field_syntax_not_supported")
+                source, target = field_name(tokens[position]), field_name(tokens[position + 2])
+                require(tokens[position], wildcard=True)
+                matched, replacements = aliases(source, target)
+                removed.update(matched)
+                renamed.update(replacements)
+                position += 3
+            known.difference_update(removed)
+            known.update(renamed)
+        elif command in {"stats", "timechart"}:
+            generated: set[str] = set()
+            options = chart_options if command == "timechart" else aggregate_options
+            position = 0
+            while position < len(tokens):
+                token = tokens[position]
+                if token == ",":
+                    position += 1
+                    continue
+                if token.lower() in options and position + 2 < len(tokens) and tokens[position + 1] == "=":
+                    position += 3
+                    continue
+                if token.lower() == "by":
+                    field_list(tokens[position + 1:], options=options)
+                    break
+                percentile = re.fullmatch(r"(?:p|perc|exactperc|upperperc)(\d{1,3})", token.lower())
+                if token.lower() not in ALLOWED_STATS_FUNCTIONS and not (percentile and int(percentile[1]) <= 100):
+                    raise ValueError("function_not_allowed")
+                position += 1
+                output = token
+                wildcard_source: str | None = None
+                if position < len(tokens) and tokens[position] == "(":
+                    start = position + 1
+                    depth = 1
+                    position += 1
+                    while position < len(tokens) and depth:
+                        depth += (tokens[position] == "(") - (tokens[position] == ")")
+                        position += 1
+                    if depth:
+                        raise ValueError("field_syntax_not_supported")
+                    arguments = tokens[start:position - 1]
+                    if len(arguments) == 1:
+                        require(arguments[0], wildcard=True)
+                        if "*" in field_name(arguments[0]):
+                            wildcard_source = field_name(arguments[0])
+                    else:
+                        expression(" ".join(arguments), aggregate=True)
+                    output = token + "(" + "".join(arguments) + ")"
+                elif token.lower() not in {"count", "c"}:
+                    raise ValueError("field_syntax_not_supported")
+                aliased = position < len(tokens) and tokens[position].lower() == "as"
+                if aliased:
+                    if position + 1 >= len(tokens):
+                        raise ValueError("field_syntax_not_supported")
+                    output = field_name(tokens[position + 1])
+                    position += 2
+                if wildcard_source is not None:
+                    if aliased:
+                        generated.update(aliases(wildcard_source, output)[1])
+                    else:
+                        generated.update(token + "(" + name + ")" for name in known if fnmatchcase(name, wildcard_source))
+                else:
+                    generated.add(output)
+            known.update(generated)
+        elif command in {"table", "fields", "sort", "dedup"}:
+            field_list(tokens, options={"keepevents", "keepempty", "consecutive"} if command == "dedup" else None,
+                       sorting=command in {"sort", "dedup"}, wildcard=command in {"table", "fields"})
+        elif command == "regex":
+            if len(tokens) > 1 and tokens[1] in {"=", "!="}:
+                require(tokens[0])
+        elif command == "head" and not args.isdigit():
+            predicate: list[str] = []
+            position = 0
+            while position < len(tokens):
+                if tokens[position].lower() in {"limit", "keeplast", "null"} and position + 2 < len(tokens) and tokens[position + 1] == "=":
+                    position += 3
+                else:
+                    predicate.append(tokens[position])
+                    position += 1
+            expression(" ".join(predicate))
+
+
 class SPLPolicy:
     """Immutable execution policy pinned to discovery and approved scope."""
 
@@ -255,6 +474,7 @@ class SPLPolicy:
         if "spl_not_allowed" not in reasons:
             try:
                 normalized = _preserve_raw_source_fields(parsed)
+                _validate_field_references(parsed, self.discovered_fields)
             except ValueError as exc:
                 reasons.append(str(exc))
         spl_indexes, invalid_index_scope = _scope_values(scope_expression, "index")

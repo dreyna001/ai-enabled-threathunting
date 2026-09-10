@@ -22,7 +22,7 @@ from threat_hunting.db import bounded_audit_metadata
 from threat_hunting.domain.budgets import BudgetCounters, BudgetLimits
 from threat_hunting.domain.contracts import FindingProposal, FollowUpDecision, HuntPlan, QueryAssessment, QueryProposal
 from threat_hunting.domain.errors import FailureCategory, failure_metadata
-from threat_hunting.domain.spl_policy import SPLPolicy, parse_spl
+from threat_hunting.domain.spl_policy import ALLOWED_EVAL_FUNCTIONS, ALLOWED_STATS_FUNCTIONS, SPLPolicy, parse_spl
 from threat_hunting.domain.state import HuntState
 from threat_hunting.integrations.errors import AdapterError
 from threat_hunting.integrations.models.base import ModelAdapter
@@ -1604,6 +1604,8 @@ class WorkflowService:
                     "For general endpoint chronology, retain relevant process lifecycle and module events; do not restrict the search to process_start OR image_load when that would omit process_end or other observed relevant actions. Preserve explicitly targeted action-specific searches.",
                     "stats BY nullable fields can discard events missing any grouping value. Authentication logoffs may lack logon_type or authentication_method. For complete authentication chronology, prefer bounded raw records unless the supported query explicitly preserves missing groups; do not confuse missing fields with absent events.",
                     "Allowed pipeline commands are search, where, fields, table, stats, timechart, sort, head, dedup, rename, eval, regex. No other commands are supported.",
+                    "Allowed eval/where functions: " + ", ".join(sorted(ALLOWED_EVAL_FUNCTIONS)) + ". Function arguments must reference discovered inputs or fields defined earlier in the pipeline. Do not use lookup, searchmatch, customer functions or dynamic eval field names.",
+                    "Allowed aggregate functions: " + ", ".join(sorted(ALLOWED_STATS_FUNCTIONS)) + "; percentile functions pN, percN, exactpercN and upperpercN for integer N from 0 through 100 are also allowed. Use eval(...) inside an aggregate when needed and give calculated results explicit aliases.",
                     "Set time bounds only in earliest_utc/latest_utc proposal fields within the approved range; do not put earliest/latest in SPL.",
                     "Use a simple read-only pipeline with exact positive index and sourcetype predicates. Subsearches, macros, joins, and placeholder variables are unsupported.",
                     "Correlate sources through separate queries using literal entities observed in completed searches; defer dependent questions until those results exist.",
