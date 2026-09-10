@@ -48,6 +48,8 @@ def _record_contract_failure(check: ModelOutputCheck, error: Exception) -> None:
         check.validation_error_code = "json"
     elif str(error) == "finding query labels do not match its selected evidence":
         check.validation_error_code = "citation_relationship"
+    elif str(error) == "negative findings require complete query results":
+        check.validation_error_code = "query_coverage"
     elif str(error).startswith("unknown ") and str(error).endswith(" label; choose only supplied labels"):
         check.validation_error_code = "reference_label"
     else:

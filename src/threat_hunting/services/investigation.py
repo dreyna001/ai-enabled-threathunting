@@ -16,7 +16,7 @@ from threat_hunting.domain.common import DomainModel
 from threat_hunting.domain.contracts import FindingProposal, FollowUpDecision, HuntPlan, QuestionAnswer, QuestionAnswerStep, QueryAssessment, QueryProposal
 from threat_hunting.domain.errors import Validation
 from threat_hunting.domain.spl_policy import source_pairs
-from threat_hunting.services.evidence import _flatten_scalar_values, evidence_time_bounds, lookup_retained_evidence, query_source_coverage, raw_event_time, result_source
+from threat_hunting.services.evidence import _flatten_scalar_values, evidence_time_bounds, lookup_retained_evidence, query_results_incomplete, query_source_coverage, raw_event_time, result_source
 from threat_hunting.services.reports import _derive_report_limitations
 from threat_hunting.services.threat_intel import compare_advisory_iocs, query_ioc_context
 
@@ -548,8 +548,17 @@ def _follow_up_proposal_errors(
 def _question_synthesis_contract(plan: HuntPlan, *, allow_retrieval: bool = False) -> type[BaseModel]:
     """Require one closed answer slot per approved question, with app-owned keys."""
 
+    def validate_lookup_scope(answer: QuestionAnswerStep) -> QuestionAnswerStep:
+        for request in answer.retained_evidence_requests:
+            earliest = request.earliest_utc or plan.scope.earliest_utc
+            latest = request.latest_utc or plan.scope.latest_utc
+            if earliest < plan.scope.earliest_utc or latest > plan.scope.latest_utc or earliest >= latest:
+                raise ValueError("retained evidence lookup exceeds the approved time window")
+        return answer
+
     fields: dict[str, Any] = {
-        f"question_{index}": (QuestionAnswerStep if allow_retrieval else QuestionAnswer, ...) for index, _ in enumerate(plan.questions, 1)
+        f"question_{index}": (Annotated[QuestionAnswerStep, AfterValidator(validate_lookup_scope)] if allow_retrieval else QuestionAnswer, ...)
+        for index, _ in enumerate(plan.questions, 1)
     }
     return create_model("QuestionSynthesis", __base__=DomainModel, **fields)
 
@@ -662,7 +671,7 @@ def _synthesis_context(
     query_rows = [
         {
             key: item[key]
-            for key in ("query_id", "question_id", "purpose", "spl", "status", "result_count", "truncated", "available_result_count", "retrieval_stop_reason", "earliest_utc", "latest_utc")
+            for key in ("query_id", "question_id", "purpose", "spl", "status", "outcome", "partial_fetch", "result_count", "truncated", "available_result_count", "retrieval_stop_reason", "earliest_utc", "latest_utc")
             if key in item
         } | query_windows.get(str(item["query_id"]), {})
         for item in queries
@@ -740,12 +749,16 @@ def _materialize_findings(
         str(item.get("query_id")) for item in queries
         if isinstance(item, Mapping) and item.get("status") == "completed"
     } if isinstance(queries, list) else set()
+    incomplete_queries = {str(item.get("query_id")) for item in queries
+                          if isinstance(item, Mapping) and query_results_incomplete(item)} if isinstance(queries, list) else set()
     findings: list[dict[str, Any]] = []
     for proposal in proposals:
         if not {str(value) for value in proposal.evidence_ids}.issubset(evidence_ids):
             raise Validation("synthesis referenced unavailable evidence")
         if not {str(value) for value in proposal.query_ids}.issubset(query_ids):
             raise Validation("synthesis referenced unavailable completed query")
+        if proposal.classification.value == "not_supported_within_scope" and incomplete_queries.intersection(str(value) for value in proposal.query_ids):
+            raise Validation("negative findings require complete query results")
         finding = {"finding_id": str(uuid4()), **proposal.model_dump(mode="json")}
         finding["evidence_ids"] = list(dict.fromkeys(finding["evidence_ids"]))
         finding["query_ids"] = list(dict.fromkeys(finding["query_ids"]))

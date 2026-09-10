@@ -480,6 +480,13 @@ class RetainedEvidenceFilter(DomainModel):
     field: Annotated[StrictStr, Field(min_length=1, max_length=128)]
     value: StrictStr | StrictInt | StrictBool | Annotated[float, Field(strict=True, allow_inf_nan=False)]
 
+    @field_validator("field")
+    @classmethod
+    def validate_field_name(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("lookup filter field must be nonempty")
+        return value
+
 
 class RetainedEvidenceRequest(DomainModel):
     """A bounded local lookup; never a request to submit a new search."""

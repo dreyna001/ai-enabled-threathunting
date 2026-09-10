@@ -32,6 +32,60 @@ def finding(*, evidence_ids=None, query_ids=None, classification="supported_obse
             "inference": "unknown", "limitations": []}
 
 
+@pytest.mark.parametrize("incomplete", [
+    {"truncated": True}, {"partial_fetch": True}, {"status": "failed"},
+    {"outcome": "failed"}, {"available_result_count": 5, "result_count": 0},
+])
+def test_incomplete_query_cannot_support_a_negative_finding_in_schema_or_materialization(incomplete):
+    from threat_hunting.domain.errors import Validation
+    from threat_hunting.services.investigation import _materialize_findings
+
+    source = context()
+    for query in source["completed_queries"]:
+        query["status"] = "completed"
+    source["completed_queries"][1].update(incomplete)
+    negative = finding(evidence_ids=[], query_ids=["Q2"], classification="not_supported_within_scope")
+    labels = ReferenceLabels.from_context(source)
+    schema = structured_response_format(TypeAdapter(list[FindingProposal]), "FindingProposal[]", labels)["json_schema"]["schema"]
+    assert not Draft202012Validator(schema).is_valid({"FindingProposal": [negative]})
+    with pytest.raises(ValueError, match="complete query results"):
+        labels.decode([negative], findings=True)
+    # Persistence also rejects callers that bypass request-label validation.
+    proposal = FindingProposal.model_validate({**negative, "query_ids": [source["completed_queries"][1]["query_id"]]})
+    with pytest.raises(Validation):
+        _materialize_findings([proposal], {"queries": source["completed_queries"], "evidence": source["retained_evidence"]})
+
+
+def test_negative_query_coverage_failure_uses_one_repair_with_original_references():
+    source = context()
+    source["completed_queries"][1]["truncated"] = True
+    negative = finding(evidence_ids=[], query_ids=["Q2"], classification="not_supported_within_scope")
+    model = FakeModelAdapter(responses=[json.dumps({"FindingProposal": [negative]}), json.dumps({"FindingProposal": []})])
+    runner = StrictModelRunner(model)
+    assert runner.run(TypeAdapter(list[FindingProposal]), user_payload=source, contract_name="FindingProposal[]") == []
+    assert model.call_count == 2
+    assert model.requests[0].messages[0] == model.requests[1].messages[0]
+    assert runner.counters.model_output_checks[0].validation_error_code == "query_coverage"
+
+
+def test_partial_query_can_still_support_a_cited_positive_observation():
+    source = context()
+    source["completed_queries"][0]["truncated"] = True
+    labels = ReferenceLabels.from_context(source)
+    assert labels.decode([finding()], findings=True)[0]["evidence_ids"] == [source["retained_evidence"][0]["evidence_id"]]
+
+
+def test_schema_omits_negative_findings_when_every_query_is_incomplete():
+    source = context()
+    for query in source["completed_queries"]:
+        query["truncated"] = True
+    schema = structured_response_format(TypeAdapter(list[FindingProposal]), "FindingProposal[]", ReferenceLabels.from_context(source))["json_schema"]["schema"]
+    Draft202012Validator.check_schema(schema)
+    validator = Draft202012Validator(schema)
+    assert validator.is_valid({"FindingProposal": [finding()]})
+    assert not validator.is_valid({"FindingProposal": [finding(evidence_ids=[], query_ids=["Q2"], classification="not_supported_within_scope")]})
+
+
 def test_api_schema_is_closed_and_constrains_citation_choices():
     source = context()
     model = FakeModelAdapter(responses=[json.dumps({"FindingProposal": [finding()]})])

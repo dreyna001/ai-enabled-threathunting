@@ -799,6 +799,71 @@ def test_synthesis_context_exhaustion_preserves_explicit_unanswered_question(mon
     assert service.get_hunt("owner-1", hid)["state"] == "report_draft"
 
 
+def test_truncated_search_reaches_report_with_limitations_after_negative_finding_repair():
+    base = _model()._responses[0]
+    synthesis_calls = 0
+
+    class PartialJob(Job):
+        content = {"isDone": "1", "resultCount": "2"}
+
+        def results(self, **kwargs):
+            rows = [*super().results(), {"_time": "2026-01-01T00:35:00Z", "host": "host-2", "event_id": "evt-2"}]
+            offset = int(kwargs.get("offset", 0))
+            return rows[offset:offset + int(kwargs.get("count", 2))]
+
+    class PartialJobs(Jobs):
+        def create(self, query, **kwargs):
+            if query.startswith("| tstats "):
+                return CatalogJob()
+            job = PartialJob()
+            job.name = str(kwargs.get("id", job.name))
+            self[job.name] = job
+            return job
+
+    def response(request):
+        nonlocal synthesis_calls
+        context = json.loads(request.messages[0]["content"])
+        if "FollowUpDecision[]" in (request.system or ""):
+            return json.dumps([{"question_id": question["question_id"], "proposal": None,
+                                "skip_reason": "Retained results are limited."} for question in context["follow_up_questions"]])
+        if "QueryProposal[]" in (request.system or ""):
+            proposals = json.loads(base(request))
+            proposals[0]["spl"] = "search index=main sourcetype=syslog | head 2"
+            return json.dumps(proposals)
+        if "Required contract: QuestionSynthesis." not in (request.system or ""):
+            return base(request)
+        synthesis_calls += 1
+        assert context["completed_queries"][0]["truncated"] is True
+        if synthesis_calls == 1:
+            return json.dumps({"question_1": {"summary": "No related activity.", "limitations": [], "findings": [{
+                "title": "No related activity", "classification": "not_supported_within_scope", "statement": "No related activity was present.",
+                "confidence": "low", "evidence_ids": [], "query_ids": [context["completed_queries"][0]["query_id"]],
+                "inference": "unknown", "limitations": ["Approved sources only."]}]}})
+        assert "complete query results" in request.messages[-1]["content"]
+        return json.dumps({"question_1": {"summary": "The search cannot establish absence.", "findings": [],
+                                         "limitations": ["Search results were truncated; omitted rows remain unassessed."]}})
+
+    engine = create_engine("sqlite+pysqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    workflow_metadata.create_all(engine)
+    jobs_metadata.create_all(engine)
+    client = Splunk()
+    client.jobs = PartialJobs()
+    service = WorkflowService(engine, model_adapter=FakeModelAdapter(responses=[response] * 20),
+                              splunk_connector=SplunkConnector(SplunkConnectionConfig(endpoint="https://splunk.example", token="test-token"), client=client),
+                              execution_config={"provider": "fake", "model_name": "test"})
+    hid = str(service.create_hunt("owner-1", title="Partial search", hypothesis="h", objective="o")["hunt_id"])
+    service.discover("owner-1", hid)
+    service.approve("owner-1", hid, "reviewed")
+    service.execute("owner-1", hid)
+    service.execute_job(service.jobs.claim("worker-1"))
+    result = service.results("owner-1", hid)
+    assert synthesis_calls == 2 and result["findings"] == []
+    assert len(result["evidence"]) == 1
+    assert result["usage"]["model_repair_attempts"] == 1
+    assert any(check["validation_error_code"] == "query_coverage" for check in result["usage"]["model_output_checks"])
+    assert service.get_hunt("owner-1", hid)["state"] == "report_draft"
+
+
 def test_oversized_assessment_preserves_retained_evidence_for_final_synthesis(monkeypatch):
     from threat_hunting.services import workflow
 

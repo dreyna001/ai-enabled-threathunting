@@ -77,7 +77,7 @@ class ModelOutputCheck(DomainModel):
     repair: StrictBool
     contract_valid: StrictBool | None = None
     grounding_valid: StrictBool | None = None
-    validation_error_code: Literal["schema", "json", "reference_label", "citation_relationship", "structure"] | None = None
+    validation_error_code: Literal["schema", "json", "reference_label", "citation_relationship", "query_coverage", "structure"] | None = None
 
 
 class BudgetCounters(DomainModel):

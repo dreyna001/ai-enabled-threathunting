@@ -9,7 +9,7 @@ from types import MappingProxyType
 from typing import Any, Mapping
 
 from threat_hunting.domain.contracts import FINDING_GROUNDING_FIELDS
-from threat_hunting.services.evidence import _flatten_scalar_values, compact_evidence_records
+from threat_hunting.services.evidence import _flatten_scalar_values, compact_evidence_records, query_results_incomplete
 
 
 _EVIDENCE_FIELDS = {"evidence_id", "evidence_ids", "allowed_evidence_ids", "result_row_refs", "evidence_candidate_row_refs",
@@ -116,12 +116,21 @@ class ReferenceLabels:
                     entity["result_row_refs"] = matches
         if findings:
             evidence_by_id = {str(row["evidence_id"]): row for row in self.evidence.values()}
+            query_by_id = {str(row["query_id"]): row for row in self.queries.values()}
             groups = [decoded] if isinstance(decoded, list) else [
                 answer["findings"] for answer in decoded.values()
                 if isinstance(answer, Mapping) and isinstance(answer.get("findings"), list)
             ] if isinstance(decoded, Mapping) else []
             for finding in (item for group in groups for item in group):
-                if not isinstance(finding, dict) or not finding.get("evidence_ids"):
+                if not isinstance(finding, dict):
+                    continue
+                if finding.get("classification") == "not_supported_within_scope":
+                    query_ids = finding.get("query_ids", [])
+                    if not isinstance(query_ids, list):
+                        raise ValueError("finding query_ids must be a list")
+                    if any(query_results_incomplete(query_by_id[identifier]) for identifier in query_ids):
+                        raise ValueError("negative findings require complete query results")
+                if not finding.get("evidence_ids"):
                     continue
                 expected = sorted({str(evidence_by_id[identifier]["query_id"]) for identifier in finding["evidence_ids"]})
                 explicit = finding.get("query_ids", [])
@@ -206,6 +215,12 @@ def structured_response_format(contract: Any, name: str, references: ReferenceLa
             }
             variant["properties"][required_field]["minItems"] = 1
             if references is not None:
+                if required_field == "query_ids":
+                    eligible = [label for label, query in references.queries.items() if not query_results_incomplete(query)]
+                    if not eligible:
+                        continue
+                    schema["$defs"]["CompleteScopeQueryReference"] = {"type": "string", "enum": eligible}
+                    variant["properties"]["query_ids"]["items"] = {"$ref": "#/$defs/CompleteScopeQueryReference"}
                 other_field = "evidence_ids" if required_field == "query_ids" else "query_ids"
                 variant["properties"][other_field]["maxItems"] = 0
             variants.append(variant)
@@ -252,7 +267,7 @@ def prepare_model_context(payload: Any, name: str) -> tuple[Any, ReferenceLabels
     context["reference_rules"] = [
         "Reference fields use only the Q and E labels supplied in this request; never copy identifiers from raw telemetry.",
         "For findings with evidence_ids, return query_ids=[]; the application derives their query relationships.",
-        "For findings without evidence, select completed query labels to describe scoped negative results.",
+        "For scoped negative findings, select only completed query labels with successful, complete result retrieval. Truncated or partial results cannot establish absence; explain missing support in the question's limitations instead.",
     ]
     if name == "QueryAssessment[]":
         context["reference_rules"].append("Select the completed query's Q label; the application derives question_id. Do not return question_id.")

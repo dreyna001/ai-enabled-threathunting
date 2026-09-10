@@ -171,13 +171,43 @@ def test_model_lookup_cannot_cross_hunt_or_approved_time_scope(change):
     state = results()
     request = {"query_ids": [state["queries"][0]["query_id"]]}
     request.update({"query_ids": ["foreign-query"]} if change == "foreign_query" else {"earliest_utc": "2025-12-31T00:00:00Z"})
-    answer = _question_synthesis_contract(plan(), allow_retrieval=True).model_validate({"question_1": {**limited(), "retained_evidence_requests": [request]}, "question_2": limited()})
+    payload = {"question_1": {**limited(), "retained_evidence_requests": [request]}, "question_2": limited()}
+    if change == "outside_time":
+        with pytest.raises(ValidationError, match="approved time window"):
+            _question_synthesis_contract(plan(), allow_retrieval=True).model_validate(payload)
+        return
+    answer = _question_synthesis_contract(plan(), allow_retrieval=True).model_validate(payload)
     with pytest.raises(Validation):
         _retained_synthesis_pages(answer, plan(), state)
 
 
+def test_out_of_scope_lookup_is_repaired_with_original_context():
+    state = results()
+    response = {"question_1": {**limited(), "retained_evidence_requests": [{
+        "query_ids": ["Q1"], "earliest_utc": "2025-01-01T00:00:00Z"}]}, "question_2": limited()}
+    model = FakeModelAdapter(responses=[json.dumps(response), json.dumps({"question_1": limited(), "question_2": limited()})])
+    runner = StrictModelRunner(model)
+    answer = runner.run(_question_synthesis_contract(plan(), allow_retrieval=True),
+                        user_payload=_synthesis_context(plan=plan(), results=state, threat_intelligence=""),
+                        contract_name="QuestionSynthesis")
+    assert not answer.question_1.retained_evidence_requests
+    assert model.call_count == 2
+    assert model.requests[0].messages[0] == model.requests[1].messages[0]
+    assert runner.counters.model_repair_attempts == 1
+
+
+def test_lookup_reports_unobserved_filter_fields_instead_of_implying_source_absence():
+    state = results()
+    page = lookup_retained_evidence(state, query_ids={state["queries"][0]["query_id"]}, filters={"not_observed": "value"})
+    assert page["unobserved_filter_fields"] == ["not_observed"]
+    assert page["matching_raw_record_count"] == 0
+    assert "does not establish absence" in page["limitation"]
+    assert page["query_coverage"][0]["retained_evidence_count"] == 1
+
+
 @pytest.mark.parametrize("change", [{"offset": -1}, {"limit": 501}, {"limit": True}, {"query_ids": ["q", "q"]},
                                   {"earliest_utc": "2026-01-01T00:00:00"},
+                                  {"filters": [{"field": "   ", "value": "host"}]},
                                   {"filters": [{"field": "h", "value": {"regex": ".*"}}]}])
 def test_model_lookup_rejects_unbounded_or_ambiguous_parameters(change):
     with pytest.raises(ValidationError):

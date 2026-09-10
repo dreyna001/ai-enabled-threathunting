@@ -51,6 +51,22 @@ EvidenceKindValue = Literal["raw_event", "aggregate_row"]
 NonNegativeInt = Field(ge=0)
 
 
+def query_results_incomplete(query: Mapping[str, Any]) -> bool:
+    """Identify failed or incomplete retrieval in an already scoped query ledger.
+
+    Older completed-query contexts omitted status/outcome flags. Preserve that
+    representation while rejecting explicit failure or missing result coverage.
+    This check does not prove that a query or its interpretation is correct.
+    """
+    retained, available = query.get("result_count"), query.get("available_result_count")
+    return (
+        query.get("status", "completed") != "completed"
+        or query.get("outcome") not in {None, "success", "succeeded"}
+        or bool(query.get("truncated")) or bool(query.get("partial_fetch"))
+        or type(retained) is int and type(available) is int and available > retained
+    )
+
+
 def result_source(row: Mapping[str, Any], pairs: frozenset[tuple[str, str]]) -> tuple[str, str]:
     """Resolve projected source fields only when they identify one possible pair.
 
@@ -706,6 +722,9 @@ def lookup_retained_evidence(
 
     retained = [item for item in results.get("evidence", [])
                 if isinstance(item, Mapping) and str(item.get("query_id")) in query_ids]
+    observed_fields = {field for item in retained if item.get("evidence_kind", "raw_event") == "raw_event"
+                       and isinstance(item.get("selected_result"), Mapping) for field in item["selected_result"]}
+    unobserved_filter_fields = sorted(set(filters).difference(observed_fields))
     matching: list[tuple[datetime | None, int, Mapping[str, Any]]] = []
     unknown_time_excluded = 0
     aggregate_rows = 0
@@ -765,12 +784,14 @@ def lookup_retained_evidence(
                            for query_id in sorted(query_ids)],
         "matching_raw_record_count": len(rows), "matching_representation_group_count": len(compacted),
         "aggregate_rows_excluded": aggregate_rows,
+        "unobserved_filter_fields": unobserved_filter_fields,
         "unknown_time_rows_excluded_by_window": unknown_time_excluded,
         "observed_time_bounds": evidence_time_bounds(rows), "distinct_fields": counts,
         "offset": offset, "effective_limit": effective_limit,
         "next_offset": next_offset if next_offset < len(compacted) else None,
         "records": [_json_value(item) for item in page],
-        "limitation": "Counts cover matching retained raw rows and literal field values, not all source events or confirmed affected entities. Multivalue fields remain ambiguous. Repeated records do not increase distinct literal counts. Missing values and truncated searches prevent complete scope claims.",
+        "limitation": "Counts cover matching retained raw rows and literal field values, not all source events or confirmed affected entities. Multivalue fields remain ambiguous. Repeated records do not increase distinct literal counts. Missing values and truncated searches prevent complete scope claims."
+                      + (" A filter field was not observed in the retained raw records; zero matches does not establish absence in the searched source." if unobserved_filter_fields else ""),
     }
 
 
