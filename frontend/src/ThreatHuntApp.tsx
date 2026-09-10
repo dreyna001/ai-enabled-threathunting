@@ -170,7 +170,9 @@ function ResultCard({ title, items }: { title: string; items: JsonObject[] }) {
   );
 }
 
-export function ObservedTimeline({ results }: { results: HuntResults }) {
+export function ObservedTimeline({ results, id = "observed-timeline", heading = "Observed timeline", anchor }: {
+  results: HuntResults; id?: string; heading?: string; anchor?: string | null;
+}) {
   const [filter, setFilter] = useState("");
   const [page, setPage] = useState(0);
   const pageSize = 50;
@@ -186,8 +188,8 @@ export function ObservedTimeline({ results }: { results: HuntResults }) {
   const display = (value: unknown) => value === undefined || value === null ? "Unknown" : typeof value === "string" ? value : JSON.stringify(value);
   const hasRawEvidence = results.evidence.some((item) => (item.evidence_kind ?? "raw_event") === "raw_event");
 
-  return <section id="observed-timeline" className="vs-card vs-span vs-timeline">
-    <h2>Observed timeline</h2>
+  return <section id={id} className="vs-card vs-span vs-timeline">
+    <h2>{heading}</h2>
     <p>Chronology from retained raw records, independent of model findings. Repeated representations may remain; the count is not a unique-event count. Aggregate rows are excluded.</p>
     <p className="vs-muted">Records without a usable time appear last. Observations do not prove continuous activity. Search retrieval status describes the individual search, not complete hunt coverage.</p>
     {!results.timeline.length ? <p className="vs-empty">{hasRawEvidence ? "The observed timeline is unavailable for these results. Retained evidence remains available below." : "No raw observations retained."}</p> : <>
@@ -197,13 +199,16 @@ export function ObservedTimeline({ results }: { results: HuntResults }) {
       {visible.length ? <div className="table-wrap" role="region" aria-label="Observed records" tabIndex={0}>
         <table>
           <caption>Retained observations in time order (UTC)</caption>
-          <thead><tr><th scope="col">Observed time</th><th scope="col">Action</th><th scope="col">Host</th><th scope="col">User</th><th scope="col">Process</th><th scope="col">Source details</th></tr></thead>
+          <thead><tr><th scope="col">Observed time</th>{anchor !== undefined && <th scope="col">Relative to lead observation</th>}<th scope="col">Action</th><th scope="col">Host</th><th scope="col">User</th><th scope="col">Process</th><th scope="col">Source details</th></tr></thead>
           <tbody>{visible.map((item, index) => {
             const source = evidence.get(String(item.evidence_id));
             const event = source?.selected_result;
             const fields = event && typeof event === "object" && !Array.isArray(event) ? event as JsonObject : {};
+            const stamp = Date.parse(String(item.event_time_utc));
+            const leadStamp = anchor ? Date.parse(anchor) : NaN;
+            const period = !Number.isFinite(stamp) || !Number.isFinite(leadStamp) ? "Unknown" : stamp < leadStamp ? "Before" : stamp > leadStamp ? "After" : "At";
             return <tr key={`${String(item.evidence_id)}-${start + index}`}>
-              <td>{display(item.event_time_utc)}</td><td>{display(fields.action)}</td><td>{display(fields.host)}</td>
+              <td>{display(item.event_time_utc)}</td>{anchor !== undefined && <td>{period}</td>}<td>{display(fields.action)}</td><td>{display(fields.host)}</td>
               <td>{display(fields.user)}</td><td>{display(fields.process)}</td>
               <td><details><summary>View recorded fields</summary>
                 <p>Search retrieval: {display(item.query_coverage)}</p>
@@ -259,12 +264,77 @@ function QuestionInventories({ inventories }: { inventories: RetainedInventory[]
   </details>;
 }
 
+function LeadActivity({ results, selectedLead, onSelect }: { results: HuntResults; selectedLead: string; onSelect: (value: string) => void }) {
+  const activity = results.lead_activity;
+  const lead = activity?.leads.find((item) => item.lead_evidence_ids[0] === selectedLead) ?? activity?.leads[0];
+  if (!activity && results.question_answers?.some((answer) => answer.lead_coverage?.length)) {
+    return <p className="vs-empty">The calculated lead activity is unavailable for these results. Retained source records remain available in the observed timeline.</p>;
+  }
+  if (!activity?.leads.length || !lead) return null;
+  return <section id="lead-activity" className="vs-lead-activity">
+    <h3>Observed activity for the retained leads</h3>
+    <p>Calculated from retained records for these answers, independently of the model's findings. Matching native fields identify review context; they do not prove identity, causation or maliciousness.</p>
+    <label>Choose a lead<select value={lead.lead_evidence_ids[0]} onChange={(event) => onSelect(event.target.value)}>
+      {activity.leads.map((item) => <option key={item.lead_evidence_ids[0]} value={item.lead_evidence_ids[0]}>
+        {item.identity_fields.host ?? "Unknown host"} · {item.anchor_event_time_utc ?? "Unknown time"} · {item.identity_fields.process_guid ?? item.lead_evidence_ids[0]}
+      </option>)}
+    </select></label>
+    <ObservedLead key={lead.lead_evidence_ids[0]} results={results} lead={lead} />
+  </section>;
+}
+
+function ObservedLead({ results, lead }: { results: HuntResults; lead: NonNullable<HuntResults["lead_activity"]>["leads"][number] }) {
+  const [relationship, setRelationship] = useState("session");
+  const available = lead.scopes.map((selection) => ({ selection,
+    scope: results.lead_activity?.scopes.find((item) => item.scope_id === selection.scope_id) }));
+  const selected = available.find((item) => (item.scope?.identity_fields.process_guid ? "process" : "session") === relationship) ?? available.at(-1);
+  const selection = selected?.selection;
+  const scope = selected?.scope;
+  const scopeId = scope?.scope_id ?? "";
+  const scopedResults = useMemo(() => {
+    const references = new Set(scope?.evidence_ids);
+    return { ...results, timeline: results.timeline.filter((item) => references.has(String(item.evidence_id))) };
+  }, [results, scope]);
+  return <>
+    <p>Lead observation: {lead.anchor_event_time_utc ?? "Unknown time"}. This anchor is not necessarily a process start.</p>
+    {lead.limitation && <p className="vs-warning">{lead.limitation}</p>}
+    {!!lead.scopes.length && <label>Recorded relationship<select value={scopeId} onChange={(event) => {
+      const chosen = available.find((item) => item.scope?.scope_id === event.target.value);
+      setRelationship(chosen?.scope?.identity_fields.process_guid ? "process" : "session");
+    }}>
+      {lead.scopes.map((item) => {
+        const fields = results.lead_activity?.scopes.find((candidate) => candidate.scope_id === item.scope_id)?.identity_fields;
+        return <option key={item.scope_id} value={item.scope_id}>{fields?.process_guid ? "Matching host and process fields" : "Matching host, user and session"}</option>;
+      })}
+    </select></label>}
+    {scope && selection && <>
+      <p>{scope.raw_record_count} retained raw records match every selected field. Repeated representations remain; this is not a unique-event count.</p>
+      <ul>{selection.periods.map((period) => <li key={period.relative_to_lead}>
+        {period.relative_to_lead}: {period.raw_record_count} records; {period.first_event_time_utc ?? "unknown time"} to {period.last_event_time_utc ?? "unknown time"}.
+      </li>)}</ul>
+      <details><summary>Observed actions and search coverage</summary>
+        <ul>{scope.actions.map((action) => <li key={JSON.stringify(action.action)}>{action.action ?? "Unknown action"}: {action.raw_record_count} records, {action.first_observed_utc} to {action.last_observed_utc}.</li>)}</ul>
+        <p>Each status applies to its own search and time window. An empty selection does not establish source absence.</p>
+        <ul>{scope.query_coverage.map((query) => <li key={query.query_id}>Search {query.query_id}: {query.retrieval_status}; {query.matching_raw_record_count} matching retained records. Window: {query.earliest_utc ?? "unknown"} to {query.latest_utc ?? "unknown"}.</li>)}</ul>
+      </details>
+      <QuestionInventories inventories={[{ scope: { query_ids: scope.query_coverage.map((query) => query.query_id),
+        filters: Object.entries(scope.identity_fields).map(([field, value]) => ({ field, value })), earliest_utc: null, latest_utc: null },
+        raw_record_count: scope.raw_record_count, fields: scope.fields,
+        limitations: ["All retained raw rows matching these exact scalar identity fields are included, including unknown times and observations from incomplete searches. Counts do not establish affected entities or complete source coverage."] }]} />
+      <ObservedTimeline key={scopeId} results={scopedResults} id="lead-observed-timeline" heading="Records matching this lead selection" anchor={lead.anchor_event_time_utc} />
+    </>}
+  </>;
+}
+
 export function QuestionAnswers({ results }: { results: HuntResults }) {
+  const [selectedLead, setSelectedLead] = useState("");
   if (!results.question_answers?.length) return null;
   const findings = new Map(results.findings.map((item) => [String(item.finding_id), item]));
+  const activityLeadIds = new Set(results.lead_activity?.leads.map((item) => item.lead_evidence_ids[0]));
   return (
     <section className="vs-card vs-span">
       <h2>Approved question answers</h2>
+      <LeadActivity results={results} selectedLead={selectedLead} onSelect={setSelectedLead} />
       {results.question_answers.map((answer) => (
         <article key={answer.question_id}>
           <h3>{answer.question}</h3>
@@ -280,6 +350,8 @@ export function QuestionAnswers({ results }: { results: HuntResults }) {
               </div>)}</dl>
               {!Object.keys(lead.identity_fields).length && <p>Identity fields unavailable.</p>}
               <p>{lead.finding_ids.length} findings linked.</p>
+              {activityLeadIds.has(lead.lead_evidence_ids[0]) &&
+                <a href="#lead-activity" onClick={() => setSelectedLead(lead.lead_evidence_ids[0])}>Review observed activity for this lead</a>}
               {lead.limitation && <p>Unanswered or limited: {lead.limitation}</p>}
             </section>)}
           </details>}

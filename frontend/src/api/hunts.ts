@@ -88,6 +88,24 @@ export interface HuntResults {
   evidence: JsonObject[];
   entities: JsonObject[];
   timeline: JsonObject[];
+  lead_activity?: {
+    leads: Array<{
+      lead_evidence_ids: string[];
+      identity_fields: Record<string, string>;
+      anchor_event_time_utc: string | null;
+      limitation: string | null;
+      scopes: Array<{ scope_id: string; periods: Array<{
+        relative_to_lead: string; raw_record_count: number;
+        first_event_time_utc: string | null; last_event_time_utc: string | null;
+      }> }>;
+    }>;
+    scopes: Array<{
+      scope_id: string; identity_fields: Record<string, string>; evidence_ids: string[]; raw_record_count: number;
+      fields: RetainedInventory["fields"];
+      actions: Array<{ action: string | null; raw_record_count: number; first_observed_utc: string; last_observed_utc: string }>;
+      query_coverage: Array<{ query_id: string; retrieval_status: string; matching_raw_record_count: number; earliest_utc: string | null; latest_utc: string | null }>;
+    }>;
+  };
   question_answers?: Array<{
     question_id: string;
     question: string;

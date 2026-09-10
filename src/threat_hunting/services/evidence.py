@@ -8,6 +8,7 @@ documented canonical envelope.
 
 from __future__ import annotations
 
+from bisect import bisect_left, bisect_right
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 import hashlib
@@ -739,6 +740,151 @@ def advisory_lead_groups(records: Sequence[Mapping[str, Any]]) -> list[dict[str,
     return list(groups.values())
 
 
+def _retained_scalar_key(value: Any) -> tuple[str, str] | None:
+    if type(value) not in (str, int, float, bool) or isinstance(value, float) and not math.isfinite(value):
+        return None
+    return type(value).__name__, json.dumps(value, ensure_ascii=False)
+
+
+def retained_field_counts(
+    rows: Sequence[Mapping[str, Any]],
+    fields: Sequence[str] = ("host", "user", "src_ip", "dest_ip", "process_guid", "process", "session_id"),
+) -> list[dict[str, Any]]:
+    """Count typed native values, preserving missing and ambiguous observations."""
+    counts = []
+    for field in dict.fromkeys(fields):
+        values: set[tuple[str, str]] = set()
+        single_values: set[tuple[str, str]] = set()
+        missing = ambiguous = 0
+        for item in rows:
+            value = item["selected_result"].get(field)
+            members = value if isinstance(value, (list, tuple)) else [value]
+            keys = {key for member in members if (key := _retained_scalar_key(member)) is not None}
+            values.update(keys)
+            if not keys:
+                missing += 1
+            elif len(keys) == 1:
+                single_values.update(keys)
+            else:
+                ambiguous += 1
+        counts.append({"field": field, "distinct_literal_value_count": len(values),
+                       "distinct_unambiguous_value_count": len(single_values),
+                       "rows_with_missing_or_nonscalar_value": missing, "rows_with_multiple_distinct_values": ambiguous})
+    return counts
+
+
+def retained_lead_activity(results: Mapping[str, Any]) -> dict[str, Any]:
+    """Attach retained facts to application-materialized leads, independent of findings.
+
+    Shared literal scopes are indexed once, not expanded per question or lead.
+    A matching host/process GUID or host/user/session is review context, not
+    proof of identity, a process lifetime, causation or source completeness.
+    """
+    leads: dict[str, dict[str, Any]] = {}
+    for answer in results.get("question_answers", []):
+        for lead in answer.get("lead_coverage", []):
+            identifiers = lead.get("lead_evidence_ids", [])
+            if identifiers:
+                leads.setdefault(str(identifiers[0]), {
+                    "lead_evidence_ids": list(identifiers), "identity_fields": dict(lead["identity_fields"]),
+                    "anchor_event_time_utc": None, "scopes": [], "limitation": None,
+                })
+    if not leads:
+        return {"leads": [], "scopes": []}
+    evidence = {str(row.get("evidence_id")): row for row in results.get("evidence", [])
+                if isinstance(row, Mapping) and row.get("evidence_kind", "raw_event") == "raw_event"
+                and isinstance(row.get("selected_result"), Mapping)}
+    timeline = retained_timeline(results)
+    scopes: dict[tuple[tuple[str, str], ...], dict[str, Any]] = {}
+    scope_rows: dict[str, list[Mapping[str, Any]]] = {}
+    anchors: dict[str, datetime | None] = {}
+    for identifier, lead in leads.items():
+        originals = [evidence[ref] for ref in lead["lead_evidence_ids"] if ref in evidence]
+        times = [stamp for row in originals if (stamp := raw_event_time(row)) is not None]
+        anchor = min(times) if times else None
+        anchors[identifier] = anchor
+        lead["anchor_event_time_utc"] = canonical_utc(anchor) if anchor else None
+        identity = lead["identity_fields"]
+        if not originals:
+            lead["limitation"] = "Original lead records are unavailable; related activity cannot be selected."
+            continue
+        event = originals[0]["selected_result"]
+        if any(
+            field in event and (not isinstance(event[field], str) or event[field] != identity.get(field))
+            for field in ("host", "process_guid", "user", "session_id")
+        ):
+            lead["limitation"] = "Missing or ambiguous native identity prevents an exact related-record selection. Original observations remain in the timeline."
+            continue
+        filters = [identity] if {"host", "process_guid"}.issubset(identity) else []
+        if {"host", "user", "session_id"}.issubset(identity):
+            filters.append({field: identity[field] for field in ("host", "user", "session_id")})
+        if not filters:
+            lead["limitation"] = "Native fields do not identify an exact process or session selection. Original observations remain in the timeline."
+        elif "process_guid" not in identity:
+            lead["limitation"] = "Process identity is unavailable; only the recorded host, user and session context is selected."
+        for selected in filters:
+            key = tuple(sorted(selected.items()))
+            if key not in scopes:
+                scope_id = f"scope_{len(scopes) + 1}"
+                scopes[key] = {"scope_id": scope_id, "identity_fields": dict(selected)}
+                scope_rows[scope_id] = []
+            lead["scopes"].append({"scope_id": scopes[key]["scope_id"]})
+    # At most five field combinations: host/GUID with optional user/session,
+    # plus host/user/session. This avoids scanning every record for every lead.
+    shapes = {tuple(field for field, _ in key) for key in scopes}
+    for reference in timeline:
+        row = evidence.get(reference["evidence_id"])
+        if row is None:
+            continue
+        event = row["selected_result"]
+        for fields in shapes:
+            if all(isinstance(event.get(field), str) for field in fields):
+                scope = scopes.get(tuple((field, event[field]) for field in fields))
+                if scope is not None:
+                    scope_rows[scope["scope_id"]].append(row)
+    query_by_id = {str(query.get("query_id")): query for query in results.get("queries", [])}
+    scope_times: dict[str, list[datetime]] = {}
+    for scope in scopes.values():
+        rows = scope_rows[scope["scope_id"]]
+        times = [stamp for row in rows if (stamp := raw_event_time(row)) is not None]
+        scope_times[scope["scope_id"]] = times
+        actions: dict[str | None, list[Mapping[str, Any]]] = {}
+        queries: dict[str, int] = {}
+        for row in rows:
+            action = row["selected_result"].get("action")
+            action = action if isinstance(action, str) and action.strip() else None
+            actions.setdefault(action, []).append(row)
+            query_id = str(row.get("query_id", "unknown"))
+            queries[query_id] = queries.get(query_id, 0) + 1
+        coverage = []
+        for query_id, count in queries.items():
+            query = query_by_id.get(query_id, {})
+            status = "incomplete" if query and query_results_incomplete(query) else "complete" if query.get("status") == "completed" else "unknown"
+            coverage.append({"query_id": query_id, "retrieval_status": status, "matching_raw_record_count": count,
+                             "earliest_utc": query.get("earliest_utc"), "latest_utc": query.get("latest_utc")})
+        scope.update(evidence_ids=[str(row["evidence_id"]) for row in rows], raw_record_count=len(rows),
+                     time_bounds=evidence_time_bounds(rows), fields=retained_field_counts(rows), query_coverage=coverage,
+                     actions=[{"action": action, "raw_record_count": len(group), **evidence_time_bounds(group)}
+                              for action, group in actions.items()])
+    for identifier, lead in leads.items():
+        anchor = anchors[identifier]
+        for selected in lead["scopes"]:
+            rows, times = scope_rows[selected["scope_id"]], scope_times[selected["scope_id"]]
+            left = bisect_left(times, anchor) if anchor is not None else 0
+            right = bisect_right(times, anchor) if anchor is not None else 0
+            periods = []
+            for period, start, end in (("before", 0, left), ("at", left, right), ("after", right, len(times))):
+                if anchor is not None and end > start:
+                    periods.append({"relative_to_lead": period, "raw_record_count": end - start,
+                                    "first_event_time_utc": canonical_utc(times[start]), "last_event_time_utc": canonical_utc(times[end - 1])})
+            unknown = len(rows) - len(times) if anchor is not None else len(rows)
+            if unknown:
+                periods.append({"relative_to_lead": "unknown", "raw_record_count": unknown,
+                                "first_event_time_utc": None, "last_event_time_utc": None})
+            selected["periods"] = periods
+    return {"leads": list(leads.values()), "scopes": list(scopes.values())}
+
+
 def lookup_retained_evidence(
     results: Mapping[str, Any], *, query_ids: set[str],
     filters: Mapping[str, Any] | None = None,
@@ -772,12 +918,7 @@ def lookup_retained_evidence(
     if any(not isinstance(field, str) or not field.strip() for field in (*filters, *distinct_fields)):
         raise Validation("retained evidence lookup field names must be nonempty strings")
 
-    def scalar_key(value: Any) -> tuple[str, str] | None:
-        if type(value) not in (str, int, float, bool) or isinstance(value, float) and not math.isfinite(value):
-            return None
-        return type(value).__name__, json.dumps(value, ensure_ascii=False)
-
-    if any(scalar_key(value) is None for value in filters.values()):
+    if any(_retained_scalar_key(value) is None for value in filters.values()):
         raise Validation("retained evidence lookup filters require finite scalar values")
 
     retained = [item for item in results.get("evidence", [])
@@ -795,7 +936,7 @@ def lookup_retained_evidence(
         event = item.get("selected_result", {})
         if not isinstance(event, Mapping):
             continue
-        if any(scalar_key(value) not in {scalar_key(member) for member in (
+        if any(_retained_scalar_key(value) not in {_retained_scalar_key(member) for member in (
             event[field] if isinstance(event.get(field), (list, tuple)) else [event.get(field)]
         )} for field, value in filters.items()):
             continue
@@ -809,25 +950,7 @@ def lookup_retained_evidence(
         matching.append((stamp, position, item))
     matching.sort(key=lambda item: (item[0] is None, item[0] or datetime.max.replace(tzinfo=timezone.utc), item[1]))
     rows = [item[2] for item in matching]
-    counts = []
-    for field in dict.fromkeys(distinct_fields):
-        values: set[tuple[str, str]] = set()
-        single_values: set[tuple[str, str]] = set()
-        missing = ambiguous = 0
-        for item in rows:
-            value = item["selected_result"].get(field)
-            members = value if isinstance(value, (list, tuple)) else [value]
-            keys = {key for member in members if (key := scalar_key(member)) is not None}
-            values.update(keys)
-            if not keys:
-                missing += 1
-            elif len(keys) == 1:
-                single_values.update(keys)
-            else:
-                ambiguous += 1
-        counts.append({"field": field, "distinct_literal_value_count": len(values),
-                       "distinct_unambiguous_value_count": len(single_values),
-                       "rows_with_missing_or_nonscalar_value": missing, "rows_with_multiple_distinct_values": ambiguous})
+    counts = retained_field_counts(rows, distinct_fields)
     inventory = {
         "scope": {"query_ids": sorted(query_ids), "filters": filters,
                   "earliest_utc": canonical_utc(earliest_utc) if earliest_utc else None,

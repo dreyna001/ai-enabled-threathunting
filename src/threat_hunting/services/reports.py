@@ -28,7 +28,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from threat_hunting.domain.contracts import HuntPlan, RetainedInventory
 from threat_hunting.domain.errors import Validation
-from threat_hunting.services.evidence import evidence_time_bounds, query_source_coverage, retained_timeline
+from threat_hunting.services.evidence import evidence_time_bounds, query_source_coverage, retained_lead_activity, retained_timeline
 
 from sqlalchemy import text
 
@@ -624,6 +624,8 @@ def _validate_report_content(content: Mapping[str, Any], results: Mapping[str, A
     for key, limit in REPORT_LIST_LIMITS.items():
         if len(normalized[key]) > limit:
             raise Validation(f"report section {key!r} exceeds the {limit}-item limit")
+    if "observed_activity" in normalized and json.dumps(normalized["observed_activity"], sort_keys=True) != json.dumps(_observed_activity_report(results or {}), sort_keys=True):
+        raise Validation("report observed activity must match the retained records")
     if "question_answers" in (results or {}) or "question_answers" in normalized:
         answers = normalized.get("question_answers")
         if not isinstance(answers, list):
@@ -666,6 +668,21 @@ def _validate_report_content(content: Mapping[str, Any], results: Mapping[str, A
     if any(not isinstance(item, dict) or set(item).difference(REPORT_QUERY_FIELDS) for item in normalized["query_appendix"]):
         raise Validation("query appendix must contain query summaries only")
     return normalized
+
+
+def _observed_activity_report(results: Mapping[str, Any]) -> dict[str, Any]:
+    """Include scoped factual summaries without copying every retained reference."""
+    activity = retained_lead_activity(results)
+    leads = activity["leads"][:REPORT_FINDING_DETAIL_TARGET]
+    selected = {item["scope_id"] for lead in leads for item in lead["scopes"]}
+    scopes = []
+    for scope in activity["scopes"]:
+        if scope["scope_id"] in selected:
+            scopes.append({**{key: value for key, value in scope.items() if key not in {"evidence_ids", "actions"}},
+                           "actions": scope["actions"][:REPORT_LIST_LIMITS["timeline"]],
+                           "total_action_groups": len(scope["actions"])})
+    return {"leads": leads, "scopes": scopes, "total_lead_count": len(activity["leads"]),
+            "limitation": "Application-calculated retained observations, independent of model findings. Exact literal matches are review context, not proven identity or causation. Counts describe raw representations, not unique events or affected entities. Unknown times do not establish a temporal relationship. Each search has its own retrieval scope; no retained match does not prove source absence. Do not add overlapping scope counts. The full activity view is available in hunt results."}
 
 
 def _concise_report_content(
@@ -786,6 +803,7 @@ def _concise_report_content(
             f"{conclusion_and_disposition.rstrip()} "
             "Investigation coverage is limited; the full blast radius is not established."
         )
+    observed_activity = _observed_activity_report(results)
     return {
         "hypothesis": hypothesis,
         "objective_and_scope": objective,
@@ -799,6 +817,7 @@ def _concise_report_content(
         "query_appendix": queries,
         **({"question_answers": question_answers}
            if "question_answers" in results else {}),
+        **({"observed_activity": observed_activity} if observed_activity["total_lead_count"] else {}),
     }
 
 
@@ -944,6 +963,32 @@ def _inventory_text(inventory: Mapping[str, Any]) -> list[str]:
     ]
 
 
+def _observed_activity_text(activity: Mapping[str, Any]) -> list[str]:
+    scopes = {scope["scope_id"]: scope for scope in activity["scopes"]}
+    lines = [f"Showing {len(activity['leads'])} of {activity['total_lead_count']} retained lead groups.", activity["limitation"]]
+    for lead in activity["leads"]:
+        lines.append("Lead identity: " + "; ".join(f"{key}={value}" for key, value in lead["identity_fields"].items()))
+        lines.append(f"Lead observation: {lead['anchor_event_time_utc'] or 'unknown time'}; reference {lead['lead_evidence_ids'][0]}. The anchor is not necessarily a process start.")
+        if lead["limitation"]:
+            lines.append(lead["limitation"])
+        for selection in lead["scopes"]:
+            scope = scopes[selection["scope_id"]]
+            lines.append("Literal selection: " + "; ".join(f"{key}={value}" for key, value in scope["identity_fields"].items()))
+            lines.append(f"{scope['raw_record_count']} retained raw records. " + "; ".join(
+                f"{period['relative_to_lead']}: {period['raw_record_count']} ({period['first_event_time_utc'] or 'unknown'} to {period['last_event_time_utc'] or 'unknown'})"
+                for period in selection["periods"]))
+            lines.append(f"Observed actions ({len(scope['actions'])} of {scope['total_action_groups']} groups shown): " + "; ".join(
+                f"{item['action'] or 'unknown action'}: {item['raw_record_count']}, {item['first_observed_utc']} to {item['last_observed_utc']}"
+                for item in scope["actions"]))
+            lines.append("Distinct literal values (missing / multivalue rows): " + "; ".join(
+                f"{item['field']}={item['distinct_literal_value_count']} ({item['rows_with_missing_or_nonscalar_value']} / {item['rows_with_multiple_distinct_values']})"
+                for item in scope["fields"]))
+            lines.append("Source retrieval: " + "; ".join(
+                f"{item['query_id']} {item['retrieval_status']}, {item['matching_raw_record_count']} matching retained rows, window {item['earliest_utc'] or 'unknown'} to {item['latest_utc'] or 'unknown'}"
+                for item in scope["query_coverage"]))
+    return lines
+
+
 def _formatted_pdf(title: str, content: Mapping[str, Any]) -> bytes:
     """Render the bounded report contract as a readable, paginated PDF."""
 
@@ -970,6 +1015,7 @@ def _formatted_pdf(title: str, content: Mapping[str, Any]) -> bytes:
         ("Objective and scope", "objective_and_scope"),
         ("Data sources used", "data_sources_used"),
         ("Approved question answers", "question_answers"),
+        ("Observed activity by lead", "observed_activity"),
         ("Findings", "findings"),
         ("Selected evidence citations", "selected_evidence"),
         ("Entities", "entities"),
@@ -978,7 +1024,10 @@ def _formatted_pdf(title: str, content: Mapping[str, Any]) -> bytes:
         ("Conclusion and disposition", "conclusion_and_disposition"),
         ("Query appendix", "query_appendix"),
     ):
-        if key == "question_answers":
+        if key == "observed_activity":
+            if content.get(key):
+                lines.extend(section(heading, _observed_activity_text(content[key])))
+        elif key == "question_answers":
             for answer in content.get(key, []):
                 lines.extend(section("Approved question answer", _question_answer_text(answer)))
         elif key == "findings":

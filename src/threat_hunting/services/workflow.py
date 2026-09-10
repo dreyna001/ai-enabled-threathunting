@@ -36,7 +36,7 @@ from threat_hunting.services.orchestration import (
 )
 from threat_hunting.services.jobs import JobConflict, JobService
 from threat_hunting.services.threat_intel import query_ioc_context, intelligence_sources, validate_intelligence_refs
-from threat_hunting.services.evidence import query_source_coverage, retained_timeline
+from threat_hunting.services.evidence import query_source_coverage, retained_lead_activity, retained_timeline
 from threat_hunting.services.uploads import UploadLimits
 
 
@@ -1951,6 +1951,7 @@ class WorkflowService:
             raise Conflict("hunt results are not available")
         results = _json_copy(row["results"])
         results["timeline"] = retained_timeline(results)
+        results["lead_activity"] = retained_lead_activity(results)
         return results
 
     def report(self, owner_id: str, hunt_id: str) -> dict[str, Any]:
@@ -1965,6 +1966,8 @@ class WorkflowService:
             raise Conflict("finalized reports cannot be edited")
         if row["report_version"] != expected_version:
             raise Conflict("report version is stale")
+        if "observed_activity" in (row["report_content"] or {}) and "observed_activity" not in content:
+            raise Validation("report observed activity cannot be removed")
         normalized = _validate_report_content(content, row["results"])
         self._update(owner_id, hunt_id, expected_state=HuntState.REPORT_DRAFT.value, expected_report_state=HuntState.REPORT_DRAFT.value, expected_report_version=expected_version, report_content=normalized, report_version=expected_version + 1, updated_at_utc=_now())
         return self.report(owner_id, hunt_id)

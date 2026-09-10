@@ -37,6 +37,14 @@ code, pre, .vs-code { font-family: "Roboto Mono", ui-monospace, monospace; }
 .vs-code { font-size: 0.78rem; }
 pre { max-height: 18rem; overflow: auto; padding: 0.75rem; border: 1px solid #30363d; background: #0d1117; white-space: pre-wrap; }
 .vs-inventory { min-width: 0; overflow-wrap: anywhere; }
+.vs-lead-activity { min-width: 0; overflow-wrap: anywhere; border-bottom: 1px solid #30363d; padding-bottom: 1rem; margin-bottom: 1rem; }
+.vs-lead-activity label { display: grid; gap: 0.4rem; margin: 1rem 0; font-weight: 600; }
+.vs-lead-activity select { max-width: 100%; width: 100%; padding: 0.65rem; border: 1px solid #30363d; border-radius: 2px; background: #0d1117; color: #e6edf3; font: inherit; color-scheme: dark; }
+.vs-lead-activity select:focus-visible { outline: 3px solid #8cbcff; outline-offset: 2px; }
+.vs-lead-activity .vs-timeline table { min-width: 65rem; }
+.vs-lead-activity .vs-timeline td:nth-child(3) { white-space: nowrap; }
+.vs-lead-activity .vs-timeline td:nth-child(4) { min-width: 10rem; }
+.vs-lead-activity .vs-timeline td:nth-child(5), .vs-lead-activity .vs-timeline td:nth-child(6) { min-width: 8rem; }
 .vs-inventory .table-wrap { max-width: 100%; overflow-x: auto; }
 .vs-inventory table { width: 100%; min-width: 36rem; border-collapse: collapse; }
 .vs-inventory th, .vs-inventory td { padding: 0.5rem; border-bottom: 1px solid #30363d; text-align: left; }

@@ -41,6 +41,39 @@ describe("observed timeline presentation", () => {
 });
 
 describe("question answer presentation", () => {
+  it("shows application-owned lead activity with before and after records even without findings", () => {
+    const evidence = ["before", "lead", "after"].map((id, index) => ({ evidence_id: id,
+      event_time_utc: `2026-01-06T${String(index + 8).padStart(2, "0")}:00:00Z`, selected_result: { action: id === "lead" ? "process_start" : "dns_query", host: "<host>", process: "browser" } }));
+    const results: HuntResults = { findings: [], evidence, entities: [], timeline: evidence.map((row) => ({
+      evidence_id: row.evidence_id, event_time_utc: row.event_time_utc, query_coverage: "incomplete" })),
+      question_answers: [{ question_id: "q1", question: "What happened?", summary: "No model interpretation.", finding_ids: [], limitations: ["Unanswered."],
+        lead_coverage: [{ lead_evidence_ids: ["lead"], identity_fields: { host: "<host>", process_guid: "native" }, finding_ids: [], limitation: "Unanswered." }] }],
+      lead_activity: { leads: [{ lead_evidence_ids: ["lead"], identity_fields: { host: "<host>", process_guid: "native" },
+        anchor_event_time_utc: "2026-01-06T09:00:00Z", limitation: null, scopes: [{ scope_id: "session", periods: [
+          { relative_to_lead: "before", raw_record_count: 1, first_event_time_utc: "2026-01-06T08:00:00Z", last_event_time_utc: "2026-01-06T08:00:00Z" },
+          { relative_to_lead: "after", raw_record_count: 1, first_event_time_utc: "2026-01-06T10:00:00Z", last_event_time_utc: "2026-01-06T10:00:00Z" }] }] }],
+        scopes: [{ scope_id: "session", identity_fields: { host: "<host>", user: "user", session_id: "native-session" },
+          evidence_ids: evidence.map((row) => row.evidence_id), raw_record_count: 3, fields: [],
+          actions: [{ action: "dns_query", raw_record_count: 2, first_observed_utc: "2026-01-06T08:00:00Z", last_observed_utc: "2026-01-06T10:00:00Z" }],
+          query_coverage: [{ query_id: "complete-q", retrieval_status: "complete", matching_raw_record_count: 1, earliest_utc: null, latest_utc: null },
+            { query_id: "partial-q", retrieval_status: "incomplete", matching_raw_record_count: 2, earliest_utc: null, latest_utc: null }] }] } };
+    const markup = renderToStaticMarkup(<QuestionAnswers results={results} />);
+    expect(markup).toContain("Observed activity for the retained leads");
+    expect(markup).toContain("3 retained raw records match every selected field");
+    expect(markup).toContain("before: 1 records");
+    expect(markup).toContain("after: 1 records");
+    expect(markup).toContain("dns_query: 2 records");
+    expect(markup).toContain("Search complete-q: complete");
+    expect(markup).toContain("Search partial-q: incomplete");
+    expect(markup).toContain("native-session");
+    expect(markup).toContain("Review observed activity for this lead");
+    expect(markup).toContain('href="#evidence-before"');
+    expect(markup).toContain('href="#evidence-after"');
+    expect(markup).toContain("<td>Before</td>");
+    expect(markup).toContain("<td>After</td>");
+    expect(markup).not.toContain("<host>");
+  });
+
   it("keeps every finding accessible behind a collapsed question summary", () => {
     const findings = Array.from({ length: 2000 }, (_, i) => ({ finding_id: `finding-${i}`, statement: `Observation ${i}` }));
     const results: HuntResults = {
