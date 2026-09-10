@@ -327,7 +327,10 @@ def prepare_model_context(payload: Any, name: str) -> tuple[Any, ReferenceLabels
         for lead in payload["advisory_leads"]:
             lead["record_index"] = []
             identity = lead["identity_fields"]
-            event = source_by_id[lead["lead_evidence_id"]].get("selected_result", {})
+            anchor_row = source_by_id[lead["lead_evidence_id"]]
+            anchor = raw_event_time(anchor_row)
+            lead["anchor_event_time_utc"] = anchor.isoformat().replace("+00:00", "Z") if anchor else None
+            event = anchor_row.get("selected_result", {})
             if not {"host", "process_guid"}.issubset(identity) or any(
                 field in event and field not in identity for field in ("host", "process_guid", "user", "session_id")
             ):
@@ -336,21 +339,40 @@ def prepare_model_context(payload: Any, name: str) -> tuple[Any, ReferenceLabels
             if {"host", "user", "session_id"}.issubset(identity):
                 scopes.append({field: identity[field] for field in ("host", "user", "session_id")})
             for filters in scopes:
-                actions: dict[str | None, list[str]] = {}
+                periods: dict[str, dict[str | None, dict[str, Any]]] = {
+                    period: {} for period in ("before", "at", "after", "unknown")
+                }
                 for row in chronological:
                     observed = row.get("selected_result", {})
                     if all(observed.get(field) == value for field, value in filters.items()):
+                        stamp = raw_event_time(row)
+                        period = "unknown" if anchor is None or stamp is None else (
+                            "before" if stamp < anchor else "after" if stamp > anchor else "at"
+                        )
                         action = observed.get("action")
                         action = action if isinstance(action, str) and action.strip() else None
-                        actions.setdefault(action, []).append(str(row["evidence_id"]))
-                lead["record_index"].append({"filters": filters, "actions": [
-                    {"action": action, "evidence_ids": identifiers} for action, identifiers in actions.items()
+                        timestamp = stamp.isoformat().replace("+00:00", "Z") if stamp else None
+                        group = periods[period].setdefault(action, {
+                            "action": action, "first_event_time_utc": timestamp,
+                            "last_event_time_utc": timestamp, "evidence_ids": [],
+                        })
+                        group["evidence_ids"].append(str(row["evidence_id"]))
+                        if timestamp is not None:
+                            group["last_event_time_utc"] = timestamp
+                lead["record_index"].append({"filters": filters, "periods": [
+                    {"relative_to_lead": period, "actions": list(actions.values())}
+                    for period, actions in periods.items() if actions
                 ]})
         payload["lead_index_rule"] = (
             "lead_evidence_id selects the earliest known-time advisory match in the supplied review group; "
             "it is not the group's only observation or proof of a process start. Review all its evidence_ids. "
-            "record_index lists supplied raw representation groups matching every literal filter, grouped by "
-            "observed action. References within each action are ordered by event time, with unknown times last; "
+            "record_index lists supplied raw representation groups matching every literal filter, grouped "
+            "before, at, or after anchor_event_time_utc, then by observed action. The unknown period means "
+            "the anchor or record timestamp is unavailable. Review each supplied period and action relevant "
+            "to the approved question, including surrounding process starts, module loads, process ends and "
+            "communications. References within each action are ordered by event time, with unknown times last. "
+            "First/last times bound known observations in that action and period, not continuous activity, "
+            "a process lifetime, or a proven causal sequence. Use source timestamps for individual events; "
             "null action means no unambiguous nonempty string action. Identical representations retain other "
             "citation origins in duplicate_references; different projections remain separate. These lists are "
             "navigation, not unique event counts, proven identity, causation, or complete source coverage. "
