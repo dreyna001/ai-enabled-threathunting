@@ -26,7 +26,7 @@ from typing import Any, Protocol
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from threat_hunting.domain.contracts import HuntPlan
+from threat_hunting.domain.contracts import HuntPlan, RetainedInventory
 from threat_hunting.domain.errors import Validation
 from threat_hunting.services.evidence import evidence_time_bounds, query_source_coverage
 
@@ -269,6 +269,16 @@ def validate_report_content(
                 raise ReportValidationError("question lead coverage requires observed identity fields and findings or a limitation")
             if available_finding_ids is not None and not set(answer["finding_ids"]).issubset(available_finding_ids):
                 raise ReportValidationError("question answer references unavailable findings")
+            inventories = answer.get("inventories", [])
+            if not isinstance(inventories, list) or len(inventories) > 3:
+                raise ReportValidationError("question inventories must be a bounded array")
+            for inventory in inventories:
+                try:
+                    measured = RetainedInventory.model_validate(inventory)
+                except ValueError as exc:
+                    raise ReportValidationError("question inventory has invalid scope or quantities") from exc
+                if available_query_ids is not None and not set(measured.scope.query_ids).issubset(available_query_ids):
+                    raise ReportValidationError("question inventory references unavailable queries")
     if str(normalized.get("disposition")) == "supported" and not normalized["evidence_ids"]:
         raise ReportValidationError("supported reports require retained evidence citations")
     for entry in normalized["query_appendix"]:
@@ -622,7 +632,7 @@ def _validate_report_content(content: Mapping[str, Any], results: Mapping[str, A
         answered: set[str] = set()
         finding_ids = {str(item.get("finding_id")) for item in (results or {}).get("findings", normalized["findings"]) if isinstance(item, Mapping)}
         for answer in answers:
-            if not isinstance(answer, dict) or set(answer) - {"lead_coverage"} != {"question_id", "question", "summary", "finding_ids", "limitations"}:
+            if not isinstance(answer, dict) or set(answer) - {"lead_coverage", "inventories"} != {"question_id", "question", "summary", "finding_ids", "limitations"}:
                 raise Validation("report question answer has invalid fields")
             question_id = answer["question_id"]
             if (not isinstance(question_id, str) or not question_id.strip() or question_id in answered
@@ -641,6 +651,9 @@ def _validate_report_content(content: Mapping[str, Any], results: Mapping[str, A
             if "lead_coverage" in answer or "lead_coverage" in expected.get(question_id, {}):
                 if not expected or answer.get("lead_coverage") != expected[question_id].get("lead_coverage"):
                     raise Validation("report lead coverage must match the retained question answer")
+            if "inventories" in answer or "inventories" in expected.get(question_id, {}):
+                if not expected or json.dumps(answer.get("inventories"), sort_keys=True) != json.dumps(expected[question_id].get("inventories"), sort_keys=True):
+                    raise Validation("report inventories must match the retained question answer")
             answered.add(question_id)
         if expected and answered != set(expected):
             raise Validation("report question_answers must contain every approved question")
@@ -885,11 +898,28 @@ def _question_answer_text(answer: Mapping[str, Any]) -> list[str]:
         f"Answer: {answer['summary']}",
         f"{len(answer['finding_ids'])} finding(s) retained; full details are available in this hunt's results.",
         *(f"Limitation: {item}" for item in answer["limitations"]),
+        *(line for inventory in answer.get("inventories", []) for line in _inventory_text(inventory)),
         *("Advisory lead (observed identity fields): "
           + ("; ".join(f"{key.replace('_', ' ')}: {value}" for key, value in lead["identity_fields"].items()) or "Identity fields unavailable")
           + f". {len(lead['finding_ids'])} finding(s) linked."
           + (f" Unanswered or limited: {lead['limitation']}" if lead["limitation"] else " Analysis still requires review.")
           for lead in answer.get("lead_coverage", [])),
+    ]
+
+
+def _inventory_text(inventory: Mapping[str, Any]) -> list[str]:
+    scope = inventory["scope"]
+    filters = "; ".join(f"{item['field']} = {json.dumps(item['value'], ensure_ascii=False)}" for item in scope["filters"]) or "no additional field filters"
+    return [
+        f"Measured inventory: {inventory['raw_record_count']} retained raw rows. Repeated representations may remain.",
+        f"Selected search references: {', '.join(scope['query_ids'])}.",
+        f"Scope: {filters}; from {scope['earliest_utc'] or 'the selected search start'} to {scope['latest_utc'] or 'the selected search end'} (end excluded).",
+        *(f"{item['field'].replace('_', ' ')}: {item['distinct_literal_value_count']} distinct literal values; "
+          f"{item['distinct_unambiguous_value_count']} distinct values in unambiguous rows; "
+          f"{item['rows_with_missing_or_nonscalar_value']} rows missing a scalar value; "
+          f"{item['rows_with_multiple_distinct_values']} rows with multiple values."
+          for item in inventory["fields"]),
+        *(f"Inventory limitation: {item}" for item in inventory["limitations"]),
     ]
 
 

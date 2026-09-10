@@ -44,4 +44,21 @@ describe("question answer presentation", () => {
     expect(markup).not.toContain("<script>");
     expect(markup).not.toContain("<details open");
   });
+
+  it("shows computed scoped counts with missing values and source limitations", () => {
+    const markup = renderToStaticMarkup(<QuestionAnswers results={{ findings: [], evidence: [], entities: [], timeline: [],
+      question_answers: [{ question_id: "q1", question: "How many values?", summary: "Review the measured inventory.", finding_ids: [], limitations: [],
+        inventories: [{ scope: { query_ids: ["query-a"], filters: [{ field: "host", value: "<script>unsafe</script>" }], earliest_utc: null, latest_utc: null },
+          raw_record_count: 52,
+          fields: [{ field: "process_guid", distinct_literal_value_count: 1, distinct_unambiguous_value_count: 1,
+            rows_with_missing_or_nonscalar_value: 3, rows_with_multiple_distinct_values: 2 }],
+          limitations: ["Selected search retrieval is incomplete."] }] }] }} />);
+    expect(markup).toContain("View measured counts");
+    expect(markup).toContain("52 retained raw rows");
+    expect(markup).toContain('<th scope="row">process guid</th><td>1</td><td>1</td><td>3</td><td>2</td>');
+    expect(markup).toContain("Rows missing values");
+    expect(markup).toContain("retrieval is incomplete");
+    expect(markup).toContain("Do not add counts from overlapping selections");
+    expect(markup).not.toContain("<script>");
+  });
 });

@@ -8,6 +8,7 @@ import {
   JobStatus,
   JsonObject,
   ReportPreview,
+  RetainedInventory,
   Session,
   workflowApi,
 } from "./api/hunts";
@@ -168,6 +169,38 @@ function ResultCard({ title, items }: { title: string; items: JsonObject[] }) {
   );
 }
 
+function QuestionInventories({ inventories }: { inventories: RetainedInventory[] }) {
+  if (!inventories.length) return null;
+  return <details>
+    <summary>View measured counts</summary>
+    <p>Calculated from the selected retained records. Field values do not establish confirmed affected entities.</p>
+    {inventories.map((inventory) => <section className="vs-inventory" key={JSON.stringify(inventory.scope)}>
+      <p>{inventory.raw_record_count} retained raw rows. Repeated representations may remain.</p>
+      <details>
+        <summary>Show record selection</summary>
+        <p>Search references: {inventory.scope.query_ids.join(", ")}</p>
+        {inventory.scope.filters.length ? <dl>{inventory.scope.filters.map((filter) => <div key={filter.field}>
+          <dt>{filter.field.replaceAll("_", " ")}</dt><dd>{JSON.stringify(filter.value)}</dd>
+        </div>)}</dl> : <p>No additional field filters.</p>}
+        <p>From {inventory.scope.earliest_utc ?? "the selected search start"} to {inventory.scope.latest_utc ?? "the selected search end"} (end excluded).</p>
+      </details>
+      <div className="table-wrap" role="region" aria-label="Measured field counts" tabIndex={0}>
+        <table>
+          <caption>Observed field values in this selection</caption>
+          <thead><tr><th scope="col">Field</th><th scope="col">Distinct values</th><th scope="col">Unambiguous values</th><th scope="col">Rows missing values</th><th scope="col">Rows with multiple values</th></tr></thead>
+          <tbody>{inventory.fields.map((field) => <tr key={field.field}>
+            <th scope="row">{field.field.replaceAll("_", " ")}</th>
+            <td>{field.distinct_literal_value_count}</td><td>{field.distinct_unambiguous_value_count}</td>
+            <td>{field.rows_with_missing_or_nonscalar_value}</td><td>{field.rows_with_multiple_distinct_values}</td>
+          </tr>)}</tbody>
+        </table>
+      </div>
+      <p>Unambiguous values come from rows with one distinct scalar value. Do not add counts from overlapping selections.</p>
+      {!!inventory.limitations.length && <ul>{inventory.limitations.map((item, index) => <li key={index}>{item}</li>)}</ul>}
+    </section>)}
+  </details>;
+}
+
 export function QuestionAnswers({ results }: { results: HuntResults }) {
   if (!results.question_answers?.length) return null;
   const findings = new Map(results.findings.map((item) => [String(item.finding_id), item]));
@@ -179,6 +212,7 @@ export function QuestionAnswers({ results }: { results: HuntResults }) {
           <h3>{answer.question}</h3>
           <p>{answer.summary}</p>
           {answer.limitations.length > 0 && <ul>{answer.limitations.map((item, index) => <li key={`${answer.question_id}-${index}`}>{item}</li>)}</ul>}
+          <QuestionInventories inventories={answer.inventories ?? []} />
           {!!answer.lead_coverage?.length && <details>
             <summary>Review {answer.lead_coverage.length} advisory leads for this question</summary>
             <p>Observed identity fields group records for review. Linked findings still require analyst review.</p>

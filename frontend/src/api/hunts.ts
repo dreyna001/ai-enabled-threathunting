@@ -65,6 +65,24 @@ export interface HuntSummary {
   updated_at_utc: string;
 }
 
+export interface RetainedInventory {
+  scope: {
+    query_ids: string[];
+    filters: Array<{ field: string; value: string | number | boolean }>;
+    earliest_utc: string | null;
+    latest_utc: string | null;
+  };
+  raw_record_count: number;
+  fields: Array<{
+    field: string;
+    distinct_literal_value_count: number;
+    distinct_unambiguous_value_count: number;
+    rows_with_missing_or_nonscalar_value: number;
+    rows_with_multiple_distinct_values: number;
+  }>;
+  limitations: string[];
+}
+
 export interface HuntResults {
   findings: JsonObject[];
   evidence: JsonObject[];
@@ -76,6 +94,7 @@ export interface HuntResults {
     summary: string;
     finding_ids: string[];
     limitations: string[];
+    inventories?: RetainedInventory[];
     lead_coverage?: Array<{
       lead_evidence_ids: string[];
       identity_fields: Record<string, string>;

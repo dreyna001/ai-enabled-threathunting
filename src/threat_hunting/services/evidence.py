@@ -719,6 +719,7 @@ def lookup_retained_evidence(
     earliest_utc: datetime | None = None, latest_utc: datetime | None = None,
     offset: int = 0, limit: int = 500, max_rows: int = 500,
     distinct_fields: Sequence[str] = ("host", "user", "src_ip", "dest_ip", "process_guid", "process", "session_id"),
+    include_records: bool = True,
 ) -> dict[str, Any]:
     """Look up raw retained rows without changing search or retention metadata.
 
@@ -726,6 +727,8 @@ def lookup_retained_evidence(
     fields. Counts describe the matching retained subset, never incident scope.
     The caller supplies the already owner-scoped hunt state; no external query
     or database access is performed here.
+    With include_records=False, return inventory metadata without materializing
+    copied/compacted record pages or claiming a representation-group count.
     """
 
     completed = {str(item["query_id"]): item for item in results.get("queries", [])
@@ -799,11 +802,7 @@ def lookup_retained_evidence(
         counts.append({"field": field, "distinct_literal_value_count": len(values),
                        "distinct_unambiguous_value_count": len(single_values),
                        "rows_with_missing_or_nonscalar_value": missing, "rows_with_multiple_distinct_values": ambiguous})
-    effective_limit = min(limit, max_rows)
-    compacted = compact_evidence_records(rows, list(completed.values()))
-    page = compacted[offset:offset + effective_limit]
-    next_offset = offset + len(page)
-    return {
+    inventory = {
         "scope": {"query_ids": sorted(query_ids), "filters": filters,
                   "earliest_utc": canonical_utc(earliest_utc) if earliest_utc else None,
                   "latest_utc": canonical_utc(latest_utc) if latest_utc else None},
@@ -813,16 +812,25 @@ def lookup_retained_evidence(
                             "available_result_count": completed[query_id].get("available_result_count"),
                             "retrieval_stop_reason": completed[query_id].get("retrieval_stop_reason")}
                            for query_id in sorted(query_ids)],
-        "matching_raw_record_count": len(rows), "matching_representation_group_count": len(compacted),
+        "matching_raw_record_count": len(rows),
         "aggregate_rows_excluded": aggregate_rows,
         "unobserved_filter_fields": unobserved_filter_fields,
         "unknown_time_rows_excluded_by_window": unknown_time_excluded,
         "observed_time_bounds": evidence_time_bounds(rows), "distinct_fields": counts,
+        "limitation": "Counts cover matching retained raw rows and literal field values, not all source events or confirmed affected entities. Multivalue fields remain ambiguous. Repeated records do not increase distinct literal counts. Missing values and truncated searches prevent complete scope claims."
+                      + (" A filter field was not observed in the retained raw records; zero matches does not establish absence in the searched source." if unobserved_filter_fields else ""),
+    }
+    if not include_records:
+        return inventory
+    effective_limit = min(limit, max_rows)
+    compacted = compact_evidence_records(rows, list(completed.values()))
+    page = compacted[offset:offset + effective_limit]
+    next_offset = offset + len(page)
+    return inventory | {
+        "matching_representation_group_count": len(compacted),
         "offset": offset, "effective_limit": effective_limit,
         "next_offset": next_offset if next_offset < len(compacted) else None,
         "records": [_json_value(item) for item in page],
-        "limitation": "Counts cover matching retained raw rows and literal field values, not all source events or confirmed affected entities. Multivalue fields remain ambiguous. Repeated records do not increase distinct literal counts. Missing values and truncated searches prevent complete scope claims."
-                      + (" A filter field was not observed in the retained raw records; zero matches does not establish absence in the searched source." if unobserved_filter_fields else ""),
     }
 
 

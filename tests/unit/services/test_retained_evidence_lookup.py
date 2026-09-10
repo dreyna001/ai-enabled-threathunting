@@ -112,14 +112,30 @@ def test_time_spread_preserves_query_source_and_indicator_priorities():
     assert {row["evidence_id"] for row in rows} == {"e3", "e8", "other"}
 
 
-def test_synthesis_receives_full_retained_counts_separately_from_its_small_sample():
+def test_full_retained_counts_remain_available_without_synthesis_transcription():
     state = results()
     plan = SimpleNamespace(hypothesis="h", objective="o", questions=[], scope=SimpleNamespace(model_dump=lambda **_: {}))
     context = _synthesis_context(plan=plan, threat_intelligence="", results=state, limit=3)
     assert len(context["retained_evidence"]) == 3
-    inventory = context["retained_query_inventories"][0]
+    assert "retained_query_inventories" not in context
+    inventory = lookup_retained_evidence(state, query_ids={state["queries"][0]["query_id"]}, limit=1)
     assert inventory["matching_raw_record_count"] == 9
     assert inventory["query_coverage"][0]["query_truncated"] is True
-    assert "records" not in inventory
+    assert len(inventory["records"]) == 1
     assert next(item for item in inventory["distinct_fields"] if item["field"] == "host")["distinct_literal_value_count"] == 2
     assert context["evidence_coverage"][0]["supplied_evidence_count"] == 3
+
+
+def test_inventory_only_lookup_does_not_materialize_raw_record_pages(monkeypatch):
+    state = results()
+    original = deepcopy(state)
+
+    def cannot_materialize(*args, **kwargs):
+        raise AssertionError("Counting must not build copies of raw record pages")
+
+    monkeypatch.setattr("threat_hunting.services.evidence.compact_evidence_records", cannot_materialize)
+    measured = lookup_retained_evidence(state, query_ids={"q1"}, include_records=False)
+    assert measured["matching_raw_record_count"] == 9
+    assert next(item for item in measured["distinct_fields"] if item["field"] == "host")["distinct_literal_value_count"] == 2
+    assert "records" not in measured and "matching_representation_group_count" not in measured
+    assert state == original

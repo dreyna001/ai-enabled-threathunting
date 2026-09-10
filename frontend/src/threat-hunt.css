@@ -36,6 +36,10 @@ code, pre, .vs-code { font-family: "Roboto Mono", ui-monospace, monospace; }
 .vs-card textarea { max-height: 18rem; overflow: auto; resize: vertical; }
 .vs-code { font-size: 0.78rem; }
 pre { max-height: 18rem; overflow: auto; padding: 0.75rem; border: 1px solid #30363d; background: #0d1117; white-space: pre-wrap; }
+.vs-inventory { min-width: 0; overflow-wrap: anywhere; }
+.vs-inventory .table-wrap { max-width: 100%; overflow-x: auto; }
+.vs-inventory table { width: 100%; min-width: 36rem; border-collapse: collapse; }
+.vs-inventory th, .vs-inventory td { padding: 0.5rem; border-bottom: 1px solid #30363d; text-align: left; }
 .vs-actions { display: flex; flex-wrap: wrap; gap: 0.6rem; margin-top: 1rem; }
 .vs-badge, .vs-card header > span { padding: 0.35rem 0.55rem; border: 1px solid #30363d; background: #1c2129; color: #8cbcff; text-transform: capitalize; }
 .vs-error, .vs-warning { padding: 0.75rem; border: 1px solid; }

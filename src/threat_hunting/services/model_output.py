@@ -255,6 +255,7 @@ def structured_response_format(contract: Any, name: str, references: ReferenceLa
         if answer_name not in schema.get("$defs", {}):
             continue
         definition = schema["$defs"][answer_name]
+        definition["properties"]["inventory_scopes"]["maxItems"] = 3
         variants = []
         for required_field in ("findings", "limitations"):
             variant = deepcopy(definition)
@@ -270,6 +271,7 @@ def structured_response_format(contract: Any, name: str, references: ReferenceLa
             retrieval["properties"]["retained_evidence_requests"].update(minItems=1, maxItems=3)
             retrieval["properties"]["findings"]["maxItems"] = 0
             retrieval["properties"]["lead_coverage"]["maxItems"] = 0
+            retrieval["properties"]["inventory_scopes"]["maxItems"] = 0
             retrieval["properties"]["limitations"]["minItems"] = 1
             variants.append(retrieval)
         schema["$defs"][answer_name] = {"anyOf": variants}
@@ -302,6 +304,7 @@ def prepare_model_context(payload: Any, name: str) -> tuple[Any, ReferenceLabels
     )
     references = ReferenceLabels.from_context(payload)
     if name == "QuestionSynthesis":
+        payload.pop("retained_query_inventories", None)
         payload["advisory_leads"] = references.advisory_leads
         source_by_id = {str(row["evidence_id"]): row for row in references.evidence.values()}
         rows = {str(row["evidence_id"]): row for row in [

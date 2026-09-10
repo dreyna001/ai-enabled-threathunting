@@ -450,6 +450,65 @@ class FindingProposal(DomainModel):
         return self
 
 
+class RetainedEvidenceFilter(DomainModel):
+    """An exact typed comparison against already retained raw fields."""
+
+    field: Annotated[StrictStr, Field(min_length=1, max_length=128)]
+    value: StrictStr | StrictInt | StrictBool | Annotated[float, Field(strict=True, allow_inf_nan=False)]
+
+    @field_validator("field")
+    @classmethod
+    def validate_field_name(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("lookup filter field must be nonempty")
+        return value
+
+
+class RetainedEvidenceScope(DomainModel):
+    """A typed subset of retained raw rows, bounded by completed queries."""
+
+    query_ids: Annotated[list[Identifier], Field(min_length=1, max_length=50)]
+    filters: Annotated[list[RetainedEvidenceFilter], Field(max_length=8)] = Field(default_factory=list)
+    earliest_utc: UTCDateTime | None = None
+    latest_utc: UTCDateTime | None = None
+
+    @model_validator(mode="after")
+    def validate_lookup(self) -> "RetainedEvidenceScope":
+        if len(set(self.query_ids)) != len(self.query_ids):
+            raise ValueError("lookup query references must be unique")
+        if len({item.field for item in self.filters}) != len(self.filters):
+            raise ValueError("lookup filter fields must be unique")
+        if self.earliest_utc and self.latest_utc and self.earliest_utc >= self.latest_utc:
+            raise ValueError("lookup time window must increase")
+        return self
+
+
+class RetainedEvidenceRequest(RetainedEvidenceScope):
+    """A bounded local page; never a request to submit a new search."""
+
+    offset: Annotated[StrictInt, Field(ge=0, le=50_000)] = 0
+    limit: Annotated[StrictInt, Field(ge=1, le=500)] = 100
+
+
+class RetainedFieldCount(DomainModel):
+    """Application-computed literal counts, not incident entity counts."""
+
+    field: Identifier
+    distinct_literal_value_count: Annotated[StrictInt, Field(ge=0)]
+    distinct_unambiguous_value_count: Annotated[StrictInt, Field(ge=0)]
+    rows_with_missing_or_nonscalar_value: Annotated[StrictInt, Field(ge=0)]
+    rows_with_multiple_distinct_values: Annotated[StrictInt, Field(ge=0)]
+
+
+class RetainedInventory(DomainModel):
+    """An immutable measured subset stored beside a question answer."""
+
+    scope: RetainedEvidenceScope
+    raw_record_count: Annotated[StrictInt, Field(ge=0)]
+    fields: Annotated[list[RetainedFieldCount], Field(min_length=1, max_length=32)]
+    limitations: list[Identifier]
+
+
 class LeadCoverage(DomainModel):
     """Account for a supplied advisory lead without model-owned finding IDs."""
 
@@ -485,6 +544,13 @@ class QuestionAnswer(DomainModel):
         "not a limit on the findings or evidence retained for the investigation."
     ))
     findings: list[FindingProposal]
+    inventory_scopes: Annotated[list[RetainedEvidenceScope], Field(max_length=3)] = Field(default_factory=list, description=(
+        "Select retained query/filter/time scopes when this question asks for counts of hosts, users, "
+        "IP addresses, process names, process GUIDs or sessions. The application calculates exact "
+        "distinct literal counts from all matching retained raw rows and presents scoped tables. "
+        "Do not estimate, copy or state those inventory quantities in prose. Do not add counts "
+        "from overlapping scopes. Use [] when counts are not requested or while requesting pages."
+    ))
     lead_coverage: list[LeadCoverage] = Field(default_factory=list, description=(
         "Account for every supplied advisory_leads entry exactly once for this question. "
         "Select its lead_evidence_id, link responsive findings by one-based position, "
@@ -501,41 +567,8 @@ class QuestionAnswer(DomainModel):
     def require_answer_or_limitation(self) -> "QuestionAnswer":
         if not self.findings and not self.limitations:
             raise ValueError("each question requires a supported finding or an explicit limitation")
-        return self
-
-
-class RetainedEvidenceFilter(DomainModel):
-    """An exact typed comparison against already retained raw fields."""
-
-    field: Annotated[StrictStr, Field(min_length=1, max_length=128)]
-    value: StrictStr | StrictInt | StrictBool | Annotated[float, Field(strict=True, allow_inf_nan=False)]
-
-    @field_validator("field")
-    @classmethod
-    def validate_field_name(cls, value: str) -> str:
-        if not value.strip():
-            raise ValueError("lookup filter field must be nonempty")
-        return value
-
-
-class RetainedEvidenceRequest(DomainModel):
-    """A bounded local lookup; never a request to submit a new search."""
-
-    query_ids: Annotated[list[Identifier], Field(min_length=1, max_length=50)]
-    filters: Annotated[list[RetainedEvidenceFilter], Field(max_length=8)] = Field(default_factory=list)
-    earliest_utc: UTCDateTime | None = None
-    latest_utc: UTCDateTime | None = None
-    offset: Annotated[StrictInt, Field(ge=0, le=50_000)] = 0
-    limit: Annotated[StrictInt, Field(ge=1, le=500)] = 100
-
-    @model_validator(mode="after")
-    def validate_lookup(self) -> "RetainedEvidenceRequest":
-        if len(set(self.query_ids)) != len(self.query_ids):
-            raise ValueError("lookup query references must be unique")
-        if len({item.field for item in self.filters}) != len(self.filters):
-            raise ValueError("lookup filter fields must be unique")
-        if self.earliest_utc and self.latest_utc and self.earliest_utc >= self.latest_utc:
-            raise ValueError("lookup time window must increase")
+        if len({scope.model_dump_json() for scope in self.inventory_scopes}) != len(self.inventory_scopes):
+            raise ValueError("question inventory scopes must be distinct")
         return self
 
 
@@ -546,8 +579,8 @@ class QuestionAnswerStep(QuestionAnswer):
 
     @model_validator(mode="after")
     def defer_findings_during_retrieval(self) -> "QuestionAnswerStep":
-        if self.retained_evidence_requests and (self.findings or self.lead_coverage):
-            raise ValueError("request evidence before generating final findings or lead coverage for this question")
+        if self.retained_evidence_requests and (self.findings or self.lead_coverage or self.inventory_scopes):
+            raise ValueError("request evidence before generating final findings, lead coverage or inventory scopes for this question")
         return self
 
 

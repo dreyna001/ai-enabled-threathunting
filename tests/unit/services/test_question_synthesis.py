@@ -35,8 +35,8 @@ def positive():
 
 
 def response():
-    return {"question_1": {"summary": "A retained event names host-1.", "findings": [positive()], "lead_coverage": [], "limitations": []},
-            "question_2": {"summary": "This question remains unanswered.", "findings": [], "lead_coverage": [], "limitations": ["The supplied telemetry does not answer this question."]}}
+    return {"question_1": {"summary": "A retained event names host-1.", "findings": [positive()], "lead_coverage": [], "inventory_scopes": [], "limitations": []},
+            "question_2": {"summary": "This question remains unanswered.", "findings": [], "lead_coverage": [], "inventory_scopes": [], "limitations": ["The supplied telemetry does not answer this question."]}}
 
 
 def lead_context():

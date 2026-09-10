@@ -109,7 +109,7 @@ def test_budget_fitting_rebuilds_index_with_only_supplied_records():
         "summary": "The supplied subset remains unreviewed.", "findings": [], "limitations": ["Unreviewed."],
         "lead_coverage": [{"lead_evidence_id": "E1", "finding_numbers": [], "limitation": "Unreviewed."}],
     }})])
-    limits = BudgetLimits(max_context_characters=30_000, max_model_input_tokens=30_000)
+    limits = BudgetLimits(max_context_characters=40_000, max_model_input_tokens=40_000)
     runner = StrictModelRunner(model, limits=limits)
     runner.run(_question_synthesis_contract(SimpleNamespace(questions=[object()])), user_payload={},
                contract_name="QuestionSynthesis", context_builder=lambda limit: {
