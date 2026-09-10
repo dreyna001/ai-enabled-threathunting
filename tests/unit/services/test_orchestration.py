@@ -5,7 +5,7 @@ import json
 from uuid import uuid4
 
 import pytest
-from pydantic import TypeAdapter
+from pydantic import BaseModel, TypeAdapter
 
 from threat_hunting.domain.budgets import BudgetCounters, BudgetLimits
 from threat_hunting.domain.contracts import HuntPlan, QueryProposal, ResultMode
@@ -26,6 +26,43 @@ from threat_hunting.services.threat_intel import intelligence_sources
 
 
 NOW = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+
+def test_request_budget_counts_model_text_without_http_json_escaping():
+    class Answer(BaseModel):
+        value: str
+
+    model = FakeModelAdapter(responses=['{"value":"ok"}'])
+    runner = StrictModelRunner(model, limits=BudgetLimits(max_context_characters=30_000, max_model_input_tokens=30_000))
+    assert runner.run(Answer, user_payload={"retained_text": '"' * 10_000}).value == "ok"
+    assert model.call_count == 1
+    assert len(model.requests[0].messages[0]["content"]) > 20_000
+
+
+def test_multibyte_input_still_respects_byte_estimate_when_character_limit_fits():
+    class Answer(BaseModel):
+        value: str
+
+    model = FakeModelAdapter(responses=[])
+    runner = StrictModelRunner(model, limits=BudgetLimits(max_context_characters=30_000, max_model_input_tokens=15_000))
+    with pytest.raises(AdapterError, match="input budget"):
+        runner.run(Answer, user_payload={"retained_text": "é" * 10_000})
+    assert model.call_count == 0
+
+
+def test_model_checks_record_actual_usage_for_invalid_output_and_its_repair():
+    model = FakeModelAdapter(responses=[
+        {"text": "not-json", "usage": {"input_tokens": 91, "output_tokens": 23}},
+        {"text": json.dumps(_plan()), "usage": {"input_tokens": 141, "output_tokens": 10}},
+    ])
+    runner = StrictModelRunner(model)
+    runner.run(HuntPlan, user_payload={"facts": "test input"})
+    checks = runner.counters.model_output_checks
+    assert [(check.input_tokens, check.output_tokens) for check in checks] == [(91, 23), (141, 10)]
+    assert all(check.estimated_input_tokens >= check.input_tokens for check in checks)
+    assert all(check.context_characters > 0 for check in checks)
+    assert runner.counters.model_input_tokens == 232
+    assert runner.counters.model_output_tokens == 33
 
 
 def _plan() -> dict[str, object]:

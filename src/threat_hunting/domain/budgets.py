@@ -78,6 +78,10 @@ class ModelOutputCheck(DomainModel):
     contract_valid: StrictBool | None = None
     grounding_valid: StrictBool | None = None
     validation_error_code: Literal["schema", "json", "reference_label", "citation_relationship", "query_coverage", "structure"] | None = None
+    context_characters: StrictInt | None = Field(default=None, ge=0)
+    estimated_input_tokens: StrictInt | None = Field(default=None, ge=0)
+    input_tokens: StrictInt | None = Field(default=None, ge=0)
+    output_tokens: StrictInt | None = Field(default=None, ge=0)
 
 
 class BudgetCounters(DomainModel):

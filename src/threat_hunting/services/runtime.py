@@ -128,7 +128,7 @@ def build_production_service(engine: Engine, settings: RuntimeSettings) -> Workf
             "splunk_app_namespace": settings.splunk.app_namespace,
             "splunk_poll_interval_seconds": settings.hunt_limits.splunk_poll_interval_seconds,
             "hunt_limits": settings.hunt_limits.model_dump(mode="json"),
-            "prompt_contract_version": "1.24",
+            "prompt_contract_version": "1.25",
             "spl_policy_version": POLICY_VERSION,
             "query_result_limits": dict(QUERY_RESULT_LIMITS),
             "image_version": settings.image_version,

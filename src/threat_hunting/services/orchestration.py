@@ -148,16 +148,28 @@ class StrictModelRunner:
         "telemetry, or evidence; use unknown or an empty list when required."
     )
 
+    @staticmethod
+    def _request_sizes(request: ModelRequest) -> tuple[int, int]:
+        # Providers receive decoded message/system strings. Count their full
+        # contents, including JSON inside those strings, but not the extra
+        # escaping used to serialize the enclosing HTTP request. Schemas remain
+        # counted in both system text and native format, plus tools and roles.
+        parts = [request.system or ""]
+        for message in request.as_messages():
+            content = message.pop("content")
+            parts.append(content if isinstance(content, str) else json.dumps(content, ensure_ascii=False, sort_keys=True, default=str))
+            parts.append(json.dumps(message, ensure_ascii=False, sort_keys=True, default=str))
+        for value in (request.response_format, request.tools):
+            if value:
+                parts.append(json.dumps(value, ensure_ascii=False, sort_keys=True, default=str))
+        # UTF-8 bytes and framing are still a conservative estimate, not
+        # measured provider tokens. Character and token limits stay separate.
+        return sum(map(len, parts)), sum(len(part.encode("utf-8")) for part in parts) + 1024
+
     def _request_fits(self, request: ModelRequest) -> bool:
-        # Count the complete portable request, including the schema in both
-        # system text and response_format. UTF-8 bytes plus framing reserve
-        # are a conservative input-token estimate, not measured provider usage.
-        encoded = json.dumps({"system": request.system, "messages": request.as_messages(),
-                              "response_format": request.response_format, "tools": request.tools},
-                             ensure_ascii=False, sort_keys=True, default=str)
-        return (len(encoded) <= self.limits.max_context_characters
-                and len(encoded.encode("utf-8")) + 1024
-                <= self.limits.max_model_input_tokens - self.counters.model_input_tokens)
+        characters, estimated_tokens = self._request_sizes(request)
+        return (characters <= self.limits.max_context_characters
+                and estimated_tokens <= self.limits.max_model_input_tokens - self.counters.model_input_tokens)
 
     def _output_allowance(self) -> int:
         remaining = self.limits.max_model_output_tokens - self.counters.model_output_tokens
@@ -189,7 +201,10 @@ class StrictModelRunner:
         # output and validation instructions must fit before another paid call.
         # Count before the external call, including failures.
         self.counters.record_model_call(input_tokens=0, output_tokens=0, failed=False, repair=repair)
-        self.counters.model_output_checks.append(ModelOutputCheck(contract=contract_name, repair=repair))
+        characters, estimated_tokens = self._request_sizes(request)
+        check = ModelOutputCheck(contract=contract_name, repair=repair,
+                                 context_characters=characters, estimated_input_tokens=estimated_tokens)
+        self.counters.model_output_checks.append(check)
         began = time.monotonic()
         try:
             response = self.adapter.complete(
@@ -212,6 +227,7 @@ class StrictModelRunner:
         )
         # Provider usage is recorded even when validation fails.
         usage = response.usage
+        check.input_tokens, check.output_tokens = usage.input_tokens, usage.output_tokens
         self.counters.model_input_tokens += usage.input_tokens
         self.counters.model_output_tokens += usage.output_tokens
         if self.deadline is not None and _utc_now() >= self.deadline:
