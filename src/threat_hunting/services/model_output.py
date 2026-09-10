@@ -265,7 +265,7 @@ def prepare_model_context(payload: Any, name: str) -> tuple[Any, ReferenceLabels
     references = ReferenceLabels.from_context(payload)
     context = references.encode(payload)
     context["reference_rules"] = [
-        "Reference fields use only the Q and E labels supplied in this request; never copy identifiers from raw telemetry.",
+        "Citation fields (evidence_ids, query_ids and evidence_candidate_row_refs) use only the supplied E and Q labels, never native telemetry identifiers. Native process GUIDs, session IDs and other observed field values remain evidence: include their exact values in findings when the question requests them or a relationship depends on them.",
         "For findings with evidence_ids, return query_ids=[]; the application derives their query relationships.",
         "For scoped negative findings, select only completed query labels with successful, complete result retrieval. Truncated or partial results cannot establish absence; explain missing support in the question's limitations instead.",
     ]

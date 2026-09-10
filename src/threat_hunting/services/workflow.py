@@ -1816,14 +1816,38 @@ class WorkflowService:
                     cancellation_token=token,
                 )
                 try:
-                    answer = synthesis_runner.run(
-                        _question_synthesis_contract(focused_plan, allow_retrieval=allow_retrieval),
-                        user_payload={}, contract_name="QuestionSynthesis",
-                        context_builder=lambda limit: _synthesis_context(
+                    answer = None
+                    if allow_retrieval:
+                        full_context = _synthesis_context(
                             plan=focused_plan, threat_intelligence=str(row["threat_intelligence"] or ""),
-                            results=results, limit=limit,
-                        ),
-                    )
+                            results=results, limit=self.budget_limits.max_targeted_events,
+                        )
+                        if not any(item["sample_omitted"] for item in full_context["evidence_coverage"]):
+                            # Try the complete final request before reserving
+                            # capacity for pages it would already contain.
+                            # No context builder means preflight cannot sample.
+                            calls_before = counters.model_calls
+                            try:
+                                answer = StrictModelRunner(
+                                    self.model_adapter, counters=counters, limits=self.budget_limits,
+                                    deadline=deadline, cancellation_token=token,
+                                ).run(_question_synthesis_contract(focused_plan),
+                                      user_payload=full_context, contract_name="QuestionSynthesis")
+                            except AdapterError as exc:
+                                if exc.category != FailureCategory.BUDGET_EXHAUSTED or counters.model_calls != calls_before:
+                                    # A submitted final call (including its
+                                    # repair) must not be replayed as retrieval.
+                                    allow_retrieval = False
+                                    raise
+                    if answer is None:
+                        answer = synthesis_runner.run(
+                            _question_synthesis_contract(focused_plan, allow_retrieval=allow_retrieval),
+                            user_payload={}, contract_name="QuestionSynthesis",
+                            context_builder=lambda limit: _synthesis_context(
+                                plan=focused_plan, threat_intelligence=str(row["threat_intelligence"] or ""),
+                                results=results, limit=limit,
+                            ),
+                        )
                     pages = _retained_synthesis_pages(answer, focused_plan, results)
                     generated = _materialize_question_answers(answer, focused_plan, results)
                 except AdapterError as exc:

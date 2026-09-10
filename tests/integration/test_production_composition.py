@@ -677,9 +677,9 @@ def test_elapsed_cutoff_skips_new_queries_and_preserves_synthesis(monkeypatch: p
     assert [q["status"] for q in result["query_ledger"]] == ["completed", "skipped_time_cutoff"]
     assert result["adaptive_status"] == "time_reserved_for_synthesis"
     assert len(result["evidence"]) == len(result["findings"]) == 1
-    # A retrieval-capable step reserves the final 300 seconds; inside that
-    # reserve the model gets the whole remaining time and cannot request pages.
-    assert synthesis_timeouts == [120 if elapsed == 780 else 10]
+    # All retained evidence fits, so final synthesis gets the remaining time
+    # without reserving an unnecessary retrieval round.
+    assert synthesis_timeouts == [300 if elapsed == 780 else 10]
     from threat_hunting.services.reports import _derive_report_limitations
     assert any("time cutoff" in text for text in _derive_report_limitations(result))
 
@@ -691,6 +691,17 @@ def test_synthesis_pages_checkpoint_completed_answers_and_resume_without_repeati
 
     def response(request):
         context = json.loads(request.messages[0]["content"])
+        if "QueryProposal[]" in (request.system or ""):
+            proposals = json.loads(base(request))
+            return json.dumps([*proposals, {**proposals[0], "question_id": "q2"}])
+        if "QueryAssessment[]" in (request.system or ""):
+            return json.dumps([{
+                "query_id": query["query_id"], "answered_question": False, "material_progress": False,
+                "summary": "Retained evidence needs synthesis.", "new_entities": [],
+                "evidence_candidate_row_refs": [], "coverage_changes": [],
+                "limitations": ["This bounded sample does not answer the question."],
+                "proposed_next_question": None,
+            } for query in context["completed_queries"]])
         if "FollowUpDecision[]" in (request.system or ""):
             return json.dumps([{"question_id": question["question_id"], "proposal": None,
                                 "skip_reason": "Inspect the retained events during synthesis."}
@@ -707,6 +718,8 @@ def test_synthesis_pages_checkpoint_completed_answers_and_resume_without_repeati
                                                 "filters": [{"field": "host", "value": "host-1"}], "limit": 1}],
             }
         else:
+            answer["question_1"] = {"summary": "The requested analysis remains limited.", "findings": [],
+                                    "limitations": ["The retained event does not fully answer this question."]}
             assert context["retained_lookup_pages"][0]["matching_raw_record_count"] == 1
             assert context["retained_lookup_pages"][0]["returned_evidence_ids"]
             assert context["retained_lookup_pages"][0]["query_coverage"][0]["result_count"] == 1
@@ -726,6 +739,7 @@ def test_synthesis_pages_checkpoint_completed_answers_and_resume_without_repeati
     model = FakeModelAdapter(responses=[response] * 20)
     service = WorkflowService(engine, model_adapter=model,
                               splunk_connector=SplunkConnector(SplunkConnectionConfig(endpoint="https://splunk.example", token="test-token"), client=Splunk()),
+                              budget_limits=BudgetLimits(max_representative_events=1, max_targeted_events=1),
                               execution_config={"provider": "fake", "model_name": "test"})
     hid = str(service.create_hunt("owner-1", title="Recover synthesis", hypothesis="h", objective="o")["hunt_id"])
     service.discover("owner-1", hid)
@@ -796,6 +810,59 @@ def test_synthesis_context_exhaustion_preserves_explicit_unanswered_question(mon
     assert result["question_answers"][0]["finding_ids"] == []
     assert "budget" in result["question_answers"][0]["limitations"][0]
     assert not any("Required contract: QuestionSynthesis." in (r.system or "") for r in model.requests)
+    assert service.get_hunt("owner-1", hid)["state"] == "report_draft"
+
+
+@pytest.mark.parametrize("context_limit,finish_reason", [(500_000, "stop"), (250_000, "stop"), (500_000, "length")])
+def test_complete_retained_context_is_not_sampled_to_reserve_unneeded_retrieval(context_limit, finish_reason):
+    class LargeJob(Job):
+        def results(self, **kwargs):
+            return [{**super().results()[0], "event_id": self.name, "message": "x" * 135_000}]
+
+    class LargeJobs(Jobs):
+        def create(self, query, **kwargs):
+            if query.startswith("| tstats "):
+                return CatalogJob()
+            job = LargeJob()
+            job.name = str(kwargs["id"])
+            self[job.name] = job
+            return job
+
+    engine = create_engine("sqlite+pysqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    workflow_metadata.create_all(engine)
+    jobs_metadata.create_all(engine)
+    base = _model()._responses[0]
+
+    def response(request):
+        if finish_reason == "length" and "Required contract: QuestionSynthesis." in (request.system or ""):
+            return {"text": "", "finish_reason": "length"}
+        return base(request)
+
+    model = FakeModelAdapter(responses=[response] * 8)
+    client = Splunk()
+    client.jobs = LargeJobs()
+    service = WorkflowService(engine, model_adapter=model,
+                              splunk_connector=SplunkConnector(SplunkConnectionConfig(endpoint="https://splunk.example", token="test-token"), client=client),
+                              budget_limits=BudgetLimits(max_context_characters=context_limit),
+                              execution_config={"provider": "fake", "model_name": "test"})
+    hid = str(service.create_hunt("owner-1", title="Complete retained context", hypothesis="h", objective="o")["hunt_id"])
+    service.discover("owner-1", hid)
+    service.approve("owner-1", hid, "reviewed")
+    service.execute("owner-1", hid)
+    service.execute_job(service.jobs.claim("worker-1"))
+    result = service.results("owner-1", hid)
+    assert len(result["evidence"]) == 2
+    requests = [r for r in model.requests if "Required contract: QuestionSynthesis." in (r.system or "")]
+    assert len(requests) == 1
+    supplied = json.loads(requests[0].messages[0]["content"])
+    complete = context_limit == 500_000
+    assert sum(row["supplied_evidence_count"] for row in supplied["evidence_coverage"]) == (2 if complete else 1)
+    assert any(row["sample_omitted"] for row in supplied["evidence_coverage"]) is not complete
+    assert ("retained_evidence_requests" in json.dumps(requests[0].response_format)) is not complete
+    if finish_reason == "length":
+        assert result["synthesis_retrieval_status"] == "budget_limited"
+        assert result["findings"] == []
+        assert "budget" in result["question_answers"][0]["limitations"][0]
     assert service.get_hunt("owner-1", hid)["state"] == "report_draft"
 
 
