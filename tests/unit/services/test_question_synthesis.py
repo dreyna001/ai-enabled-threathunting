@@ -65,6 +65,62 @@ def covered_response():
     return answer
 
 
+@pytest.mark.parametrize("lead_count", [0, 450, 500])
+@pytest.mark.parametrize("allow_retrieval", [False, True])
+def test_maximum_evidence_and_leads_fit_native_enum_limit_without_weakening_citations(lead_count, allow_retrieval):
+    supplied = context()
+    supplied["completed_queries"] = [
+        {"query_id": str(uuid4()), "status": "completed"} for _ in range(50)
+    ]
+    supplied["retained_evidence"] = [
+        {"evidence_id": str(uuid4()), "query_id": supplied["completed_queries"][index % 50]["query_id"],
+         "selected_result": {"host": "host-1", "process_guid": f"process-{index}"},
+         "advisory_ioc_comparison": {"matched_file_name_literals": ["observed.exe"]} if index < lead_count else {}}
+        for index in range(500)
+    ]
+    labels = ReferenceLabels.from_context(supplied)
+    contract = _question_synthesis_contract(plan(), allow_retrieval=allow_retrieval)
+    schema = structured_response_format(contract, "QuestionSynthesis", labels)["json_schema"]["schema"]
+    Draft202012Validator.check_schema(schema)
+    pending, enum_count = [schema], 0
+    while pending:
+        node = pending.pop()
+        if isinstance(node, dict):
+            enum_count += len(node.get("enum", []))
+            pending.extend(value for key, value in node.items() if key != "enum")
+        elif isinstance(node, list):
+            pending.extend(node)
+    assert enum_count <= 1000
+
+    answer = response()
+    answer["question_1"]["findings"][0]["evidence_ids"] = ["E1", "E500"]
+    for slot in answer.values():
+        slot["lead_coverage"] = [
+            {"lead_evidence_id": f"E{index}", "finding_numbers": [], "limitation": "This lead remains unreviewed."}
+            for index in range(1, lead_count + 1)
+        ]
+        if allow_retrieval:
+            slot["retained_evidence_requests"] = []
+    validator = Draft202012Validator(schema)
+    assert validator.is_valid(answer)
+    decoded = labels.decode(answer, findings=True)
+    assert decoded["question_1"]["findings"][0]["evidence_ids"] == [
+        supplied["retained_evidence"][index]["evidence_id"] for index in (0, 499)
+    ]
+    invalid = deepcopy(answer)
+    invalid["question_1"]["findings"][0]["evidence_ids"] = ["E501"]
+    assert not validator.is_valid(invalid)
+    if lead_count:
+        invalid = deepcopy(answer)
+        invalid["question_1"]["lead_coverage"][0]["lead_evidence_id"] = "E501"
+        assert not validator.is_valid(invalid)
+        if lead_count < 500:
+            invalid["question_1"]["lead_coverage"][0]["lead_evidence_id"] = "E500"
+            assert not validator.is_valid(invalid)
+            with pytest.raises(ValueError, match="every supplied advisory lead"):
+                labels.decode(invalid, findings=True)
+
+
 def test_missing_lead_coverage_uses_existing_repair_before_accepting_answer():
     model = FakeModelAdapter(responses=[json.dumps(response()), json.dumps(covered_response())])
     runner = StrictModelRunner(model)

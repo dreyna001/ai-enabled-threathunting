@@ -215,6 +215,16 @@ def structured_response_format(contract: Any, name: str, references: ReferenceLa
 
     schema = convert(factory())
     if citation_definitions:
+        lead_choices = set(citation_definitions.get("SuppliedAdvisoryLeadReference", {}).get("enum", []))
+        if lead_choices and "SuppliedEvidenceReference" in citation_definitions:
+            # Lead labels are a subset of evidence labels. Store each choice
+            # once so a full evidence batch stays within the provider enum cap.
+            other_choices = [label for label in citation_definitions["SuppliedEvidenceReference"]["enum"] if label not in lead_choices]
+            lead_reference = {"$ref": "#/$defs/SuppliedAdvisoryLeadReference"}
+            citation_definitions["SuppliedEvidenceReference"] = (
+                {"anyOf": [lead_reference, {"type": "string", "enum": other_choices}]}
+                if other_choices else lead_reference
+            )
         schema.setdefault("$defs", {}).update(citation_definitions)
     if name == "HuntPlan":
         schema["properties"].pop("intelligence_refs")
