@@ -933,6 +933,8 @@ Audit records never contain passwords, API keys, session cookies, raw authorizat
 
 Full raw result batches are temporary cache data. Only selected raw events needed to support findings are retained as evidence.
 
+The results endpoint derives an observed timeline from all retained raw observations, independently of which records the model cites. Each timeline reference contains `evidence_id`, `query_id`, `event_time_utc` and `query_coverage` (`complete`, `incomplete` or `unknown`, describing that query's retrieval). Original fields remain in the corresponding evidence record. Times are ordered in UTC; missing, invalid or timezone-naive times appear last as `unknown`. Aggregate rows remain in evidence but are excluded from the point-event timeline. Repeated representations remain distinct, and point observations do not prove continuous activity or complete hunt coverage. The workspace provides text filtering, 50-record pages and original-source links. New concise reports include a labeled excerpt of at most 20 observations spanning the retained time range, preserving native identity fields and source references. Reading results does not modify persisted evidence, findings, approval state or historical reports.
+
 ### Evidence integrity
 
 - The application assigns every retained evidence item a stable UUID.

@@ -1,14 +1,19 @@
 """Owner- and state-scoped production execution persistence tests."""
 
+from copy import deepcopy
+
+import pytest
 from sqlalchemy import create_engine, update
 from sqlalchemy.pool import StaticPool
 
 from threat_hunting.domain.contracts import QueryAssessment
+from threat_hunting.domain.errors import NotFound
 from threat_hunting.domain.state import HuntState
 from threat_hunting.services.jobs import metadata as jobs_metadata
 from threat_hunting.services.workflow import Validation, WorkflowService, hunts, workflow_metadata
 from threat_hunting.services.reports import _concise_report_content, _validate_report_content
 from threat_hunting.services.investigation import _materialize_follow_up_questions
+from threat_hunting.services.evidence import retained_timeline
 
 
 def _service() -> tuple[WorkflowService, str, str, str]:
@@ -118,6 +123,88 @@ def test_report_adds_readable_entities_and_timeline() -> None:
     assert report["timeline"][0]["action"] == "failure"
 
 
+@pytest.mark.parametrize("state", ["running", "failed", "cancelled"])
+def test_results_show_all_retained_raw_observations_without_synthesis_or_state_mutation(state: str) -> None:
+    service, owner, hunt_id, _ = _service()
+    evidence = [
+        {"evidence_id": "end", "query_id": "q1", "event_time_utc": "2026-01-06T17:00:00Z", "selected_result": {"action": "process_end"}},
+        {"evidence_id": "unknown", "query_id": "q1", "event_time_utc": "2026-01-06T08:00:00", "selected_result": {"action": "image_load"}},
+        {"evidence_id": "start", "query_id": "q1", "event_time_utc": "2026-01-06T04:00:00-05:00", "selected_result": {"action": "process_start"}},
+        {"evidence_id": "start-copy", "query_id": "q2", "event_time_utc": "2026-01-06T09:00:00Z", "selected_result": {"action": "process_start"}},
+        {"evidence_id": "aggregate", "query_id": "q1", "evidence_kind": "aggregate_row", "event_time_utc": "2026-01-06T07:00:00Z", "selected_result": {"count": 10}},
+    ]
+    original = {"evidence": evidence, "timeline": [], "findings": [], "queries": [
+        {"query_id": "q1", "status": "completed", "truncated": True},
+        {"query_id": "q2", "status": "completed", "truncated": False},
+    ]}
+    with service.engine.begin() as connection:
+        connection.execute(update(hunts).where(hunts.c.hunt_id == hunt_id).values(state=state, results=original))
+    returned = service.results(owner, hunt_id)
+    assert returned["timeline"] == [
+        {"evidence_id": "start", "query_id": "q1", "event_time_utc": "2026-01-06T09:00:00Z", "query_coverage": "incomplete"},
+        {"evidence_id": "start-copy", "query_id": "q2", "event_time_utc": "2026-01-06T09:00:00Z", "query_coverage": "complete"},
+        {"evidence_id": "end", "query_id": "q1", "event_time_utc": "2026-01-06T17:00:00Z", "query_coverage": "incomplete"},
+        {"evidence_id": "unknown", "query_id": "q1", "event_time_utc": "unknown", "query_coverage": "incomplete"},
+    ]
+    assert returned["evidence"] == evidence and returned["findings"] == []
+    returned["timeline"].clear()
+    returned["evidence"][0]["selected_result"]["action"] = "changed"
+    persisted = service._owned_row(owner, hunt_id)
+    assert persisted["state"] == state and persisted["results"] == original
+    with pytest.raises(NotFound, match="not found"):
+        service.results("different-owner", hunt_id)
+
+
+def test_report_timeline_spans_retained_observations_independently_of_model_citations() -> None:
+    evidence = [{"evidence_id": str(index), "query_id": "q1", "event_time_utc": f"2026-01-06T{index:02d}:00:00Z",
+                 "selected_result": {"host": "host-a", "session_id": "session-a", "process_guid": "process-a", "action": "process_end" if index == 23 else "image_load"}}
+                for index in range(24)]
+    evidence.append({"evidence_id": "unknown", "query_id": "q1", "event_time_utc": "unknown", "selected_result": {"action": "connection"}})
+    source = {"evidence": evidence, "findings": [{"evidence_ids": [str(i) for i in range(20)]}],
+              "queries": [{"query_id": "q1", "status": "completed", "truncated": True}]}
+    original = deepcopy(source)
+    report = _concise_report_content(hypothesis="h", objective="o", data_sources=["endpoint"], results=source,
+                                    coverage_and_limitations=[], conclusion_and_disposition="Analysis incomplete.")
+    assert len(report["timeline"]) == 20
+    assert report["timeline"][0]["evidence_id"] == "0"
+    assert report["timeline"][-2]["evidence_id"] == "23"
+    assert report["timeline"][-1]["evidence_id"] == "unknown"
+    last = report["timeline"][-2]
+    assert last["process_guid"] == "process-a" and last["session_id"] == "session-a"
+    assert last["query_coverage"] == "incomplete"
+    assert any("20 of 25" in limit and "timeline" in limit.lower() for limit in report["coverage_and_limitations"])
+    assert source == original
+
+
+@pytest.mark.parametrize(("known_count", "unknown_count"), [(0, 0), (25, 0), (0, 25), (1, 24), (4, 100)])
+def test_report_timeline_excerpt_handles_missing_times_and_preserves_source_fields(known_count: int, unknown_count: int) -> None:
+    evidence = [{"evidence_id": str(index), "query_id": "missing-query", "event_time_utc": f"2026-01-06T00:00:{index:02d}Z" if index < known_count else "invalid-time",
+                 "selected_result": {"host": ["collector", "target"], "process_guid": "literal-guid"}}
+                for index in range(known_count + unknown_count)]
+    report = _concise_report_content(hypothesis="h", objective="o", data_sources=[], results={"evidence": evidence},
+                                    coverage_and_limitations=[], conclusion_and_disposition="Not assessed.")
+    timeline = report["timeline"]
+    assert len(timeline) == min(20, len(evidence))
+    assert len({item["evidence_id"] for item in timeline}) == len(timeline)
+    if known_count:
+        assert timeline[0]["evidence_id"] == "0"
+        assert str(known_count - 1) in {item["evidence_id"] for item in timeline}
+    if unknown_count:
+        assert timeline[-1]["event_time_utc"] == "unknown"
+    if timeline:
+        assert all(item["query_coverage"] == "unknown" for item in timeline)
+        timeline[0]["host"].append("changed")
+        assert all(item["selected_result"]["host"] == ["collector", "target"] for item in evidence)
+
+
+def test_retained_timeline_keeps_positive_observations_from_failed_and_legacy_searches() -> None:
+    results = {"evidence": [{"evidence_id": f"e-{query}", "query_id": query, "event_time_utc": None} for query in ("failed", "legacy", "partial")],
+               "queries": [{"query_id": "failed", "status": "failed"}, {"query_id": "legacy"}, {"query_id": "partial", "partial_fetch": True}]}
+    assert [(item["evidence_id"], item["query_coverage"]) for item in retained_timeline(results)] == [
+        ("e-failed", "incomplete"), ("e-legacy", "unknown"), ("e-partial", "incomplete"),
+    ]
+
+
 def test_report_preserves_synthetic_provenance() -> None:
     report = _concise_report_content(
         hypothesis="h", objective="o", data_sources=["main"], results={},
@@ -144,7 +231,7 @@ def test_report_prefers_time_resolved_cited_events_and_omits_full_spl() -> None:
 
     assert [item["evidence_id"] for item in report["selected_evidence"]] == ["event-1"]
     assert report["entities"] == [{"entity_type": "host", "value": "host-1"}]
-    assert report["timeline"][0]["host"] == "host-1"
+    assert report["timeline"][0]["host"] == ["127.0.0.1:8080", "host-1"]
     assert report["timeline"][0]["process"] == "tool.exe"
     assert "spl" not in report["query_appendix"][0]
 

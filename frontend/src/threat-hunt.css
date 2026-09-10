@@ -40,6 +40,16 @@ pre { max-height: 18rem; overflow: auto; padding: 0.75rem; border: 1px solid #30
 .vs-inventory .table-wrap { max-width: 100%; overflow-x: auto; }
 .vs-inventory table { width: 100%; min-width: 36rem; border-collapse: collapse; }
 .vs-inventory th, .vs-inventory td { padding: 0.5rem; border-bottom: 1px solid #30363d; text-align: left; }
+.vs-timeline .table-wrap { max-width: 100%; max-height: 36rem; overflow: auto; }
+.vs-timeline table { width: 100%; min-width: 48rem; border-collapse: collapse; font-size: 0.85rem; }
+.vs-timeline th, .vs-timeline td { padding: 0.65rem; border-bottom: 1px solid #30363d; text-align: left; vertical-align: top; overflow-wrap: anywhere; }
+.vs-timeline thead th { position: sticky; top: 0; background: #1c2129; }
+.vs-timeline td { max-width: 18rem; }
+.vs-timeline td:first-child, .vs-timeline td:nth-child(2) { white-space: nowrap; }
+.vs-timeline dt { margin-top: 0.5rem; font-weight: 600; }
+.vs-timeline dd { margin: 0.2rem 0; white-space: pre-wrap; }
+.vs-timeline a { color: #8cbcff; }
+.vs-result-items pre:target { outline: 2px solid #8cbcff; outline-offset: -2px; }
 .vs-actions { display: flex; flex-wrap: wrap; gap: 0.6rem; margin-top: 1rem; }
 .vs-badge, .vs-card header > span { padding: 0.35rem 0.55rem; border: 1px solid #30363d; background: #1c2129; color: #8cbcff; text-transform: capitalize; }
 .vs-error, .vs-warning { padding: 0.75rem; border: 1px solid; }

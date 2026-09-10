@@ -1,4 +1,4 @@
-import { ChangeEvent, FormEvent, useEffect, useState } from "react";
+import { ChangeEvent, FormEvent, useEffect, useMemo, useState } from "react";
 import {
   CreateHuntInput,
   Hunt,
@@ -163,10 +163,68 @@ function ResultCard({ title, items }: { title: string; items: JsonObject[] }) {
     <section className="vs-card">
       <header><h3>{title}</h3><span>{items.length} · scroll</span></header>
       {items.length ? <div className="vs-result-items">{items.map((item, index) => (
-        <pre key={String(item.id ?? item.evidence_id ?? item.finding_id ?? `${title}-${index}`)}>{dump(item)}</pre>
+        <pre id={title === "Evidence" ? `evidence-${String(item.evidence_id)}` : undefined} tabIndex={title === "Evidence" ? -1 : undefined}
+          key={String(item.id ?? item.evidence_id ?? item.finding_id ?? `${title}-${index}`)}>{dump(item)}</pre>
       ))}</div> : <p className="vs-empty">None recorded.</p>}
     </section>
   );
+}
+
+export function ObservedTimeline({ results }: { results: HuntResults }) {
+  const [filter, setFilter] = useState("");
+  const [page, setPage] = useState(0);
+  const pageSize = 50;
+  const evidence = useMemo(() => new Map(results.evidence.map((item) => [String(item.evidence_id), item])), [results.evidence]);
+  const rows = useMemo(() => {
+    const query = filter.trim().toLowerCase();
+    return results.timeline.filter((item) => !query || JSON.stringify([item, evidence.get(String(item.evidence_id))]).toLowerCase().includes(query));
+  }, [results.timeline, evidence, filter]);
+  const lastPage = Math.max(0, Math.ceil(rows.length / pageSize) - 1);
+  const currentPage = Math.min(page, lastPage);
+  const start = currentPage * pageSize;
+  const visible = rows.slice(start, start + pageSize);
+  const display = (value: unknown) => value === undefined || value === null ? "Unknown" : typeof value === "string" ? value : JSON.stringify(value);
+  const hasRawEvidence = results.evidence.some((item) => (item.evidence_kind ?? "raw_event") === "raw_event");
+
+  return <section id="observed-timeline" className="vs-card vs-span vs-timeline">
+    <h2>Observed timeline</h2>
+    <p>Chronology from retained raw records, independent of model findings. Repeated representations may remain; the count is not a unique-event count. Aggregate rows are excluded.</p>
+    <p className="vs-muted">Records without a usable time appear last. Observations do not prove continuous activity. Search retrieval status describes the individual search, not complete hunt coverage.</p>
+    {!results.timeline.length ? <p className="vs-empty">{hasRawEvidence ? "The observed timeline is unavailable for these results. Retained evidence remains available below." : "No raw observations retained."}</p> : <>
+      <label>Filter observed records<input type="search" value={filter} placeholder="Host, user, process, session, action, or other recorded value"
+        onChange={(event) => { setFilter(event.target.value); setPage(0); }} /></label>
+      <p role="status">Showing {rows.length ? start + 1 : 0}–{start + visible.length} of {rows.length} matching records ({results.timeline.length} retained raw records).</p>
+      {visible.length ? <div className="table-wrap" role="region" aria-label="Observed records" tabIndex={0}>
+        <table>
+          <caption>Retained observations in time order (UTC)</caption>
+          <thead><tr><th scope="col">Observed time</th><th scope="col">Action</th><th scope="col">Host</th><th scope="col">User</th><th scope="col">Process</th><th scope="col">Source details</th></tr></thead>
+          <tbody>{visible.map((item, index) => {
+            const source = evidence.get(String(item.evidence_id));
+            const event = source?.selected_result;
+            const fields = event && typeof event === "object" && !Array.isArray(event) ? event as JsonObject : {};
+            return <tr key={`${String(item.evidence_id)}-${start + index}`}>
+              <td>{display(item.event_time_utc)}</td><td>{display(fields.action)}</td><td>{display(fields.host)}</td>
+              <td>{display(fields.user)}</td><td>{display(fields.process)}</td>
+              <td><details><summary>View recorded fields</summary>
+                <p>Search retrieval: {display(item.query_coverage)}</p>
+                <p>Search reference: {display(item.query_id)}</p>
+                {source ? <>
+                  <a href={`#${encodeURIComponent(`evidence-${String(item.evidence_id)}`)}`}>Open source record</a>
+                  <dl><div><dt>Original timestamp</dt><dd>{display(source.event_time_utc)}</dd></div>
+                    {Object.entries(fields).map(([field, value]) => <div key={field}><dt>{field}</dt><dd>{display(value)}</dd></div>)}
+                  </dl>
+                </> : <p className="vs-warning">The source record is unavailable.</p>}
+              </details></td>
+            </tr>;
+          })}</tbody>
+        </table>
+      </div> : <p className="vs-empty">No retained records match this filter.</p>}
+      <nav className="vs-actions" aria-label="Timeline pages">
+        <button className="vs-secondary" disabled={currentPage === 0} onClick={() => setPage(currentPage - 1)}>Previous records</button>
+        <button className="vs-secondary" disabled={currentPage === lastPage} onClick={() => setPage(currentPage + 1)}>Next records</button>
+      </nav>
+    </>}
+  </section>;
 }
 
 function QuestionInventories({ inventories }: { inventories: RetainedInventory[] }) {
@@ -356,7 +414,8 @@ function Workspace({ session, initial, onBack }: { session: Session; initial: Hu
         <section className="vs-card"><header><div><p className="vs-eyebrow">Analyst gate</p><h2>Plan review</h2></div><span>v{hunt.plan_version ?? 1}</span></header>{hunt.plan ? <><label>Plan JSON<textarea className="vs-code" rows={15} readOnly={!editable} value={planBody} onChange={(event) => setPlanBody(event.target.value)} /></label>{editable && <><button disabled={Boolean(busy)} onClick={savePlan}>Save edits</button><label>Revision instruction<textarea value={instruction} onChange={(event) => setInstruction(event.target.value)} /></label><button className="vs-secondary" disabled={Boolean(busy) || !instruction.trim()} onClick={() => void act("revise", () => workflowApi.revisePlan(session.access_token, hunt.hunt_id, instruction))}>Request revision</button><label>Analyst note<textarea value={note} onChange={(event) => setNote(event.target.value)} /></label><div className="vs-actions"><button disabled={Boolean(busy)} onClick={() => void act("approve", () => workflowApi.approvePlan(session.access_token, hunt.hunt_id, note))}>Approve plan</button><button className="vs-danger" disabled={Boolean(busy) || !note.trim()} onClick={() => void act("reject", () => workflowApi.rejectPlan(session.access_token, hunt.hunt_id, note))}>Reject plan</button></div></>}</> : <p className="vs-empty">Run discovery to generate a plan.</p>}</section>
         <section className="vs-card vs-span"><p className="vs-eyebrow">Bounded action</p><h2>Execution</h2><p className="vs-muted">Uses only the approved, locked plan and limits.</p>{job && <p className="vs-muted" role="status">Job <code>{job.job_id}</code> · {job.status}{job.attempts === undefined ? "" : ` · attempt ${job.attempts}`}{job.last_error ? ` · ${job.last_error}` : ""}</p>}<div className="vs-actions"><button disabled={Boolean(busy) || hunt.state !== "approved"} onClick={() => void act("execute", () => workflowApi.execute(session.access_token, hunt.hunt_id))}>{busy === "execute" ? "Executing…" : "Execute approved hunt"}</button>{canCancel && <button className="vs-danger" disabled={Boolean(busy)} onClick={() => void act("cancel", () => workflowApi.cancel(session.access_token, hunt.hunt_id))}>{busy === "cancel" ? "Cancelling…" : "Cancel hunt"}</button>}</div></section>
         {results && <QuestionAnswers results={results} />}
-        {results && <div id="hunt-results" className="vs-results vs-span">{(["findings", "evidence", "entities", "timeline"] as const).map((key) => <ResultCard key={key} title={key[0].toUpperCase() + key.slice(1)} items={results[key]} />)}</div>}
+        {results && <ObservedTimeline results={results} />}
+        {results && <div id="hunt-results" className="vs-results vs-span">{(["findings", "evidence", "entities"] as const).map((key) => <ResultCard key={key} title={key[0].toUpperCase() + key.slice(1)} items={results[key]} />)}</div>}
         {report && <section className="vs-card vs-span"><header><div><p className="vs-eyebrow">Final product</p><h2>Editable report</h2></div><span>{report.state} · v{report.version}</span></header><p>The report summarizes the investigation. <a href="#hunt-results">View complete findings and evidence</a>.</p><label>Structured report content<textarea className="vs-code" rows={20} readOnly={report.state === "finalized"} value={reportBody} onChange={(event) => setReportBody(event.target.value)} /></label><div className="vs-actions">{report.state !== "finalized" ? <><button disabled={Boolean(busy)} onClick={() => void saveReport(false)}>Save draft</button><button className="vs-secondary" disabled={Boolean(busy)} onClick={() => void saveReport(true)}>Save and finalize PDF</button></> : <button onClick={() => void workflowApi.downloadPdf(session.access_token, hunt.hunt_id).catch((error) => setError(errorMessage(error)))}>Download PDF</button>}</div></section>}
       </div>
     </main>

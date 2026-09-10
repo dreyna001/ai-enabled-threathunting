@@ -28,7 +28,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from threat_hunting.domain.contracts import HuntPlan, RetainedInventory
 from threat_hunting.domain.errors import Validation
-from threat_hunting.services.evidence import evidence_time_bounds, query_source_coverage
+from threat_hunting.services.evidence import evidence_time_bounds, query_source_coverage, retained_timeline
 
 from sqlalchemy import text
 
@@ -731,7 +731,6 @@ def _concise_report_content(
         for item in records("queries", REPORT_LIST_LIMITS["query_appendix"])
     ]
     entities: list[dict[str, Any]] = []
-    timeline: list[dict[str, Any]] = []
     for item in evidence_records:
         event = item.get("selected_result")
         if not isinstance(event, Mapping):
@@ -745,19 +744,41 @@ def _concise_report_content(
                     candidate = {"entity_type": entity_type, "value": entity}
                     if candidate not in entities:
                         entities.append(candidate)
-        timeline_event = {
-            "event_time_utc": item.get("event_time_utc", "unknown"),
-            "evidence_id": item.get("evidence_id"),
-            **{key: event[key] for key in ("host", "user", "src_ip", "action", "result", "process", "parent_process", "file_name", "file_hash", "file_hash_type") if key in event},
-        }
-        host = timeline_event.get("host")
-        host_values = host if isinstance(host, list) else [host]
-        target_hosts = [value for value in host_values if value and not _is_loopback_endpoint(value)]
-        if target_hosts:
-            timeline_event["host"] = target_hosts[0] if len(target_hosts) == 1 else target_hosts
-        timeline.append(timeline_event)
+    timeline_refs = retained_timeline(results)
+    raw_count = len(timeline_refs)
+    limit = REPORT_LIST_LIMITS["timeline"]
+    if raw_count > limit:
+        known = [item for item in timeline_refs if item["event_time_utc"] != "unknown"]
+        unknown = [item for item in timeline_refs if item["event_time_utc"] == "unknown"]
+        # Spread the excerpt over known times, preserving both endpoints and
+        # space for unknown-time observations. This is presentation, not analysis.
+        known_limit = min(len(known), max(2, limit * len(known) // raw_count))
+        timeline_refs = [
+            part[position * (len(part) - 1) // max(count - 1, 1)]
+            for part, count in ((known, known_limit), (unknown, limit - known_limit))
+            for position in range(count)
+        ]
+    evidence_by_id = {str(item.get("evidence_id")): item for item in all_evidence}
+    timeline: list[dict[str, Any]] = []
+    for reference in timeline_refs:
+        event = evidence_by_id.get(reference["evidence_id"], {}).get("selected_result", {})
+        fields = {key: event[key] for key in (
+            "host", "user", "action", "result", "session_id", "logon_id", "logon_type",
+            "process", "process_guid", "parent_process", "parent_process_guid", "file_name",
+            "file_hash", "file_hash_type", "module", "module_path", "image_loaded",
+            "src_ip", "dest_ip", "src_port", "dest_port", "query", "query_name", "dns_query",
+        ) if key in event} if isinstance(event, Mapping) else {}
+        timeline.append({"event_time_utc": reference["event_time_utc"], **deepcopy(fields), **reference})
     derived_limitations = _derive_report_limitations(results)
     coverage = list(dict.fromkeys([*coverage_and_limitations, *derived_limitations]))
+    if raw_count:
+        coverage.append(
+            f"Observed timeline excerpt shows {len(timeline)} of {raw_count} retained raw records, "
+            "selected independently of model citations. The full observed timeline remains in hunt results. "
+            "Repeated representations may remain; these are not unique-event counts. Aggregate rows are excluded. "
+            "Unknown or timezone-naive times are shown last. Observations do not prove continuous activity, "
+            "and query retrieval completeness does not establish complete hunt coverage."
+        )
     if len(all_findings) > len(findings):
         coverage.append(f"All {len(all_findings)} retained findings remain available in the hunt results, independently of this report's detail selection.")
     if derived_limitations and "full blast radius is not established" not in conclusion_and_disposition.casefold():
@@ -772,7 +793,7 @@ def _concise_report_content(
         "findings": findings,
         "selected_evidence": evidence,
         "entities": entities or records("entities", REPORT_LIST_LIMITS["entities"]),
-        "timeline": timeline or records("timeline", REPORT_LIST_LIMITS["timeline"]),
+        "timeline": timeline,
         "coverage_and_limitations": coverage,
         "conclusion_and_disposition": conclusion_and_disposition,
         "query_appendix": queries,
@@ -952,7 +973,7 @@ def _formatted_pdf(title: str, content: Mapping[str, Any]) -> bytes:
         ("Findings", "findings"),
         ("Selected evidence citations", "selected_evidence"),
         ("Entities", "entities"),
-        ("Timeline", "timeline"),
+        ("Observed timeline excerpt", "timeline"),
         ("Coverage and limitations", "coverage_and_limitations"),
         ("Conclusion and disposition", "conclusion_and_disposition"),
         ("Query appendix", "query_appendix"),

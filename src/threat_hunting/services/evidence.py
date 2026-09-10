@@ -611,6 +611,32 @@ def raw_event_time(record: Mapping[str, Any]) -> datetime | None:
         return None
 
 
+def retained_timeline(results: Mapping[str, Any]) -> list[dict[str, str]]:
+    """Index every retained raw observation without changing evidence or inferring links."""
+    queries = {str(query.get("query_id")): query for query in results.get("queries", [])
+               if isinstance(query, Mapping)}
+    observations = [(raw_event_time(record), record) for record in results.get("evidence", [])
+                    if isinstance(record, Mapping) and record.get("evidence_kind", "raw_event") == "raw_event"]
+    observations.sort(key=lambda item: (item[0] is None, item[0] or datetime.max.replace(tzinfo=timezone.utc)))
+    timeline = []
+    for stamp, record in observations:
+        query_id = str(record.get("query_id", "unknown"))
+        query = queries.get(query_id)
+        coverage = "unknown"
+        if query is not None:
+            if query_results_incomplete(query):
+                coverage = "incomplete"
+            elif query.get("status") == "completed":
+                coverage = "complete"
+        timeline.append({
+            "evidence_id": str(record.get("evidence_id", "unknown")),
+            "query_id": query_id,
+            "event_time_utc": stamp.isoformat().replace("+00:00", "Z") if stamp else "unknown",
+            "query_coverage": coverage,
+        })
+    return timeline
+
+
 def evidence_time_bounds(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     """Compute point-event bounds; samples and aggregate rows never prove continuity."""
     times: list[datetime] = []

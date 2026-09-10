@@ -1,7 +1,44 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
-import { QuestionAnswers } from "./ThreatHuntApp";
+import { ObservedTimeline, QuestionAnswers } from "./ThreatHuntApp";
 import { HuntResults } from "./api/hunts";
+
+describe("observed timeline presentation", () => {
+  it("shows raw chronology without findings, bounds rendering, and preserves source fields", () => {
+    const evidence = Array.from({ length: 51 }, (_, index) => ({ evidence_id: `e-${index}`, query_id: "q-1",
+      event_time_utc: "2026-01-06T04:00:00-05:00", selected_result: { action: "image_load", host: ["collector", "target"],
+        process: `<script>process-${index}</script>`, session_id: "native-session", process_guid: "native-guid", file_name: "winhttp.dll" } }));
+    const timeline = evidence.map((item) => ({ evidence_id: item.evidence_id, query_id: item.query_id,
+      event_time_utc: "2026-01-06T09:00:00Z", query_coverage: "incomplete" }));
+    const results: HuntResults = { evidence, timeline, findings: [], entities: [] };
+    const markup = renderToStaticMarkup(<ObservedTimeline results={results} />);
+    expect(markup).toContain("Observed timeline");
+    expect(markup).toContain("Showing 1–50 of 51 matching records");
+    expect(markup).toContain("native-session");
+    expect(markup).toContain("native-guid");
+    expect(markup).toContain("winhttp.dll");
+    expect(markup).toContain("2026-01-06T04:00:00-05:00");
+    expect(markup).toContain("2026-01-06T09:00:00Z");
+    expect(markup).toContain("Search retrieval: incomplete");
+    expect(markup).toContain('href="#evidence-e-49"');
+    expect(markup).not.toContain('href="#evidence-e-50"');
+    expect(markup).toContain("Next records");
+    expect(markup).not.toContain("<script>");
+    expect(markup).not.toContain("<details open");
+    expect(results.evidence).toHaveLength(51);
+    expect(results.timeline).toHaveLength(51);
+  });
+
+  it("distinguishes unavailable timeline/source records from no retained raw observations", () => {
+    const empty: HuntResults = { evidence: [], timeline: [], findings: [], entities: [] };
+    expect(renderToStaticMarkup(<ObservedTimeline results={empty} />)).toContain("No raw observations retained.");
+    expect(renderToStaticMarkup(<ObservedTimeline results={{ ...empty, evidence: [{ evidence_id: "e1" }] }} />)).toContain("timeline is unavailable");
+    const missing = renderToStaticMarkup(<ObservedTimeline results={{ ...empty, timeline: [{ evidence_id: "missing", event_time_utc: "unknown", query_coverage: "unknown" }] }} />);
+    expect(missing).toContain("The source record is unavailable.");
+    expect(missing).toContain("Search retrieval: unknown");
+    expect(missing).not.toContain("Open source record");
+  });
+});
 
 describe("question answer presentation", () => {
   it("keeps every finding accessible behind a collapsed question summary", () => {

@@ -36,7 +36,7 @@ from threat_hunting.services.orchestration import (
 )
 from threat_hunting.services.jobs import JobConflict, JobService
 from threat_hunting.services.threat_intel import query_ioc_context, intelligence_sources, validate_intelligence_refs
-from threat_hunting.services.evidence import query_source_coverage
+from threat_hunting.services.evidence import query_source_coverage, retained_timeline
 from threat_hunting.services.uploads import UploadLimits
 
 
@@ -1949,7 +1949,9 @@ class WorkflowService:
         row = self._owned_row(owner_id, hunt_id)
         if row["results"] is None:
             raise Conflict("hunt results are not available")
-        return _json_copy(row["results"])
+        results = _json_copy(row["results"])
+        results["timeline"] = retained_timeline(results)
+        return results
 
     def report(self, owner_id: str, hunt_id: str) -> dict[str, Any]:
         row = self._owned_row(owner_id, hunt_id)
