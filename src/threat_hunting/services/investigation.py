@@ -13,7 +13,7 @@ from uuid import uuid4
 from pydantic import AfterValidator, BaseModel, TypeAdapter, create_model
 
 from threat_hunting.domain.common import DomainModel
-from threat_hunting.domain.contracts import FindingProposal, FollowUpDecision, HuntPlan, QuestionAnswer, QueryAssessment, QueryProposal
+from threat_hunting.domain.contracts import FindingProposal, FollowUpDecision, HuntPlan, QuestionAnswer, QuestionAnswerStep, QueryAssessment, QueryProposal
 from threat_hunting.domain.errors import Validation
 from threat_hunting.domain.spl_policy import source_pairs
 from threat_hunting.services.evidence import _flatten_scalar_values, evidence_time_bounds, lookup_retained_evidence, query_source_coverage, raw_event_time, result_source
@@ -62,6 +62,7 @@ def _balanced_evidence_sample(
     query_ids: set[str] | None = None,
     limit: int = _MODEL_EVIDENCE_SAMPLE_LIMIT,
     preferred_evidence_ids: set[str] | None = None,
+    requested_evidence_groups: list[set[str]] | None = None,
 ) -> tuple[list[Mapping[str, Any]], list[dict[str, Any]]]:
     """Return a deterministic, query-balanced evidence sample and coverage metadata.
 
@@ -124,22 +125,32 @@ def _balanced_evidence_sample(
             ]
 
     sampled: list[Mapping[str, Any]] = []
-    positions = {query_id: 0 for query_id in query_order}
-    while len(sampled) < limit:
-        added = False
-        for query_id in query_order:
-            position = positions[query_id]
-            rows = rows_by_query[query_id]
-            positions[query_id] = position
-            if position >= len(rows):
-                continue
-            sampled.append(rows[position])
-            positions[query_id] = position + 1
-            added = True
-            if len(sampled) >= limit:
+    # Newest requested pages precede older pages, then ordinary sampling.
+    # Keep query/source balance within each round and original coverage below.
+    selected_ids: set[str] = set()
+    for requested in [*(requested_evidence_groups or []), None]:
+        groups = {
+            query_id: [row for row in rows if
+                       str(row.get("evidence_id")) not in selected_ids
+                       and (requested is None or str(row.get("evidence_id")) in requested)]
+            for query_id, rows in rows_by_query.items()
+        }
+        positions = {query_id: 0 for query_id in query_order}
+        while len(sampled) < limit:
+            added = False
+            for query_id in query_order:
+                position = positions[query_id]
+                rows = groups[query_id]
+                if position >= len(rows):
+                    continue
+                sampled.append(rows[position])
+                selected_ids.add(str(rows[position].get("evidence_id")))
+                positions[query_id] = position + 1
+                added = True
+                if len(sampled) >= limit:
+                    break
+            if not added:
                 break
-        if not added:
-            break
 
     supplied_by_query: dict[str, int] = {}
     for item in sampled:
@@ -224,7 +235,7 @@ def _assessment_context(
     retained_evidence = [
         {
             key: item[key]
-            for key in ("evidence_id", "query_id", "event_time_utc", "selected_result")
+            for key in ("evidence_id", "query_id", "event_time_utc", "evidence_kind", "selected_result")
             if key in item
         } | {"advisory_ioc_comparison": compare_advisory_iocs(item.get("selected_result"), advisory_iocs)}
         for item in retained_evidence
@@ -534,11 +545,11 @@ def _follow_up_proposal_errors(
     return errors
 
 
-def _question_synthesis_contract(plan: HuntPlan) -> type[BaseModel]:
+def _question_synthesis_contract(plan: HuntPlan, *, allow_retrieval: bool = False) -> type[BaseModel]:
     """Require one closed answer slot per approved question, with app-owned keys."""
 
     fields: dict[str, Any] = {
-        f"question_{index}": (QuestionAnswer, ...) for index, _ in enumerate(plan.questions, 1)
+        f"question_{index}": (QuestionAnswerStep if allow_retrieval else QuestionAnswer, ...) for index, _ in enumerate(plan.questions, 1)
     }
     return create_model("QuestionSynthesis", __base__=DomainModel, **fields)
 
@@ -550,6 +561,8 @@ def _materialize_question_answers(answer: BaseModel, plan: HuntPlan, results: Ma
     answers: list[dict[str, Any]] = []
     for index, question in enumerate(plan.questions, 1):
         item: QuestionAnswer = getattr(answer, f"question_{index}")
+        if getattr(item, "retained_evidence_requests", []):
+            continue
         materialized = _materialize_findings(item.findings, results)
         findings.extend(materialized)
         answers.append({
@@ -559,6 +572,32 @@ def _materialize_question_answers(answer: BaseModel, plan: HuntPlan, results: Ma
             "limitations": list(item.limitations),
         })
     return {"findings": findings, "question_answers": answers}
+
+
+def _retained_synthesis_pages(answer: BaseModel, plan: HuntPlan, results: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Resolve requests using this owned hunt's immutable retained results."""
+
+    pages = []
+    for index, question in enumerate(plan.questions, 1):
+        for request in getattr(getattr(answer, f"question_{index}"), "retained_evidence_requests", []):
+            earliest = request.earliest_utc or plan.scope.earliest_utc
+            latest = request.latest_utc or plan.scope.latest_utc
+            if earliest < plan.scope.earliest_utc or latest > plan.scope.latest_utc or earliest >= latest:
+                raise Validation("retained evidence lookup exceeds the approved time window")
+            page = lookup_retained_evidence(
+                results, query_ids=set(request.query_ids),
+                filters={item.field: item.value for item in request.filters},
+                earliest_utc=earliest if request.earliest_utc or request.latest_utc else None,
+                latest_utc=latest if request.earliest_utc or request.latest_utc else None,
+                offset=request.offset, limit=request.limit,
+            )
+            records = page.pop("records")
+            identifiers = [str(record["evidence_id"]) for record in records]
+            identifiers.extend(str(origin["evidence_id"]) for record in records
+                               for origin in record.get("duplicate_references", []))
+            pages.append({**page, "question_id": question.question_id,
+                          "returned_evidence_ids": list(dict.fromkeys(identifiers))})
+    return pages
 
 
 def _synthesis_context(
@@ -580,7 +619,14 @@ def _synthesis_context(
     # Source selection must not inherit an earlier model's conclusions or
     # oversized citation groups. Advisory comparisons are exact application
     # lookups; prioritize those rows within each query without starving others.
-    indicator_ids: set[str] = set()
+    pending_ids = {question.question_id for question in plan.questions}
+    lookup_pages = [page for page in results.get("synthesis_retrievals", [])
+                    if page.get("question_id") in pending_ids]
+    requested_rounds: dict[int, set[str]] = {}
+    for position, page in enumerate(lookup_pages):
+        requested_rounds.setdefault(page.get("retrieval_round", position), set()).update(
+            str(identifier) for identifier in page["returned_evidence_ids"])
+    indicator_ids: set[str] = set().union(*requested_rounds.values())
     for item in evidence if isinstance(evidence, list) else []:
         if not isinstance(item, Mapping):
             continue
@@ -590,6 +636,7 @@ def _synthesis_context(
             indicator_ids.add(str(item.get("evidence_id")))
     sampled_evidence, evidence_coverage = _balanced_evidence_sample(
         evidence, queries, query_ids=completed_ids, preferred_evidence_ids=indicator_ids, limit=limit,
+        requested_evidence_groups=[requested_rounds[key] for key in sorted(requested_rounds, reverse=True)],
     )
     query_inventories = []
     for query_id in sorted(completed_ids):
@@ -602,7 +649,7 @@ def _synthesis_context(
         {
             key: item[key]
             for key in (
-                "evidence_id", "query_id", "index", "sourcetype", "event_time_utc", "selected_result"
+                "evidence_id", "query_id", "index", "sourcetype", "event_time_utc", "evidence_kind", "selected_result"
             )
             if key in item
         } | {"advisory_ioc_comparison": compare_advisory_iocs(item.get("selected_result"), advisory_iocs)}
@@ -643,17 +690,24 @@ def _synthesis_context(
         "evidence_coverage": evidence_coverage,
         "source_coverage": query_source_coverage(results, supplied_evidence=sampled_evidence),
         "retained_query_inventories": query_inventories,
+        "retained_lookup_pages": [{**page, "supplied_evidence_ids": [
+            item["evidence_id"] for item in sampled_evidence if str(item["evidence_id"]) in page["returned_evidence_ids"]],
+            "sample_omitted": any(identifier not in {str(item["evidence_id"]) for item in sampled_evidence}
+                                  for identifier in page["returned_evidence_ids"])} for page in lookup_pages],
         "synthesis_rules": [
+            "If the response schema permits retained_evidence_requests, each question may either give a final answer or request up to three local pages first. For a request, give findings=[] and explain the missing support in limitations. The application checkpoints completed answers and resolves pages from this hunt only; requests cannot submit searches or expand the approved scope.",
+            "Use exact typed field filters, optional half-open UTC time bounds within the approved scope, completed query labels and the returned next_offset for paging. Original query coverage, matching subset counts, page size and supplied sample coverage are different. An empty local subset is not proof of absence from Splunk. Do not repeat an identical page request. If requests are unavailable or a needed page remains omitted, give an explicitly limited answer.",
             "Answer every approved question in its application-assigned answer_slot. Each slot requires findings responsive to that question or an explicit limitation explaining why it cannot be answered. Repeating an indicator finding does not answer a different chronology, authentication, or communications question. Use original indicator records as supporting evidence for related observations when needed.",
             "Give each question a concise summary covering its material findings and limitations. Group related observations instead of listing every event. Apply the same grounding standard to summaries as to finding titles and statements. Keep the full findings independently of summary length; report presentation must not restrict investigation coverage.",
             "Use retained_query_inventories for application-computed distinct literal counts over each query's full retained raw rows. State their query scope and missing or ambiguous fields. These are observed field-value counts, not confirmed affected entities or unique process instances. Do not sum per-query distinct counts across overlapping searches or infer that a whole-query count describes a narrower lead, session or time window. Truncated searches prevent a complete inventory, but do not erase the recorded observations.",
+            "For chronology questions, cover every material lead and the supplied related process/module records before and after it. State the actual process or session relationship and event times; an indicator start/end alone is not a complete surrounding timeline.",
             "Use only the supplied evidence_ids and query_ids.",
             "For every material claim, select the records that establish each stated entity, action, and relationship. A cross-source correlation requires citations from every source involved; otherwise separate the observations and label the correlation as unconfirmed inference.",
             "Apply the same evidence standard to titles and statements. An observed field value and a conventional interpretation are different: a port number does not establish an application protocol, and a familiar file or domain name does not establish identity or ownership. State the observed value; put a tentative interpretation in inference and identify the missing verification.",
             "Keep titles and statements limited to supported observations. Describe successful logons, process starts and connections as those actions. Normal, routine, benign, authorized, deliberate or coordinated behavior needs its own supplied support; familiar names, ports and successful events do not establish those properties. If a baseline or authorization is supplied, report the precise supported comparison or permission and its scope. Otherwise leave those properties unknown rather than asserting them and adding a caveat later.",
             "For correlations, state the actual relationship keys. Shared hosts/accounts and overlapping times establish only that context; they do not establish the same logon session, process or cause. Check stable process/session identifiers together with host and time when supplied. Keep activity from different identities separate, and do not attribute one process's connections to another. A proposed relationship without such support belongs in tentative inference, with the missing evidence identified.",
             "Review each distinct relevant indicator event in the supplied evidence. Cite the events that support the finding, including materially different hosts, tools, and times; do not add irrelevant citations or duplicate copies of the same event for a higher count.",
-            "The application owns search result counts, query_truncated, and sample_omitted. result_count counts retained rows; available_result_count is the server's output count when known, not the number of underlying events scanned. query_truncated means retrieval was incomplete; retrieval_stop_reason explains why. sample_omitted means retained rows were omitted only from this model context. Zero retained rows after incomplete retrieval do not establish zero matching events. Do not generate numeric counts or search-completeness claims in finding prose; the report supplies these from execution metadata.",
+            "The application owns search result counts, query_truncated, and sample_omitted. result_count counts retained rows; available_result_count is the server's output count when known, not the number of underlying events scanned. query_truncated means retrieval was incomplete; retrieval_stop_reason explains why. sample_omitted means retained rows were omitted only from this model context. Zero retained rows after incomplete retrieval do not establish zero matching events. Report supplied application-computed distinct field counts when answering an inventory question, naming their exact query/filter/time scope and missing-value limitations. Do not invent counts or infer complete source coverage from them.",
             "Derive findings from source records and executed query scope. A query purpose describes the intended investigation, not an established observation; inspect its SPL and actual results before making a claim.",
             "Base statements only on retained_evidence; advisory_context is context, not evidence.",
             "Use application-computed observed_time_bounds in evidence_coverage. The approved hunt range is a search constraint, not observed coverage. Point timestamps, including heartbeats at one time, never establish continuous activity throughout that window. Do not imply duration, continuity, or full-window monitoring without direct coverage evidence.",

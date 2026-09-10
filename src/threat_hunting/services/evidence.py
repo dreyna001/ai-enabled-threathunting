@@ -626,6 +626,46 @@ def evidence_time_bounds(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]
     }
 
 
+def compact_evidence_records(
+    records: Sequence[Mapping[str, Any]], queries: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Group identical raw representations while retaining every citation origin.
+
+    Differing fields, times, or source namespaces remain separate. Unknown
+    sources can be grouped only within the same query. This does not establish
+    a count of unique source events and never changes persisted evidence.
+    """
+    pairs = {}
+    for query in queries:
+        try:
+            pairs[str(query["query_id"])] = source_pairs(str(query.get("spl", "")))
+        except ValueError:
+            pairs[str(query["query_id"])] = frozenset()
+    groups: dict[str, dict[str, Any]] = {}
+    output: list[dict[str, Any]] = []
+    for record in records:
+        row = _json_value(record)
+        event = row.get("selected_result", {})
+        identity = next((event.get(key) for key in ("_cd", "event_id")
+                         if isinstance(event.get(key), str) and event[key]), None)
+        if row.get("evidence_kind", "raw_event") != "raw_event" or identity is None:
+            output.append(row)
+            continue
+        source = result_source(event, pairs.get(str(row["query_id"]), frozenset()))
+        namespace = source if source != ("unknown", "unknown") else ("query", row["query_id"])
+        key = json.dumps([namespace, identity, row.get("event_time_utc"), event],
+                         sort_keys=True, ensure_ascii=False)
+        if key not in groups:
+            groups[key] = row
+            output.append(row)
+        else:
+            # The complete selected result is identical; retain other envelope
+            # fields with the original evidence/query reference for audit.
+            origin = {key: value for key, value in row.items() if key != "selected_result"}
+            groups[key].setdefault("duplicate_references", []).append(origin)
+    return output
+
+
 def lookup_retained_evidence(
     results: Mapping[str, Any], *, query_ids: set[str],
     filters: Mapping[str, Any] | None = None,
@@ -710,7 +750,8 @@ def lookup_retained_evidence(
                        "distinct_unambiguous_value_count": len(single_values),
                        "rows_with_missing_or_nonscalar_value": missing, "rows_with_multiple_distinct_values": ambiguous})
     effective_limit = min(limit, max_rows)
-    page = rows[offset:offset + effective_limit]
+    compacted = compact_evidence_records(rows, list(completed.values()))
+    page = compacted[offset:offset + effective_limit]
     next_offset = offset + len(page)
     return {
         "scope": {"query_ids": sorted(query_ids), "filters": filters,
@@ -722,11 +763,12 @@ def lookup_retained_evidence(
                             "available_result_count": completed[query_id].get("available_result_count"),
                             "retrieval_stop_reason": completed[query_id].get("retrieval_stop_reason")}
                            for query_id in sorted(query_ids)],
-        "matching_raw_record_count": len(rows), "aggregate_rows_excluded": aggregate_rows,
+        "matching_raw_record_count": len(rows), "matching_representation_group_count": len(compacted),
+        "aggregate_rows_excluded": aggregate_rows,
         "unknown_time_rows_excluded_by_window": unknown_time_excluded,
         "observed_time_bounds": evidence_time_bounds(rows), "distinct_fields": counts,
         "offset": offset, "effective_limit": effective_limit,
-        "next_offset": next_offset if next_offset < len(rows) else None,
+        "next_offset": next_offset if next_offset < len(compacted) else None,
         "records": [_json_value(item) for item in page],
         "limitation": "Counts cover matching retained raw rows and literal field values, not all source events or confirmed affected entities. Multivalue fields remain ambiguous. Repeated records do not increase distinct literal counts. Missing values and truncated searches prevent complete scope claims.",
     }

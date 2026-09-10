@@ -18,6 +18,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from fnmatch import fnmatchcase
 from itertools import islice
 from pathlib import Path
 from types import MappingProxyType
@@ -523,6 +524,34 @@ class SplunkConnector:
             return SplunkConnector._record_name(content)
         return None
 
+    def _searchable_indexes(self, *, cancellation_token: Any = None) -> tuple[set[str], set[str]]:
+        """Resolve this account's explicit and inherited index permissions."""
+
+        context = self._endpoint("current_context", "authentication/current-context", cancellation_token=cancellation_token)
+        roles = self._record_content(context[0]).get("roles") if len(context) == 1 else None
+        if (not isinstance(roles, (list, tuple)) or not roles or len(roles) > 32
+                or any(not isinstance(role, str) or role in {".", ".."}
+                       or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", role) for role in roles)):
+            raise ValueError("current account roles are unavailable or exceed the bounded role scope")
+        allowed: set[str] = set()
+        denied: set[str] = set()
+        for role in dict.fromkeys(roles):
+            records = self._endpoint("role_scope", f"authorization/roles/{role}", cancellation_token=cancellation_token)
+            if len(records) != 1 or self._record_name(records[0]) != role:
+                raise ValueError("effective role permissions are unavailable")
+            content = self._record_content(records[0])
+            for key, target in (("srchIndexesAllowed", allowed), ("imported_srchIndexesAllowed", allowed),
+                                ("srchIndexesDisallowed", denied), ("imported_srchIndexesDisallowed", denied)):
+                patterns = content.get(key, [])
+                if isinstance(patterns, str):
+                    patterns = [patterns] if patterns else []
+                if (not isinstance(patterns, (list, tuple)) or len(patterns) > self.config.max_discovery_items
+                        or any(not isinstance(pattern, str) or not re.fullmatch(r"[A-Za-z0-9_.:*-]{1,256}", pattern)
+                               for pattern in patterns)):
+                    raise ValueError("effective index permissions are malformed or exceed the discovery limit")
+                target.update(patterns)
+        return allowed, denied
+
     @staticmethod
     def _record_content(record: Mapping[str, Any]) -> Mapping[str, Any]:
         content = record.get("content")
@@ -1016,9 +1045,26 @@ class SplunkConnector:
                 normalized = self._normalize_error(exc, operation=f"discover.{label}")
                 errors.append(f"{label}: {normalized.failure.category.value}")
 
+        try:
+            allowed_patterns, denied_patterns = self._searchable_indexes(cancellation_token=cancellation_token)
+        except AdapterError as exc:
+            if exc.category is FailureCategory.CANCELLED:
+                raise
+            errors.append(f"index_scope: {exc.failure.category.value}")
+            allowed_patterns, denied_patterns = set(), set()
+        except ValueError:
+            errors.append("index_scope: effective search permissions are unavailable or malformed")
+            allowed_patterns, denied_patterns = set(), set()
+
+        def matches_index(name: str, patterns: set[str]) -> bool:
+            # Splunk's * wildcard excludes internal indexes unless the pattern
+            # starts with _. Explicit or inherited denies override all allows.
+            return any(name.startswith("_") == pattern.startswith("_") and fnmatchcase(name, pattern)
+                       for pattern in patterns)
+
         for record in results.get("indexes", []):
             name = self._record_name(record)
-            if not name:
+            if not name or not matches_index(name, allowed_patterns) or matches_index(name, denied_patterns):
                 continue
             indexes.append(name)
             content = self._record_content(record)
@@ -1040,7 +1086,9 @@ class SplunkConnector:
             if name:
                 schema_fields = self._field_names(record)
                 if schema_fields:
-                    schemas[name] = schema_fields
+                    if name in schemas and set(schemas[name]) != set(schema_fields):
+                        limitations.append(f"differing field lists were returned for sourcetype {name}; their union is observational, not an exhaustive schema")
+                    schemas[name] = list(dict.fromkeys([*schemas.get(name, []), *schema_fields]))
 
         indexed_tstats_succeeded = False
         if include_indexed_sources:

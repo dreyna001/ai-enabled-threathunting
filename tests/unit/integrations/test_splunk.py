@@ -31,6 +31,8 @@ class FakeSplunkClient:
     def get(self, path: str, **_: object) -> object:
         self.get_calls.append(path)
         return {
+            "authentication/current-context": {"entry": [{"content": {"roles": ["searcher"]}}]},
+            "authorization/roles/searcher": {"entry": [{"name": "searcher", "content": {"srchIndexesAllowed": ["*"]}}]},
             "saved/sourcetypes": {"entry": [{"name": "syslog", "content": {"fields": ["host", "message"]}}]},
             "data/fields": {"entry": [{"name": "host"}, {"name": "message"}]},
             "data/models": {"entry": [{"name": "Endpoint", "content": {"accelerated": True}}]},
@@ -62,6 +64,74 @@ def test_discovery_uses_metadata_only_and_normalizes_catalog() -> None:
     assert result.time_coverage["main"]["earliest"].endswith("Z")
     assert client.search_calls == 0
     assert "search/jobs" not in client.get_calls
+
+
+@pytest.mark.parametrize("role_content,expected", [
+    ({"srchIndexesAllowed": ["*"], "srchIndexesDisallowed": ["restricted"]}, ("main",)),
+    ({"imported_srchIndexesAllowed": ["*", "_*"]}, ("main", "restricted", "_internal")),
+    ({"srchIndexesAllowed": ["*", "_*"], "imported_srchIndexesDisallowed": ["restricted", "_*"]}, ("main",)),
+])
+def test_discovery_respects_effective_search_permissions_and_internal_index_wildcards(role_content, expected):
+    class Client(FakeSplunkClient):
+        def __init__(self):
+            super().__init__()
+            self.indexes.extend([{"name": "restricted"}, {"name": "_internal"}])
+
+        def get(self, path, **kwargs):
+            if path == "authentication/current-context":
+                return {"entry": [{"content": {"roles": ["searcher"]}}]}
+            if path == "authorization/roles/searcher":
+                return {"entry": [{"name": "searcher", "content": role_content}]}
+            return super().get(path, **kwargs)
+
+    client = Client()
+    discovery = make_connector(client).discover()
+    assert discovery.indexes == expected
+    assert set(discovery.time_coverage).issubset(expected)
+    assert client.search_calls == 0
+
+
+@pytest.mark.parametrize("response", [
+    {"entry": []},
+    *({"entry": [{"content": {"roles": roles}}]} for roles in ("unknown", [".."], ["."], ["searcher/../../admin"])),
+])
+def test_missing_or_malformed_search_permissions_do_not_authorize_catalog_indexes(response):
+    class Client(FakeSplunkClient):
+        def get(self, path, **kwargs):
+            return response if path == "authentication/current-context" else super().get(path, **kwargs)
+
+    discovery = make_connector(Client()).discover()
+    assert not discovery.complete
+    assert discovery.indexes == ()
+    assert any(error.startswith("index_scope:") for error in discovery.errors)
+
+
+def test_role_permission_failure_does_not_submit_discovery_searches():
+    class Client(FakeSplunkClient):
+        def get(self, path, **kwargs):
+            if path.startswith("authorization/roles/"):
+                raise PermissionError("role metadata denied")
+            return super().get(path, **kwargs)
+
+    client = Client()
+    discovery = make_connector(client).discover(include_indexed_sources=True)
+    assert not discovery.complete
+    assert discovery.indexes == ()
+    assert client.search_calls == 0
+    assert any(error.startswith("index_scope:") for error in discovery.errors)
+
+
+def test_repeated_sourcetype_metadata_preserves_all_observed_fields():
+    class Client(FakeSplunkClient):
+        def get(self, path, **kwargs):
+            if path == "saved/sourcetypes":
+                return {"entry": [{"name": "syslog", "content": {"fields": fields}}
+                                  for fields in (["host", "message"], ["host", "process"])]}
+            return super().get(path, **kwargs)
+
+    discovery = make_connector(Client()).discover()
+    assert set(discovery.representative_schemas["syslog"]) == {"host", "message", "process"}
+    assert any("differing" in note and "syslog" in note for note in discovery.coverage_limitations)
 
 
 def test_indexed_source_catalog_includes_sources_without_saved_configuration() -> None:

@@ -1,5 +1,17 @@
 # Remaining work and resume handoff
 
+## Active September 10 work
+
+The user has resumed the full checkpoint goal. All current source changes are together on desktop `main`; v22 is applied locally with prompt **1.23** / policy **1.4** and remains undeployed/unqualified. Services were restored to the existing v18 deployment with the same volumes, 42 hunts, zero active jobs and unchanged database fingerprints. The current candidate passed 630 backend tests with explicit UTF-8 test database connections and mypy on 55 source files; related context-fitting and adaptive-reservation checks passed 48 tests. Live and analytical qualification remain open. See the current section of [resume-checkpoint.md](resume-checkpoint.md) for exact evidence, conservative fitting limits, older-checkout reconciliation, authenticated GitHub access and authorized checkpoint pushes, the unresolved Splunk endpoint/credential mismatch, and the next work. Historical pauses below no longer prevent authorized work.
+
+## September 10 desktop restart status
+
+**Paused at the user's request. Read [resume-checkpoint.md](resume-checkpoint.md) first.** The actual desktop source is still v21 (prompt 1.22 / policy 1.4). An unfinished v22 candidate is saved as a portable patch/source snapshot under `runtime/qualification/quality-fixes-20260910/v22-paused/`; it is not applied, deployed, committed or pushed.
+
+The completed v21 focused diagnostic was reviewed and remains unacceptable for missing chronology, counts and relationship citation support. The saved candidate adds retained-page requests, completed-answer checkpoints, request-budget fitting, conservative duplicate provenance and query guidance. Latest focused verification: 21 new tests passed; earlier mypy passed, but the final full suite, final typing and three new end-to-end cases have not run. No new provider calls/searches/hunts were made. Application containers require WSL mount recovery; current database/job fingerprints are unverified. Preserve trial 14 and frozen fixtures. The checkpoint lists exact next steps and a known reference-label follow-up.
+
+## Historical previous-pause record
+
 **Paused at the user's request on September 9, 2026. Start with the [complete resume checkpoint](resume-checkpoint.md) before continuing. Work is unfinished.**
 
 The latest local source is **v21, prompt 1.22 / SPL policy 1.4**, including the v19/v20 changes below; it is **not deployed**. Latest backend verification: **581 tests passed, no skips**, 65 focused tests, mypy 55 files. The final already-running diagnostic finished with four structurally valid question answers; factual review is pending. No new tests/model calls were started after the pause request. All 42 hunts and job fingerprints are unchanged; zero jobs are queued/claimed. Services remain on v18. No commit/push or scheduled continuation was created. The checkpoint records completed work, known failures, the inert context limit, diagnostic usage, exact source/artifact locations and the ordered remaining work.

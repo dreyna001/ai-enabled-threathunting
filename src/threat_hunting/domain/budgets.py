@@ -32,6 +32,7 @@ class BudgetLimits(DomainModel):
     splunk_query_timeout_seconds: PositiveInt = 120
     splunk_transport_timeout_seconds: PositiveInt = 120
     max_model_calls: PositiveInt = 12
+    max_context_characters: PositiveInt = 500_000
     max_model_input_tokens: PositiveInt = 500_000
     max_model_output_tokens: PositiveInt = 96_000
     max_model_output_tokens_per_call: PositiveInt = 8_000

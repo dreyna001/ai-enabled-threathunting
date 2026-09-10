@@ -474,6 +474,46 @@ class QuestionAnswer(DomainModel):
         return self
 
 
+class RetainedEvidenceFilter(DomainModel):
+    """An exact typed comparison against already retained raw fields."""
+
+    field: Annotated[StrictStr, Field(min_length=1, max_length=128)]
+    value: StrictStr | StrictInt | StrictBool | Annotated[float, Field(strict=True, allow_inf_nan=False)]
+
+
+class RetainedEvidenceRequest(DomainModel):
+    """A bounded local lookup; never a request to submit a new search."""
+
+    query_ids: Annotated[list[Identifier], Field(min_length=1, max_length=50)]
+    filters: Annotated[list[RetainedEvidenceFilter], Field(max_length=8)] = Field(default_factory=list)
+    earliest_utc: UTCDateTime | None = None
+    latest_utc: UTCDateTime | None = None
+    offset: Annotated[StrictInt, Field(ge=0, le=50_000)] = 0
+    limit: Annotated[StrictInt, Field(ge=1, le=500)] = 100
+
+    @model_validator(mode="after")
+    def validate_lookup(self) -> "RetainedEvidenceRequest":
+        if len(set(self.query_ids)) != len(self.query_ids):
+            raise ValueError("lookup query references must be unique")
+        if len({item.field for item in self.filters}) != len(self.filters):
+            raise ValueError("lookup filter fields must be unique")
+        if self.earliest_utc and self.latest_utc and self.earliest_utc >= self.latest_utc:
+            raise ValueError("lookup time window must increase")
+        return self
+
+
+class QuestionAnswerStep(QuestionAnswer):
+    """Return a final answer or ask for bounded retained evidence first."""
+
+    retained_evidence_requests: Annotated[list[RetainedEvidenceRequest], Field(max_length=3)] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def defer_findings_during_retrieval(self) -> "QuestionAnswerStep":
+        if self.retained_evidence_requests and self.findings:
+            raise ValueError("request evidence before generating final findings for this question")
+        return self
+
+
 class StopDecision(DomainModel):
     """Structured decision to stop investigation and synthesize a report."""
 

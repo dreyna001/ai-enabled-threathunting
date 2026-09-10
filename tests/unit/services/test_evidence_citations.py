@@ -277,6 +277,30 @@ def test_citations_reject_cross_owner_hunt_integrity_and_incomplete_queries() ->
     assert not CitationValidator({}, {pending_query.query_id: pending_query}).validate_finding(negative_pending).valid
 
 
+@pytest.mark.parametrize("source", [None, {"status": "running"}, {"status": "completed", "outcome": "failed"}])
+def test_positive_citation_requires_successful_source_query_lineage(source) -> None:
+    owner_id, hunt_id, query_id = uuid4(), uuid4(), uuid4()
+    evidence = _evidence(owner_id=owner_id, hunt_id=hunt_id, query_id=query_id)
+    finding = FindingDraft(owner_id=owner_id, hunt_id=hunt_id, title="Observed",
+                           classification="supported_observation", statement="An event was retained.",
+                           confidence="low", evidence_ids=[evidence.evidence_id])
+    queries = {} if source is None else {query_id: {
+        "query_id": query_id, "owner_id": owner_id, "hunt_id": hunt_id, **source}}
+    result = CitationValidator({evidence.evidence_id: evidence}, queries).validate_finding(finding)
+    assert not result.valid
+    assert any(issue.startswith("query_not_") for issue in result.issues)
+
+
+@pytest.mark.parametrize("coverage", [{"outcome": "failed"}, {"truncated": True}, {"partial_fetch": True}])
+def test_negative_citation_requires_complete_successful_query_coverage(coverage) -> None:
+    owner_id, hunt_id, query_id = uuid4(), uuid4(), uuid4()
+    finding = FindingDraft(owner_id=owner_id, hunt_id=hunt_id, title="Not observed",
+                           classification="not_supported_within_scope", statement="No matches in the searched scope.",
+                           confidence="low", query_ids=[query_id], limitations=["Approved scope only."])
+    query = {"query_id": query_id, "owner_id": owner_id, "hunt_id": hunt_id, "status": "completed", **coverage}
+    assert not CitationValidator({}, {query_id: query}).validate_finding(finding).valid
+
+
 def test_truncated_positive_evidence_requires_a_limitation_and_context_stays_separate() -> None:
     owner_id, hunt_id, query_id = uuid4(), uuid4(), uuid4()
     evidence = _evidence(
@@ -294,7 +318,8 @@ def test_truncated_positive_evidence_requires_a_limitation_and_context_stays_sep
         confidence="low",
         evidence_ids=[evidence.evidence_id],
     )
-    validator = CitationValidator({evidence.evidence_id: evidence}, {})
+    query = QueryCitationRecord(query_id=query_id, owner_id=owner_id, hunt_id=hunt_id, status="completed", truncated=True)
+    validator = CitationValidator({evidence.evidence_id: evidence}, {query_id: query})
     result = validator.validate_finding(finding)
     assert not result.valid
     assert "truncation_not_disclosed" in result.issues

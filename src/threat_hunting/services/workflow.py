@@ -60,6 +60,7 @@ from threat_hunting.services.investigation import (
     _materialize_question_answers,
     _materialize_follow_up_questions,
     _question_synthesis_contract,
+    _retained_synthesis_pages,
     _synthesis_context,
     _pending_investigation_questions,
     _follow_up_proposal_errors,
@@ -1152,7 +1153,16 @@ class WorkflowService:
                 adaptive_runner = StrictModelRunner(
                     self.model_adapter,
                     counters=counters,
-                    limits=self.budget_limits,
+                    # Assessment, follow-ups, and their repairs share this
+                    # allowance; reserve a final call and half the remaining
+                    # tokens for evidence-grounded synthesis.
+                    limits=self.budget_limits.model_copy(update={
+                        "max_model_calls": self.budget_limits.max_model_calls - 1,
+                        "max_model_input_tokens": counters.model_input_tokens + (
+                            self.budget_limits.max_model_input_tokens - counters.model_input_tokens) // 2,
+                        "max_model_output_tokens": counters.model_output_tokens + (
+                            self.budget_limits.max_model_output_tokens - counters.model_output_tokens) // 2,
+                    }),
                     deadline=deadline,
                     cancellation_token=token,
                 )
@@ -1591,6 +1601,8 @@ class WorkflowService:
                 "earliest_utc": _rfc3339(policy.approved_earliest_utc),
                 "latest_utc": _rfc3339(policy.approved_latest_utc),
                 "query_execution_rules": [
+                    "For general endpoint chronology, retain relevant process lifecycle and module events; do not restrict the search to process_start OR image_load when that would omit process_end or other observed relevant actions. Preserve explicitly targeted action-specific searches.",
+                    "stats BY nullable fields can discard events missing any grouping value. Authentication logoffs may lack logon_type or authentication_method. For complete authentication chronology, prefer bounded raw records unless the supported query explicitly preserves missing groups; do not confuse missing fields with absent events.",
                     "Allowed pipeline commands are search, where, fields, table, stats, timechart, sort, head, dedup, rename, eval, regex. No other commands are supported.",
                     "Set time bounds only in earliest_utc/latest_utc proposal fields within the approved range; do not put earliest/latest in SPL.",
                     "Use a simple read-only pipeline with exact positive index and sourcetype predicates. Subsearches, macros, joins, and placeholder variables are unsupported.",
@@ -1738,7 +1750,19 @@ class WorkflowService:
                         counters=counters, token=token, deadline=query_start_deadline, require_lease=require_lease,
                     )
                 except AdapterError as exc:
-                    if exc.category != FailureCategory.HARD_TIMEOUT or _now() < query_start_deadline:
+                    if exc.category == FailureCategory.BUDGET_EXHAUSTED:
+                        require_lease()
+                        current = self._owned_row(row["owner_id"], lease.hunt_id)
+                        stopped_results = dict(current["results"] or {})
+                        stopped_results.update(
+                            adaptive_complete=True, adaptive_status="budget_reserved_for_synthesis",
+                            usage=counters.model_dump(mode="json"),
+                        )
+                        self._update(
+                            row["owner_id"], lease.hunt_id, expected_state=HuntState.RUNNING.value,
+                            results=stopped_results, updated_at_utc=_now(),
+                        )
+                    elif exc.category != FailureCategory.HARD_TIMEOUT or _now() < query_start_deadline:
                         raise
                 if continue_investigation:
                     self.execute_job(lease)
@@ -1761,29 +1785,91 @@ class WorkflowService:
             require_lease()
             current = self._owned_row(row["owner_id"], lease.hunt_id)
             results = dict(current["results"] or {}) if isinstance(current["results"], Mapping) else {}
-            synthesis_runner = StrictModelRunner(
-                self.model_adapter,
-                counters=counters,
-                limits=self.budget_limits,
-                deadline=deadline,
-                cancellation_token=token,
-            )
-            answer = synthesis_runner.run(
-                _question_synthesis_contract(plan),
-                user_payload=_synthesis_context(
-                    plan=plan,
-                    threat_intelligence=str(row["threat_intelligence"] or ""),
-                    results=results,
-                    limit=self.budget_limits.max_targeted_events,
-                ),
-                contract_name="QuestionSynthesis",
-            )
-            try:
-                results.update(_materialize_question_answers(answer, plan, results))
-            except Validation:
-                counters.model_output_checks[-1].grounding_valid = False
-                raise
-            counters.model_output_checks[-1].grounding_valid = True
+            while True:
+                completed_questions = {item["question_id"] for item in results.get("question_answers", [])}
+                pending = [question for question in plan.questions if question.question_id not in completed_questions]
+                if not pending:
+                    break
+                focused_plan = plan.model_copy(update={"questions": pending})
+                remaining_seconds = (deadline - _now()).total_seconds()
+                remaining_input = self.budget_limits.max_model_input_tokens - counters.model_input_tokens
+                remaining_output = self.budget_limits.max_model_output_tokens - counters.model_output_tokens
+                allow_retrieval = (
+                    self.budget_limits.max_model_calls - counters.model_calls >= 3
+                    and remaining_seconds > self.budget_limits.synthesis_allowance_seconds
+                    and remaining_input > 4096 and remaining_output > 1024
+                    and results.get("synthesis_retrieval_status") not in {"no_new_pages", "final_only"}
+                )
+                # A retrieval-capable step leaves one call and half of remaining
+                # tokens plus the configured synthesis time for a final answer.
+                # Repairs share these same limits.
+                step_limits = self.budget_limits.model_copy(update={
+                    "max_model_calls": self.budget_limits.max_model_calls - 1,
+                    "max_model_input_tokens": counters.model_input_tokens + remaining_input // 2,
+                    "max_model_output_tokens": counters.model_output_tokens + remaining_output // 2,
+                }) if allow_retrieval else self.budget_limits
+                synthesis_runner = StrictModelRunner(
+                    self.model_adapter, counters=counters, limits=step_limits,
+                    deadline=deadline - timedelta(seconds=self.budget_limits.synthesis_allowance_seconds) if allow_retrieval else deadline,
+                    cancellation_token=token,
+                )
+                try:
+                    answer = synthesis_runner.run(
+                        _question_synthesis_contract(focused_plan, allow_retrieval=allow_retrieval),
+                        user_payload={}, contract_name="QuestionSynthesis",
+                        context_builder=lambda limit: _synthesis_context(
+                            plan=focused_plan, threat_intelligence=str(row["threat_intelligence"] or ""),
+                            results=results, limit=limit,
+                        ),
+                    )
+                    pages = _retained_synthesis_pages(answer, focused_plan, results)
+                    generated = _materialize_question_answers(answer, focused_plan, results)
+                except AdapterError as exc:
+                    if allow_retrieval and exc.category in {FailureCategory.BUDGET_EXHAUSTED, FailureCategory.HARD_TIMEOUT}:
+                        results["synthesis_retrieval_status"] = "final_only"
+                        results["usage"] = counters.model_dump(mode="json")
+                        require_lease()
+                        self._update(row["owner_id"], lease.hunt_id, expected_state=HuntState.RUNNING.value,
+                                     results=results, updated_at_utc=_now())
+                        continue
+                    if exc.category != FailureCategory.BUDGET_EXHAUSTED:
+                        raise
+                    # A smaller context was already attempted. Preserve completed
+                    # answers and expose missing analysis instead of inventing it.
+                    pages = []
+                    generated = {"findings": [], "question_answers": [{
+                        "question_id": question.question_id, "question": question.question,
+                        "summary": "This question remains unanswered because the synthesis budget was exhausted.",
+                        "finding_ids": [], "limitations": ["The remaining call, context or token budget could not support a complete answer."],
+                    } for question in pending]}
+                    results["synthesis_retrieval_status"] = "budget_limited"
+                except Validation:
+                    counters.model_output_checks[-1].grounding_valid = False
+                    raise
+                else:
+                    counters.model_output_checks[-1].grounding_valid = True
+                for key in ("findings", "question_answers"):
+                    results.setdefault(key, []).extend(generated[key])
+                previous_pages = results.setdefault("synthesis_retrievals", [])
+                added_page = False
+                for page in pages:
+                    existing = next((prior for prior in previous_pages
+                                     if {key: value for key, value in prior.items() if key != "retrieval_round"} == page), None)
+                    if existing is None:
+                        existing = dict(page)
+                        previous_pages.append(existing)
+                        added_page = True
+                    # Repeated pages still get priority in the final answer,
+                    # including when they were omitted from a previous sample.
+                    existing["retrieval_round"] = counters.model_calls
+                if pages and not added_page:
+                    results["synthesis_retrieval_status"] = "no_new_pages"
+                results["usage"] = counters.model_dump(mode="json")
+                require_lease()
+                self._update(row["owner_id"], lease.hunt_id, expected_state=HuntState.RUNNING.value,
+                             results=results, updated_at_utc=_now())
+            question_order = {question.question_id: position for position, question in enumerate(plan.questions)}
+            results["question_answers"].sort(key=lambda item: question_order[item["question_id"]])
             results["usage"] = counters.model_dump(mode="json")
             self._update(
                 row["owner_id"],

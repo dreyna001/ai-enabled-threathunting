@@ -146,6 +146,23 @@ class StrictModelRunner:
         "telemetry, or evidence; use unknown or an empty list when required."
     )
 
+    def _request_fits(self, request: ModelRequest) -> bool:
+        # Count the complete portable request, including the schema in both
+        # system text and response_format. UTF-8 bytes plus framing reserve
+        # are a conservative input-token estimate, not measured provider usage.
+        encoded = json.dumps({"system": request.system, "messages": request.as_messages(),
+                              "response_format": request.response_format, "tools": request.tools},
+                             ensure_ascii=False, sort_keys=True, default=str)
+        return (len(encoded) <= self.limits.max_context_characters
+                and len(encoded.encode("utf-8")) + 1024
+                <= self.limits.max_model_input_tokens - self.counters.model_input_tokens)
+
+    def _output_allowance(self) -> int:
+        remaining = self.limits.max_model_output_tokens - self.counters.model_output_tokens
+        if remaining <= 0:
+            raise AdapterError(FailureCategory.BUDGET_EXHAUSTED, "model output budget exhausted", operation="model.complete")
+        return min(self.limits.max_model_output_tokens_per_call, remaining)
+
     def _call(self, request: ModelRequest, *, repair: bool, contract_name: str) -> ModelResponse:
         if self.cancellation_token is not None and getattr(self.cancellation_token, "is_cancelled", lambda: False)():
             raise AdapterError(FailureCategory.CANCELLED, "operation cancelled", operation="model.complete")
@@ -162,6 +179,12 @@ class StrictModelRunner:
                 "model call budget exhausted",
                 operation="model.complete",
             )
+        if not self._request_fits(request):
+            raise AdapterError(FailureCategory.BUDGET_EXHAUSTED,
+                               "complete model request exceeds context or remaining input budget",
+                               operation="model.complete")
+        # Repairs keep the original evidence and labels. Their full previous
+        # output and validation instructions must fit before another paid call.
         # Count before the external call, including failures.
         self.counters.record_model_call(input_tokens=0, output_tokens=0, failed=False, repair=repair)
         self.counters.model_output_checks.append(ModelOutputCheck(contract=contract_name, repair=repair))
@@ -241,29 +264,48 @@ class StrictModelRunner:
         *,
         user_payload: Mapping[str, Any] | Sequence[Any],
         contract_name: str | None = None,
+        context_builder: Callable[[int], Mapping[str, Any]] | None = None,
     ) -> T:
-        """Call the configured model and permit exactly one repair attempt."""
+        """Fit retained evidence, call the model, and permit one bounded repair."""
 
         name = str(contract_name or getattr(contract, "__name__", None) or "structured output")
-        context, references = prepare_model_context(user_payload, name)
-        plan_sources = context.get("analyst_supplied_context", {}).get("intelligence_sources", []) if name == "HuntPlan" and isinstance(context, Mapping) else None
-        payload = json.dumps(context, ensure_ascii=False, sort_keys=True, default=str)
-        response_format = structured_response_format(contract, name, references)
-        schema = json.dumps(response_format["json_schema"]["schema"], ensure_ascii=False, sort_keys=True)
-        wrapper_key = name.removesuffix("[]") if name.endswith("[]") else None
-        wrapper_instruction = (
-            f' Because the response must be a JSON object, wrap the list exactly as {{"{wrapper_key}": [...]}}.'
-            if wrapper_key is not None
-            else ""
-        )
-        system = f"{self.system_instruction} Required contract: {name}.{wrapper_instruction} JSON Schema: {schema}"
-        request = ModelRequest(
-            system=system,
-            messages=[{"role": "user", "content": payload}],
-            temperature=0,
-            max_output_tokens=self.limits.max_model_output_tokens_per_call,
-            response_format=response_format,
-        )
+        row_limit = self.limits.max_targeted_events
+        minimum_rows, maximum_rows = 1, row_limit
+        best_row_limit: int | None = None
+        while True:
+            context, references = prepare_model_context(context_builder(row_limit) if context_builder else user_payload, name)
+            plan_sources = context.get("analyst_supplied_context", {}).get("intelligence_sources", []) if name == "HuntPlan" and isinstance(context, Mapping) else None
+            payload = json.dumps(context, ensure_ascii=False, sort_keys=True, default=str)
+            response_format = structured_response_format(contract, name, references)
+            schema = json.dumps(response_format["json_schema"]["schema"], ensure_ascii=False, sort_keys=True)
+            wrapper_key = name.removesuffix("[]") if name.endswith("[]") else None
+            wrapper_instruction = (
+                f' Because the response must be a JSON object, wrap the list exactly as {{"{wrapper_key}": [...]}}.'
+                if wrapper_key is not None
+                else ""
+            )
+            system = f"{self.system_instruction} Required contract: {name}.{wrapper_instruction} JSON Schema: {schema}"
+            request = ModelRequest(
+                system=system,
+                messages=[{"role": "user", "content": payload}],
+                temperature=0,
+                max_output_tokens=self._output_allowance(),
+                response_format=response_format,
+            )
+            fits = self._request_fits(request)
+            if context_builder is None:
+                break
+            if fits:
+                best_row_limit = row_limit
+                minimum_rows = row_limit + 1
+            else:
+                maximum_rows = row_limit - 1
+            if minimum_rows > maximum_rows:
+                if fits or best_row_limit is None:
+                    break
+                row_limit = best_row_limit
+            else:
+                row_limit = (minimum_rows + maximum_rows) // 2
         last_response = ""
         for attempt in range(2):
             response = self._call(request, repair=attempt == 1, contract_name=name)
@@ -295,7 +337,7 @@ class StrictModelRunner:
                         },
                     ],
                     temperature=0,
-                    max_output_tokens=self.limits.max_model_output_tokens_per_call,
+                    max_output_tokens=self._output_allowance(),
                     response_format=response_format,
                 )
         raise AssertionError("bounded model loop did not terminate")
@@ -332,7 +374,7 @@ class StrictModelRunner:
                 {"role": "user", "content": repair_instruction},
             ],
             temperature=0,
-            max_output_tokens=self.limits.max_model_output_tokens_per_call,
+            max_output_tokens=self._output_allowance(),
             response_format=response_format,
         )
         response = self._call(request, repair=True, contract_name=name)

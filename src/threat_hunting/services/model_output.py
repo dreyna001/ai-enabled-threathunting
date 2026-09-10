@@ -9,10 +9,11 @@ from types import MappingProxyType
 from typing import Any, Mapping
 
 from threat_hunting.domain.contracts import FINDING_GROUNDING_FIELDS
-from threat_hunting.services.evidence import _flatten_scalar_values
+from threat_hunting.services.evidence import _flatten_scalar_values, compact_evidence_records
 
 
-_EVIDENCE_FIELDS = {"evidence_id", "evidence_ids", "allowed_evidence_ids", "result_row_refs", "evidence_candidate_row_refs"}
+_EVIDENCE_FIELDS = {"evidence_id", "evidence_ids", "allowed_evidence_ids", "result_row_refs", "evidence_candidate_row_refs",
+                    "returned_evidence_ids", "supplied_evidence_ids"}
 _QUERY_FIELDS = {"query_id", "query_ids", "source_query_id"}
 _SCHEMA_KEYS = {"type", "properties", "items", "$ref", "$defs", "anyOf", "enum", "format", "description", "title"}
 
@@ -30,6 +31,8 @@ class ReferenceLabels:
         records = list(context.get("retained_evidence", []))
         for query in queries:
             records.extend(query.get("retained_evidence", []))
+        records.extend({**row, **origin, "duplicate_references": []}
+                       for row in list(records) for origin in row.get("duplicate_references", []))
         evidence_by_id = {str(row["evidence_id"]): row for row in records}
         query_by_id = {str(row["query_id"]): row for row in queries}
         if any(str(row["query_id"]) not in query_by_id for row in evidence_by_id.values()):
@@ -171,7 +174,7 @@ def structured_response_format(contract: Any, name: str, references: ReferenceLa
                 else:
                     prop.clear()
                     prop.update(choice)
-                if key == "query_ids":
+                if key == "query_ids" and "evidence_ids" in result["properties"]:
                     prop["description"] = "Use [] when selecting evidence_ids; the application derives their queries. Select query labels for findings with no evidence, including zero-result searches."
         return result
 
@@ -207,14 +210,16 @@ def structured_response_format(contract: Any, name: str, references: ReferenceLa
                 variant["properties"][other_field]["maxItems"] = 0
             variants.append(variant)
         schema["$defs"]["FindingProposal"] = {"anyOf": variants}
-    if "QuestionAnswer" in schema.get("$defs", {}):
-        definition = schema["$defs"]["QuestionAnswer"]
+    for answer_name in ("QuestionAnswer", "QuestionAnswerStep"):
+        if answer_name not in schema.get("$defs", {}):
+            continue
+        definition = schema["$defs"][answer_name]
         variants = []
         for required_field in ("findings", "limitations"):
             variant = deepcopy(definition)
             variant["properties"][required_field]["minItems"] = 1
             variants.append(variant)
-        schema["$defs"]["QuestionAnswer"] = {"anyOf": variants}
+        schema["$defs"][answer_name] = {"anyOf": variants}
     if name.endswith("[]"):
         definitions = schema.pop("$defs", {})
         schema = {
@@ -230,6 +235,18 @@ def structured_response_format(contract: Any, name: str, references: ReferenceLa
 def prepare_model_context(payload: Any, name: str) -> tuple[Any, ReferenceLabels | None]:
     if name not in {"QueryAssessment[]", "FindingProposal[]", "QuestionSynthesis"}:
         return payload, None
+    payload = deepcopy(payload)
+    queries = payload.get("completed_queries", [])
+    if "retained_evidence" in payload:
+        payload["retained_evidence"] = compact_evidence_records(payload["retained_evidence"], queries)
+    for query in queries:
+        if "retained_evidence" in query:
+            query["retained_evidence"] = compact_evidence_records(query["retained_evidence"], queries)
+    payload["evidence_representation_rule"] = (
+        "Identical raw representations may share a selected_result with duplicate_references preserving "
+        "all original evidence and query citations. Differing fields or conflicting values remain separate. "
+        "Coverage counts still describe original representations, not unique source events."
+    )
     references = ReferenceLabels.from_context(payload)
     context = references.encode(payload)
     context["reference_rules"] = [

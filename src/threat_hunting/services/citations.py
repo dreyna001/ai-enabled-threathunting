@@ -31,12 +31,16 @@ class QueryCitationRecord(DomainModel):
     owner_id: UUID
     hunt_id: UUID
     status: StrictStr
+    outcome: StrictStr | None = None
+    truncated: StrictBool = False
+    partial_fetch: StrictBool = False
 
     @property
     def completed(self) -> bool:
         """Whether the query produced a completed ledger entry."""
 
-        return self.status.lower() in {"completed", "succeeded", "success"}
+        successful = self.outcome is None or self.outcome.lower() in {"success", "succeeded"}
+        return successful and self.status.lower() in {"completed", "succeeded", "success"}
 
 
 class Citation(DomainModel):
@@ -149,6 +153,11 @@ def _base_checks(
             issues.append(f"evidence_hunt_mismatch:{evidence_id}")
         if not verify_evidence_integrity(evidence):
             issues.append(f"evidence_integrity_mismatch:{evidence_id}")
+        lineage_query_id = _uuid(_attr(evidence, "query_id"))
+        if lineage_query_id is None:
+            issues.append(f"evidence_query_missing:{evidence_id}")
+        elif lineage_query_id not in unique_queries:
+            unique_queries.append(lineage_query_id)
         truncation = _attr(evidence, "truncation")
         if bool(_attr(truncation, "truncated") if truncation is not None else False):
             truncated_citation = True
@@ -167,13 +176,17 @@ def _base_checks(
         if record_hunt != hunt_id:
             issues.append(f"query_hunt_mismatch:{query_id}")
         status = _attr(query, "status")
-        completed = bool(_attr(query, "completed")) if hasattr(query, "completed") else str(status).lower() in {
+        outcome = _attr(query, "outcome")
+        successful = outcome is None or str(outcome).lower() in {"success", "succeeded"}
+        completed = str(status).lower() in {
             "completed",
             "succeeded",
             "success",
         }
-        if not completed:
+        if not completed or not successful:
             issues.append(f"query_not_completed:{query_id}")
+        if require_query and (bool(_attr(query, "truncated")) or bool(_attr(query, "partial_fetch"))):
+            issues.append(f"query_coverage_incomplete:{query_id}")
 
     # Keep issue ordering deterministic while preserving the first useful
     # diagnostic for each condition.

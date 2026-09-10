@@ -48,6 +48,8 @@ class Splunk:
 
     def get(self, path: str, **_: object) -> object:
         return {
+            "authentication/current-context": {"entry": [{"content": {"roles": ["searcher"]}}]},
+            "authorization/roles/searcher": {"entry": [{"name": "searcher", "content": {"srchIndexesAllowed": ["main"]}}]},
             "data/indexes": {"entry": [{"name": "main"}]},
             "saved/sourcetypes": {"entry": [{"name": "syslog", "content": {"fields": ["host", "event_id"]}}]},
             "data/fields": {"entry": [{"name": "host"}, {"name": "event_id"}]},
@@ -675,6 +677,150 @@ def test_elapsed_cutoff_skips_new_queries_and_preserves_synthesis(monkeypatch: p
     assert [q["status"] for q in result["query_ledger"]] == ["completed", "skipped_time_cutoff"]
     assert result["adaptive_status"] == "time_reserved_for_synthesis"
     assert len(result["evidence"]) == len(result["findings"]) == 1
-    assert synthesis_timeouts == [min(300, 1200 - elapsed)]
+    # A retrieval-capable step reserves the final 300 seconds; inside that
+    # reserve the model gets the whole remaining time and cannot request pages.
+    assert synthesis_timeouts == [120 if elapsed == 780 else 10]
     from threat_hunting.services.reports import _derive_report_limitations
     assert any("time cutoff" in text for text in _derive_report_limitations(result))
+
+
+@pytest.mark.parametrize("interrupt_after_checkpoint,repeat_page", [(False, False), (True, False), (False, True), ("cancel", False)])
+def test_synthesis_pages_checkpoint_completed_answers_and_resume_without_repeating_work(monkeypatch, interrupt_after_checkpoint, repeat_page):
+    base = _model(draft_question_ids=("q1", "q2"))._responses[0]
+    synthesis_questions = []
+
+    def response(request):
+        context = json.loads(request.messages[0]["content"])
+        if "FollowUpDecision[]" in (request.system or ""):
+            return json.dumps([{"question_id": question["question_id"], "proposal": None,
+                                "skip_reason": "Inspect the retained events during synthesis."}
+                               for question in context["follow_up_questions"]])
+        if "Required contract: QuestionSynthesis." not in (request.system or ""):
+            return base(request)
+        synthesis_questions.append([q["question_id"] for q in context["approved_plan"]["questions"]])
+        answer = json.loads(base(request))
+        if len(synthesis_questions) == 1:
+            answer["question_2"] = {
+                "summary": "Retained context is needed.", "findings": [],
+                "limitations": ["Inspect a retained page before answering."],
+                "retained_evidence_requests": [{"query_ids": [context["completed_queries"][0]["query_id"]],
+                                                "filters": [{"field": "host", "value": "host-1"}], "limit": 1}],
+            }
+        else:
+            assert context["retained_lookup_pages"][0]["matching_raw_record_count"] == 1
+            assert context["retained_lookup_pages"][0]["returned_evidence_ids"]
+            assert context["retained_lookup_pages"][0]["query_coverage"][0]["result_count"] == 1
+            if repeat_page and len(synthesis_questions) == 2:
+                answer["question_1"] = {
+                    "summary": "Inspect the page again.", "findings": [], "limitations": ["Review retained context."],
+                    "retained_evidence_requests": [{"query_ids": [context["completed_queries"][0]["query_id"]],
+                                                    "filters": [{"field": "host", "value": "host-1"}], "limit": 1}],
+                }
+            elif repeat_page:
+                assert "retained_evidence_requests" not in json.dumps(request.response_format)
+        return json.dumps(answer)
+
+    engine = create_engine("sqlite+pysqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    workflow_metadata.create_all(engine)
+    jobs_metadata.create_all(engine)
+    model = FakeModelAdapter(responses=[response] * 20)
+    service = WorkflowService(engine, model_adapter=model,
+                              splunk_connector=SplunkConnector(SplunkConnectionConfig(endpoint="https://splunk.example", token="test-token"), client=Splunk()),
+                              execution_config={"provider": "fake", "model_name": "test"})
+    hid = str(service.create_hunt("owner-1", title="Recover synthesis", hypothesis="h", objective="o")["hunt_id"])
+    service.discover("owner-1", hid)
+    service.approve("owner-1", hid, "reviewed")
+    service.execute("owner-1", hid)
+    lease = service.jobs.claim("worker-1")
+    update = service._update
+
+    def crash_after_persist(*args, **kwargs):
+        result = update(*args, **kwargs)
+        value = kwargs.get("results", {})
+        if value.get("synthesis_retrievals") and len(value.get("question_answers", [])) == 1:
+            raise SystemExit("simulated worker loss after durable checkpoint")
+        return result
+
+    if interrupt_after_checkpoint:
+        monkeypatch.setattr(service, "_update", crash_after_persist)
+        with pytest.raises(SystemExit):
+            service.execute_job(lease)
+        checkpoint = service.results("owner-1", hid)
+        assert len(checkpoint["question_answers"]) == len(checkpoint["findings"]) == 1
+        saved_finding = checkpoint["findings"][0]
+        saved_queries = checkpoint["queries"]
+        monkeypatch.setattr(service, "_update", update)
+        if interrupt_after_checkpoint == "cancel":
+            service.cancel("owner-1", hid)
+            calls = model.call_count
+            with pytest.raises(Conflict, match="lease"):
+                service.execute_job(lease)
+            assert service.get_hunt("owner-1", hid)["state"] == "cancelled"
+            assert service.results("owner-1", hid) == checkpoint
+            assert model.call_count == calls
+            return
+    service.execute_job(lease)
+    result = service.results("owner-1", hid)
+    assert synthesis_questions == [["q1", "q2"], ["q2"]] + ([["q2"]] if repeat_page else [])
+    assert [item["question_id"] for item in result["question_answers"]] == ["q1", "q2"]
+    assert len(result["synthesis_retrievals"]) == 1
+    if repeat_page:
+        assert result["synthesis_retrieval_status"] == "no_new_pages"
+    assert len(result["findings"]) == 1
+    assert service.get_hunt("owner-1", hid)["state"] == "report_draft"
+    if interrupt_after_checkpoint:
+        assert result["findings"][0] == saved_finding
+        assert result["queries"] == saved_queries
+
+
+def test_synthesis_context_exhaustion_preserves_explicit_unanswered_question(monkeypatch):
+    engine = create_engine("sqlite+pysqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    workflow_metadata.create_all(engine)
+    jobs_metadata.create_all(engine)
+    model = _model()
+    service = WorkflowService(engine, model_adapter=model,
+                              splunk_connector=SplunkConnector(SplunkConnectionConfig(endpoint="https://splunk.example", token="test-token"), client=Splunk()),
+                              execution_config={"provider": "fake", "model_name": "test"})
+    hid = str(service.create_hunt("owner-1", title="Bounded synthesis", hypothesis="h", objective="o")["hunt_id"])
+    service.discover("owner-1", hid)
+    service.approve("owner-1", hid, "reviewed")
+    service.execute("owner-1", hid)
+    lease = service.jobs.claim("worker-1")
+    from threat_hunting.services import workflow
+    context = workflow._synthesis_context
+    monkeypatch.setattr(workflow, "_synthesis_context", lambda **kwargs: {**context(**kwargs), "advisory_context": "x" * 500_001})
+    service.execute_job(lease)
+    result = service.results("owner-1", hid)
+    assert result["synthesis_retrieval_status"] == "budget_limited"
+    assert result["findings"] == []
+    assert result["question_answers"][0]["finding_ids"] == []
+    assert "budget" in result["question_answers"][0]["limitations"][0]
+    assert not any("Required contract: QuestionSynthesis." in (r.system or "") for r in model.requests)
+    assert service.get_hunt("owner-1", hid)["state"] == "report_draft"
+
+
+def test_oversized_assessment_preserves_retained_evidence_for_final_synthesis(monkeypatch):
+    from threat_hunting.services import workflow
+
+    engine = create_engine("sqlite+pysqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    workflow_metadata.create_all(engine)
+    jobs_metadata.create_all(engine)
+    model = _model()
+    service = WorkflowService(engine, model_adapter=model,
+                              splunk_connector=SplunkConnector(SplunkConnectionConfig(endpoint="https://splunk.example", token="test-token"), client=Splunk()),
+                              execution_config={"provider": "fake", "model_name": "test"})
+    hid = str(service.create_hunt("owner-1", title="Reserve final answer", hypothesis="h", objective="o")["hunt_id"])
+    service.discover("owner-1", hid)
+    service.approve("owner-1", hid, "reviewed")
+    service.execute("owner-1", hid)
+    lease = service.jobs.claim("worker-1")
+    original = workflow._assessment_context
+    monkeypatch.setattr(workflow, "_assessment_context", lambda *args, **kwargs: {
+        **original(*args, **kwargs), "advisory_context": "x" * 500_001})
+    service.execute_job(lease)
+    result = service.results("owner-1", hid)
+    assert result["adaptive_status"] == "budget_reserved_for_synthesis"
+    assert len(result["evidence"]) == len(result["findings"]) == 1
+    assert result["usage"]["model_calls"] == 2
+    assert not any("Required contract: QueryAssessment[]." in (r.system or "") for r in model.requests)
+    assert service.get_hunt("owner-1", hid)["state"] == "report_draft"
