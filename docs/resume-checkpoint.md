@@ -22,7 +22,7 @@ Final local verification:
 - frontend: **21 unit tests**, type check, production build, and **one Playwright E2E smoke test** passed;
 - synthetic known-answer suite: **12/12 passed**, 100% scripted recovery, no fabricated evidence or citation failures;
 - Compose config, immutable image build/deploy, health checks, database preservation, and diff whitespace checks passed;
-- remote [CI for implementation commit `325795e`](https://github.com/dreyna001/ai-enabled-threathunting/actions/runs/34661799196) passed both backend and frontend jobs.
+- remote [CI for local-qualification commit `01d7768`](https://github.com/dreyna001/ai-enabled-threathunting/actions/runs/34663507327) passed both backend and frontend jobs.
 
 Do not run the paid twelve-case live matrix yet. It still requires real protected abstract-to-fixture mappings, real scenario execution/export bindings, and deterministic timeout, repair, restart, hard-budget, and cancellation injection. Do not simulate those outcomes or treat the offline scorer as provider qualification.
 
