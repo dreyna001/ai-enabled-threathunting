@@ -31,7 +31,9 @@ Remaining work is external or deferred:
 1. obtain independent analyst acceptance;
 2. verify production HTTPS/certificates, a real least-privilege account, and the external approval reference in the target environment;
 3. qualify rollback when a future release changes schema;
-4. optimize cost/cache behavior only after accuracy acceptance, using trial 17 as a measured baseline.
+4. optimize cost/cache behavior only after accuracy acceptance, using trial 17 as a measured baseline;
+5. finish the small MCP service with authorization, auditing, cancellation, replay protection, and internal TLS before enabling MCP execution;
+6. optionally move PydanticAI from adapter-backed FunctionModel transport to native OpenAI/Bedrock models. The structured Agent boundary is already in place.
 
 ## Historical pause: September 10, 2026, 18:45 EDT
 
