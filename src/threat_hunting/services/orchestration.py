@@ -1,9 +1,10 @@
 """Bounded production orchestration for model and Splunk operations.
 
-The service layer owns contracts, budgets, policy, and evidence identity.  The
-provider adapters in :mod:`threat_hunting.integrations` only transport data.
-This module deliberately has no provider fallback: a production caller must
-inject the configured adapter selected by the immutable execution snapshot.
+The service layer owns contracts, budgets, policy, and evidence identity.
+Structured model calls go through one PydanticAI Agent step; provider adapters
+only transport data.  This module deliberately has no provider fallback: a
+production caller must inject the configured adapter selected by the immutable
+execution snapshot.
 """
 
 from __future__ import annotations
@@ -31,6 +32,7 @@ from threat_hunting.domain.errors import FailureCategory, failure_metadata
 from threat_hunting.domain.spl_policy import SPLPolicy, parse_spl, source_pairs
 from threat_hunting.integrations.errors import AdapterError
 from threat_hunting.integrations.models.base import ModelAdapter, ModelRequest, ModelResponse
+from threat_hunting.integrations.models.pydantic_ai_runtime import complete_structured
 from threat_hunting.integrations.splunk import SplunkConnector, SplunkDiscovery
 from threat_hunting.services.model_output import ReferenceLabels, prepare_model_context, structured_response_format
 from threat_hunting.services.evidence import result_source
@@ -207,7 +209,8 @@ class StrictModelRunner:
         self.counters.model_output_checks.append(check)
         began = time.monotonic()
         try:
-            response = self.adapter.complete(
+            response = complete_structured(
+                self.adapter,
                 request,
                 timeout_seconds=timeout_seconds,
                 cancellation_token=self.cancellation_token,
