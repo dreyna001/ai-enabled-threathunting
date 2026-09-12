@@ -26,7 +26,7 @@ from typing import Any, Protocol
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from threat_hunting.domain.contracts import HuntPlan, RetainedInventory
+from threat_hunting.domain.contracts import HuntPlan, MAX_STORED_QUESTION_INVENTORIES, RetainedInventory
 from threat_hunting.domain.errors import Validation
 from threat_hunting.services.evidence import evidence_time_bounds, query_source_coverage, retained_lead_activity, retained_timeline
 
@@ -270,7 +270,7 @@ def validate_report_content(
             if available_finding_ids is not None and not set(answer["finding_ids"]).issubset(available_finding_ids):
                 raise ReportValidationError("question answer references unavailable findings")
             inventories = answer.get("inventories", [])
-            if not isinstance(inventories, list) or len(inventories) > 3:
+            if not isinstance(inventories, list) or len(inventories) > MAX_STORED_QUESTION_INVENTORIES:
                 raise ReportValidationError("question inventories must be a bounded array")
             for inventory in inventories:
                 try:

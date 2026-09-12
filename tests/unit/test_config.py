@@ -6,6 +6,7 @@ import pytest
 from sqlalchemy import create_engine
 
 from threat_hunting.config import ConfigurationError, RuntimeSettings, load_database_url
+from threat_hunting.domain.common import is_absolute_config_path
 from threat_hunting.services import runtime
 
 
@@ -70,6 +71,28 @@ def test_hunt_time_reserves_follow_runtime_settings(tmp_path: Path, minutes: int
             limits.max_inflight_query_seconds_after_cutoff, limits.synthesis_allowance_seconds) == expected
     assert limits.max_model_call_timeout_seconds == model_seconds
     assert limits.max_model_calls == 12
+
+
+@pytest.mark.parametrize(
+    ("path", "expected"),
+    [
+        ("/var/lib/threat-hunting", True),
+        ("/tmp/missing-ca.pem", True),
+        ("tmp/missing-ca.pem", False),
+        ("./secrets/ca.pem", False),
+    ],
+)
+def test_absolute_config_path_accepts_posix_and_rejects_relative(path: str, expected: bool) -> None:
+    assert is_absolute_config_path(Path(path)) is expected
+    if expected:
+        assert is_absolute_config_path(path) is True
+
+
+def test_settings_reject_relative_storage_paths(tmp_path: Path) -> None:
+    value = valid_config(tmp_path)
+    value["storage"]["persistent_path"] = "relative/persistent"
+    with pytest.raises(ValueError, match="storage paths must be absolute"):
+        RuntimeSettings.model_validate(value)
 
 
 def test_shipped_runtime_uses_twenty_minutes_and_five_minute_model_calls() -> None:

@@ -55,6 +55,9 @@ QUERY_RESULT_LIMITS = MappingProxyType({
     ResultMode.TARGETED: 10_000,
 })
 
+MAX_MODEL_INVENTORY_SCOPES = 3
+MAX_STORED_QUESTION_INVENTORIES = 500
+
 
 class FindingClassification(StrEnum):
     """Permitted finding classifications."""
@@ -552,7 +555,7 @@ class QuestionAnswer(DomainModel):
         "not a limit on the findings or evidence retained for the investigation."
     ))
     findings: list[FindingProposal]
-    inventory_scopes: Annotated[list[RetainedEvidenceScope], Field(max_length=3)] = Field(default_factory=list, description=(
+    inventory_scopes: Annotated[list[RetainedEvidenceScope], Field(max_length=MAX_MODEL_INVENTORY_SCOPES)] = Field(default_factory=list, description=(
         "Select retained query/filter/time scopes when this question asks for counts of hosts, users, "
         "IP addresses, process names, process GUIDs or sessions. The application calculates exact "
         "distinct literal counts from all matching retained raw rows and presents scoped tables. "

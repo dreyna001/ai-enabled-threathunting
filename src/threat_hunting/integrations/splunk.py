@@ -27,6 +27,7 @@ from urllib.parse import urlsplit
 
 from pydantic import SecretStr
 
+from threat_hunting.domain.common import is_absolute_config_path
 from threat_hunting.domain.errors import FailureCategory
 
 from .errors import AdapterError
@@ -101,7 +102,7 @@ class SplunkConnectionConfig:
             raise ValueError("TLS verification can be disabled only in an explicitly enabled lab")
         if parsed.scheme == "http" and self.verify_tls:
             raise ValueError("TLS verification requires an https Splunk endpoint")
-        if self.ca_bundle_path is not None and not Path(self.ca_bundle_path).is_absolute():
+        if self.ca_bundle_path is not None and not is_absolute_config_path(self.ca_bundle_path):
             raise ValueError("ca_bundle_path must be absolute")
         if self.timeout_seconds <= 0 or self.timeout_seconds > 300:
             raise ValueError("timeout_seconds must be greater than 0 and at most 300")

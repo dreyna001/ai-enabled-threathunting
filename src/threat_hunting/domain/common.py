@@ -8,6 +8,7 @@ the same validation rules can be used by API, worker, and test code.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
@@ -97,3 +98,13 @@ def validate_uuid(value: UUID) -> UUID:
     """Return a UUID unchanged; useful as an explicit validator target."""
 
     return value
+
+
+def is_absolute_config_path(value: Path | str) -> bool:
+    """Return whether ``value`` names an absolute native or POSIX/container path."""
+
+    path = Path(value)
+    if path.is_absolute():
+        return True
+    posix = path.as_posix()
+    return posix.startswith("/") and not posix.startswith("//")

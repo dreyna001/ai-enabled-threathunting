@@ -33,6 +33,7 @@ from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from threat_hunting.db import action_digest, deterministic_sid
+from threat_hunting.domain.common import is_absolute_config_path
 from threat_hunting.domain.errors import FailureCategory
 
 from .errors import AdapterError
@@ -106,7 +107,7 @@ class MCPConnectionConfig:
             value = getattr(self, field_name)
             if value is not None:
                 path = Path(value)
-                if not path.is_absolute():
+                if not is_absolute_config_path(path):
                     raise ValueError(f"{field_name} must be absolute")
                 object.__setattr__(self, field_name, path)
         if self.service_subject is not None and not self.service_subject.strip():

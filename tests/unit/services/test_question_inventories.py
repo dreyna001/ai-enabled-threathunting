@@ -8,8 +8,19 @@ from uuid import uuid4
 
 import pytest
 
+from threat_hunting.domain.contracts import MAX_STORED_QUESTION_INVENTORIES
 from threat_hunting.domain.errors import Validation
 from threat_hunting.integrations.models.fake import FakeModelAdapter
+from threat_hunting.services.evidence import (
+    advisory_lead_groups,
+    lead_session_spl_disjunction,
+    question_requires_all_lead_coverage,
+    retained_lead_session_filters,
+    spl_covers_all_lead_sessions,
+    spl_covers_lead_session,
+    spl_literal,
+    widen_spl_for_lead_sessions,
+)
 from threat_hunting.services.investigation import _materialize_question_answers, _question_synthesis_contract
 from threat_hunting.services.orchestration import ModelContractError, StrictModelRunner
 from threat_hunting.services.reports import ReportValidationError, _concise_report_content, _formatted_pdf, _validate_report_content, render_report_html
@@ -35,14 +46,15 @@ def response():
                            "inventory_scopes": [{"query_ids": ["Q1"], "filters": [], "earliest_utc": None, "latest_utc": None}]}}
 
 
-def materialized(source=None, answer=None):
+def materialized(source=None, answer=None, *, hunt_plan=None):
     source = source or state()
+    hunt_plan = hunt_plan or plan()
     model = FakeModelAdapter(responses=[json.dumps(answer or response())])
-    parsed = StrictModelRunner(model).run(_question_synthesis_contract(plan()), contract_name="QuestionSynthesis", user_payload={
+    parsed = StrictModelRunner(model).run(_question_synthesis_contract(hunt_plan), contract_name="QuestionSynthesis", user_payload={
         "completed_queries": source["queries"], "retained_evidence": source["evidence"][:1],
         "retained_query_inventories": [{"should_not_reach_model": True}],
     })
-    return _materialize_question_answers(parsed, plan(), source), model
+    return _materialize_question_answers(parsed, hunt_plan, source), model
 
 
 def test_inventory_counts_all_retained_rows_without_model_transcription():
@@ -167,6 +179,91 @@ def test_inventory_persistence_rechecks_scope(scope_change):
         _materialize_question_answers(parsed, plan(), source)
 
 
+def _five_lead_state():
+    query = str(uuid4())
+    evidence = []
+    for index in range(5):
+        evidence.append({
+            "query_id": query, "evidence_id": str(uuid4()), "evidence_kind": "raw_event",
+            "event_time_utc": f"2026-01-0{index + 1}T12:00:00Z",
+            "selected_result": {
+                "host": f"host-{index}", "user": f"user-{index}",
+                "session_id": f"session-{index}", "process_guid": f"guid-{index}",
+                "file_name": "observed.exe",
+            },
+            "advisory_ioc_comparison": {"matched_file_name_literals": ["observed.exe"]},
+        })
+    return {
+        "queries": [{"query_id": query, "question_id": "approved-spread", "status": "completed", "result_count": 5, "truncated": False}],
+        "evidence": evidence,
+    }
+
+
+def _materialize_direct(source, answer, *, hunt_plan):
+    parsed = _question_synthesis_contract(hunt_plan).model_validate(answer)
+    return _materialize_question_answers(
+        parsed, hunt_plan, source, threat_intelligence="[file:name = 'observed.exe']",
+    )
+
+
+def test_count_question_materializes_five_application_owned_session_inventories():
+    source = _five_lead_state()
+    plan = SimpleNamespace(
+        questions=[SimpleNamespace(
+            question_id="approved-spread",
+            question="Across how many distinct related hosts, users, source or destination IPs, and processes were communications observed?",
+        )],
+        scope=SimpleNamespace(earliest_utc=datetime(2026, 1, 1, tzinfo=timezone.utc),
+                              latest_utc=datetime(2026, 1, 10, tzinfo=timezone.utc)),
+    )
+    answer = {"question_1": {"summary": "Refer to measured tables.", "findings": [], "lead_coverage": [],
+                             "inventory_scopes": [], "limitations": ["Counts remain scoped."]}}
+    stored = _materialize_direct(source, answer, hunt_plan=plan)
+    inventories = stored["question_answers"][0]["inventories"]
+    assert len(inventories) == 5
+    sessions = {json.dumps(item["scope"]["filters"], sort_keys=True) for item in inventories}
+    assert len(sessions) == 5
+
+
+def test_unrelated_question_does_not_auto_add_inventories():
+    source = _five_lead_state()
+    plan = SimpleNamespace(
+        questions=[SimpleNamespace(question_id="approved-spread",
+                                   question="What authentication activity is associated with related hosts and users?")],
+        scope=SimpleNamespace(earliest_utc=datetime(2026, 1, 1, tzinfo=timezone.utc),
+                              latest_utc=datetime(2026, 1, 10, tzinfo=timezone.utc)),
+    )
+    answer = {"question_1": {"summary": "No inventories requested.", "findings": [], "lead_coverage": [],
+                             "inventory_scopes": [], "limitations": ["Authentication only."]}}
+    stored = _materialize_direct(source, answer, hunt_plan=plan)
+    assert "inventories" not in stored["question_answers"][0]
+
+
+def test_report_accepts_five_inventories_and_rejects_overflow():
+    source = _five_lead_state()
+    plan = SimpleNamespace(
+        questions=[SimpleNamespace(
+            question_id="approved-spread",
+            question="Across how many distinct related hosts, users, source or destination IPs, and processes were communications observed?",
+        )],
+        scope=SimpleNamespace(earliest_utc=datetime(2026, 1, 1, tzinfo=timezone.utc),
+                              latest_utc=datetime(2026, 1, 10, tzinfo=timezone.utc)),
+    )
+    answer = {"question_1": {"summary": "Refer to measured tables.", "findings": [], "lead_coverage": [],
+                             "inventory_scopes": [], "limitations": ["Counts remain scoped."]}}
+    stored = _materialize_direct(source, answer, hunt_plan=plan)
+    report = _concise_report_content(hypothesis="h", objective="o", data_sources=[], results=stored,
+                                     coverage_and_limitations=[], conclusion_and_disposition="Review remains open.")
+    assert len(report["question_answers"][0]["inventories"]) == 5
+    assert _validate_report_content(report, stored) == report
+    overflow = deepcopy(report)
+    overflow["question_answers"][0]["inventories"].extend(
+        [deepcopy(overflow["question_answers"][0]["inventories"][0])] * (MAX_STORED_QUESTION_INVENTORIES - 4)
+    )
+    with pytest.raises(Validation, match="inventor"):
+        _validate_report_content(overflow, stored)
+
+
 def test_filtered_inventory_reports_unknown_time_and_missing_filter_boundaries():
     source = state()
     source["evidence"][0]["event_time_utc"] = "unknown"
@@ -181,3 +278,58 @@ def test_filtered_inventory_reports_unknown_time_and_missing_filter_boundaries()
     inventory = stored["question_answers"][0]["inventories"][0]
     assert inventory["raw_record_count"] == 0
     assert any("zero matches does not establish absence" in item for item in inventory["limitations"])
+
+
+@pytest.mark.parametrize("question,expected", [
+    ("What related endpoint execution records occur around each lead?", True),
+    ("Review all leads for related authentication activity.", True),
+    ("What authentication activity is associated with related hosts and users?", True),
+    ("What DNS and network activity is associated with related processes and hosts?", True),
+    ("Do scoped endpoint records contain an exact advisory hash or filename match?", False),
+    ("Pivot the observed host for unrelated telemetry.", False),
+])
+def test_question_requires_all_lead_coverage(question, expected):
+    assert question_requires_all_lead_coverage(question) is expected
+
+
+def test_lead_session_disjunction_covers_five_sessions_and_escapes_literals():
+    sessions = [
+        {"host": f"host-{index}", "user": f"user-{index}", "session_id": f"session-{index}"}
+        for index in range(5)
+    ]
+    sessions[0]["user"] = r'CORP\j."smith'
+    disjunction = lead_session_spl_disjunction(sessions)
+    for session in sessions:
+        assert spl_covers_lead_session(disjunction, session)
+    assert spl_literal(r'CORP\j."smith') in disjunction
+    assert 'host="host-4"' in disjunction
+    assert disjunction.count(" OR ") == 4
+
+
+def test_spl_covers_lead_session_requires_and_conjunction_not_or_pivot():
+    session = {"host": "ws-17.corp.example", "user": r"CORP\j.smith", "session_id": "799a2e31-bb86-53af-818e-7a4fc8b5b766"}
+    narrow = (
+        '(host="ws-17.corp.example" OR user="CORP\\j.smith" '
+        'OR session_id="799a2e31-bb86-53af-818e-7a4fc8b5b766")'
+    )
+    wide = (
+        f'(host={spl_literal(session["host"])} AND user={spl_literal(session["user"])} '
+        f'AND session_id={spl_literal(session["session_id"])})'
+    )
+    assert not spl_covers_lead_session(narrow, session)
+    assert spl_covers_lead_session(wide, session)
+
+
+def test_widen_spl_replaces_ws17_only_auth_filter_with_all_five_sessions():
+    sessions = retained_lead_session_filters(advisory_lead_groups(_five_lead_state()["evidence"]))
+    assert len(sessions) == 5
+    original = (
+        'search index=auth sourcetype=auth '
+        '(host="host-0" OR user="user-0" OR session_id="session-0") | table host user session_id'
+    )
+    assert not spl_covers_all_lead_sessions(original, sessions)
+    widened = widen_spl_for_lead_sessions(original, sessions)
+    assert spl_covers_all_lead_sessions(widened, sessions)
+    assert "index=auth" in widened
+    assert "| table host user session_id" in widened
+    assert "host-4" in widened and "session-4" in widened

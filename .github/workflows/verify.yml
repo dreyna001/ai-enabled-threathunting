@@ -13,7 +13,7 @@ jobs:
     timeout-minutes: 15
     services:
       postgres:
-        image: postgres:16-alpine
+        image: postgres:16-alpine@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685
         env:
           POSTGRES_DB: threat_hunting_test
           POSTGRES_USER: postgres
@@ -57,3 +57,8 @@ jobs:
       - run: npm ci --ignore-scripts
       - run: npm run test:unit
       - run: npm run build
+      - name: Install Playwright Chromium
+        run: npx playwright install chromium --with-deps
+      - run: npm run test:e2e
+        env:
+          CI: "true"

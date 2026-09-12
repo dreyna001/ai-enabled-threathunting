@@ -12,6 +12,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, PositiveFloat, PositiveInt, SecretStr, field_validator, model_validator
 
+from threat_hunting.domain.common import is_absolute_config_path
+
 
 CONFIG_ENV = "THREAT_HUNTING_CONFIG"
 DATABASE_URL_FILE_ENV = "THREAT_HUNTING_DATABASE_URL_FILE"
@@ -38,7 +40,7 @@ class StorageSettings(StrictModel):
     @field_validator("persistent_path", "temporary_path")
     @classmethod
     def path_must_be_absolute(cls, value: Path) -> Path:
-        if not value.is_absolute():
+        if not is_absolute_config_path(value):
             raise ValueError("storage paths must be absolute")
         return value
 
@@ -62,7 +64,7 @@ class TlsSettings(StrictModel):
     def insecure_mode_requires_explicit_lab_flag(self) -> "TlsSettings":
         if not self.verify and not self.lab_only_allow_insecure:
             raise ValueError("TLS verification can be disabled only with lab_only_allow_insecure=true")
-        if self.ca_bundle_path is not None and not self.ca_bundle_path.is_absolute():
+        if self.ca_bundle_path is not None and not is_absolute_config_path(self.ca_bundle_path):
             raise ValueError("ca_bundle_path must be absolute")
         return self
 
@@ -248,7 +250,7 @@ class ExecutionSettings(StrictModel):
     @field_validator("mcp_ca_bundle_path", "mcp_client_cert_path", "mcp_client_key_path")
     @classmethod
     def mcp_tls_paths_must_be_absolute(cls, value: Path | None) -> Path | None:
-        if value is not None and not value.is_absolute():
+        if value is not None and not is_absolute_config_path(value):
             raise ValueError("MCP TLS certificate paths must be absolute")
         return value
 

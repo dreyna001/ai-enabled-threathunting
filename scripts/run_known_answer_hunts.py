@@ -27,6 +27,15 @@ sys.path.insert(0, str(ROOT / "tests"))
 
 from known_answer.observed import score_observed_runs  # noqa: E402
 
+from known_answer.bindings import (  # noqa: E402
+    BINDINGS_ENV,
+    BindingsError,
+    HuntResultExport,
+    KnownAnswerBindings,
+    adapter_configuration_without_bindings,
+    extract_synthetic_runs,
+    load_bindings_from_env,
+)
 from known_answer.harness import (  # noqa: E402
     KnownAnswerError,
     SyntheticRun,
@@ -35,6 +44,7 @@ from known_answer.harness import (  # noqa: E402
     run_suite,
     score_runs,
 )
+from threat_hunting.domain.common import is_absolute_config_path  # noqa: E402
 from threat_hunting.integrations.models import ModelConfiguration, ModelFactory  # noqa: E402
 from threat_hunting.integrations.splunk import SplunkConnectionConfig, SplunkConnector  # noqa: E402
 
@@ -45,6 +55,7 @@ class LiveConfigurationError(RuntimeError):
 
 _LIVE_ADAPTER_ENV = "THREAT_HUNTING_KNOWN_ANSWER_LIVE_ADAPTER"
 _FIXTURE_ID_ENV = "THREAT_HUNTING_KNOWN_ANSWER_FIXTURE_ID"
+_IMPLEMENTED_FAULT_INJECTORS: frozenset[str] = frozenset()
 
 
 def _env_flag(name: str, *, default: bool = False) -> bool:
@@ -156,7 +167,7 @@ def _build_live_adapters(configuration: Mapping[str, str]) -> tuple[SplunkConnec
     ca_bundle = os.environ.get("THREAT_HUNTING_TLS_CA_BUNDLE_FILE")
     if ca_bundle:
         ca_path = Path(ca_bundle)
-        if not ca_path.is_absolute():
+        if not is_absolute_config_path(ca_path):
             raise LiveConfigurationError("THREAT_HUNTING_TLS_CA_BUNDLE_FILE must be an absolute path")
     else:
         ca_path = None
@@ -196,37 +207,60 @@ def _build_live_adapters(configuration: Mapping[str, str]) -> tuple[SplunkConnec
     return splunk, model
 
 
-def _coerce_live_runs(raw_runs: object) -> list[SyntheticRun]:
-    """Normalize adapter records into the evaluator's strict terminal contract."""
+def _assert_live_matrix_ready(bindings: KnownAnswerBindings) -> None:
+    """Block the paid twelve-case matrix until fault injection is supplied."""
 
-    if not isinstance(raw_runs, Sequence) or isinstance(raw_runs, (str, bytes)):
-        raise LiveConfigurationError("live workflow adapter must return a runs list")
-    runs: list[SyntheticRun] = []
-    tuple_fields = {
-        "retained_evidence_ids",
-        "cited_evidence_ids",
-        "fabricated_evidence_ids",
-        "citation_failures",
-    }
-    for item in raw_runs:
+    blocked = bindings.fault_scenarios_blocked_for_live(_IMPLEMENTED_FAULT_INJECTORS)
+    if blocked:
+        raise LiveConfigurationError(
+            "live qualification is blocked: deterministic fault injection is required for "
+            f"{', '.join(blocked)}; supply a supported fault injector in the private bindings file"
+        )
+
+
+def _coerce_live_exports(raw_exports: object, bindings: KnownAnswerBindings) -> list[SyntheticRun]:
+    """Normalize terminal hunt exports through the validated binding extractor."""
+
+    if not isinstance(raw_exports, Sequence) or isinstance(raw_exports, (str, bytes)):
+        raise LiveConfigurationError("live workflow adapter must return an exports list")
+    exports: list[HuntResultExport] = []
+    for item in raw_exports:
         if not isinstance(item, Mapping):
-            raise LiveConfigurationError("live workflow adapter returned a malformed scenario result")
-        values = dict(item)
-        for field in tuple_fields:
-            value = values.get(field, ())
-            if isinstance(value, str) or not isinstance(value, Sequence):
-                raise LiveConfigurationError(f"live scenario field {field} must be a list")
-            values[field] = tuple(str(entry) for entry in value)
-        try:
-            runs.append(SyntheticRun(**values))
-        except (TypeError, ValueError) as exc:
-            raise LiveConfigurationError("live workflow adapter returned an invalid scenario result") from exc
-    return runs
+            raise LiveConfigurationError("live workflow adapter returned a malformed scenario export")
+        scenario_id = item.get("scenario_id")
+        results = item.get("results")
+        if not isinstance(scenario_id, str) or not scenario_id:
+            raise LiveConfigurationError("live workflow export requires scenario_id")
+        if not isinstance(results, Mapping):
+            raise LiveConfigurationError("live workflow export requires results")
+        binding = bindings.scenarios.get(scenario_id)
+        if binding is None:
+            raise LiveConfigurationError(f"live workflow export references unknown scenario: {scenario_id}")
+        exports.append(
+            HuntResultExport(
+                scenario_id=scenario_id,
+                category=binding.category,
+                terminal_state=str(item["terminal_state"]) if item.get("terminal_state") is not None else None,
+                limitation=str(item.get("limitation", "")),
+                results=dict(results),
+            )
+        )
+    try:
+        return extract_synthetic_runs(exports, bindings)
+    except BindingsError as exc:
+        raise LiveConfigurationError(str(exc)) from exc
 
 
 def run_live_suite(configuration: Mapping[str, str]) -> dict[str, Any]:
     """Run and score the configured live workflow against non-production fixtures."""
 
+    try:
+        bindings = load_bindings_from_env(BINDINGS_ENV)
+    except BindingsError as exc:
+        raise LiveConfigurationError(str(exc)) from exc
+    _assert_live_matrix_ready(bindings)
+    if bindings.fixture_id != configuration["fixture_id"]:
+        raise LiveConfigurationError("configured fixture identifier does not match private scenario bindings")
     callback = _load_live_adapter(configuration.get("live_adapter", ""))
     splunk, model = _build_live_adapters(configuration)
     health = splunk.healthcheck()
@@ -237,12 +271,13 @@ def run_live_suite(configuration: Mapping[str, str]) -> dict[str, Any]:
             "verify the dedicated non-production endpoint, token, and TLS trust"
         )
     cases = load_cases()
+    adapter_configuration = adapter_configuration_without_bindings(configuration, bindings)
     try:
         adapter_result = callback(
             cases=cases,
             splunk=splunk,
             model=model,
-            configuration=dict(configuration),
+            configuration=adapter_configuration,
         )
     except LiveConfigurationError:
         raise
@@ -252,7 +287,15 @@ def run_live_suite(configuration: Mapping[str, str]) -> dict[str, Any]:
         raise LiveConfigurationError("live workflow adapter must return a result object")
     if adapter_result.get("fixture_id") != configuration["fixture_id"]:
         raise LiveConfigurationError("live workflow adapter returned an unexpected fixture identifier")
-    runs = _coerce_live_runs(adapter_result.get("runs"))
+    if adapter_result.get("exports") is not None:
+        runs = _coerce_live_exports(adapter_result.get("exports"), bindings)
+    elif adapter_result.get("runs") is not None:
+        raise LiveConfigurationError(
+            "live qualification is blocked: the workflow adapter returned pre-scored runs; "
+            "return terminal hunt exports and use the validated binding extractor instead"
+        )
+    else:
+        raise LiveConfigurationError("live workflow adapter must return terminal exports")
     result = score_runs(runs, load_answers())
     return {
         **result,
@@ -286,7 +329,7 @@ def main(argv: list[str] | None = None) -> int:
             result = run_live_suite(configuration)
         else:
             result = run_suite()
-    except (KnownAnswerError, LiveConfigurationError) as exc:
+    except (KnownAnswerError, LiveConfigurationError, BindingsError) as exc:
         print(f"known-answer qualification failed: {exc}", file=sys.stderr)
         return 2
     if args.json:

@@ -80,19 +80,23 @@ def test_related_periods_compare_utc_instants_and_keep_every_observation():
         assert actions["before"]["connection"] == {
             "action": "connection", "first_event_time_utc": "2026-01-06T09:58:00Z",
             "last_event_time_utc": "2026-01-06T09:59:59.999999Z", "evidence_ids": ["E4", "E6"],
+            "raw_record_count": 2, "representative_evidence_id": "E4",
         }
         assert actions["at"]["image_load"]["evidence_ids"] == ["E1"]
         assert actions["at"]["connection"] == {
             "action": "connection", "first_event_time_utc": "2026-01-06T10:00:00Z",
             "last_event_time_utc": "2026-01-06T10:00:00Z", "evidence_ids": ["E5"],
+            "raw_record_count": 1, "representative_evidence_id": "E5",
         }
         assert actions["after"]["connection"] == {
             "action": "connection", "first_event_time_utc": "2026-01-06T10:00:00.000001Z",
             "last_event_time_utc": "2026-01-06T10:02:00Z", "evidence_ids": ["E7", "E3"],
+            "raw_record_count": 2, "representative_evidence_id": "E7",
         }
         assert actions["unknown"]["connection"] == {
             "action": "connection", "first_event_time_utc": None,
             "last_event_time_utc": None, "evidence_ids": ["E2"],
+            "raw_record_count": 1, "representative_evidence_id": "E2",
         }
         indexed = [identifier for group in actions.values() for action in group.values()
                    for identifier in action["evidence_ids"]]
@@ -119,6 +123,7 @@ def test_unknown_anchor_does_not_assign_relative_times_to_known_related_records(
         assert actions["connection"] == {
             "action": "connection", "first_event_time_utc": "2026-01-06T08:00:00Z",
             "last_event_time_utc": "2026-01-06T17:00:00Z", "evidence_ids": ["E4", "E2", "E3"],
+            "raw_record_count": 3, "representative_evidence_id": "E4",
         }
         assert actions["image_load"]["first_event_time_utc"] is None
 
@@ -201,7 +206,7 @@ def test_budget_fitting_rebuilds_index_with_only_supplied_records():
         "summary": "The supplied subset remains unreviewed.", "findings": [], "limitations": ["Unreviewed."],
         "lead_coverage": [{"lead_evidence_id": "E1", "finding_numbers": [], "limitation": "Unreviewed."}],
     }})])
-    limits = BudgetLimits(max_context_characters=40_000, max_model_input_tokens=40_000)
+    limits = BudgetLimits(max_context_characters=50_000, max_model_input_tokens=50_000)
     runner = StrictModelRunner(model, limits=limits)
     runner.run(_question_synthesis_contract(SimpleNamespace(questions=[object()])), user_payload={},
                contract_name="QuestionSynthesis", context_builder=lambda limit: {

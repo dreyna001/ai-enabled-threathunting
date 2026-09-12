@@ -124,21 +124,195 @@ def test_live_mode_reports_exact_blocker_when_workflow_adapter_is_missing(
     monkeypatch.setenv("THREAT_HUNTING_MODEL_API_KEY_FILE", str(model_key_file))
     monkeypatch.setenv("THREAT_HUNTING_KNOWN_ANSWER_FIXTURE_ID", "fixture-test")
     monkeypatch.delenv("THREAT_HUNTING_KNOWN_ANSWER_LIVE_ADAPTER", raising=False)
+    from known_answer.test_bindings import build_valid_bindings, write_bindings
+
+    monkeypatch.setenv(
+        "THREAT_HUNTING_KNOWN_ANSWER_BINDINGS_FILE",
+        str(write_bindings(tmp_path, build_valid_bindings(fault_injector="deterministic-v1"))),
+    )
+    monkeypatch.setattr(
+        live_runner, "_IMPLEMENTED_FAULT_INJECTORS", frozenset({"deterministic-v1"})
+    )
 
     configuration = live_runner._require_live_configuration()
     with pytest.raises(live_runner.LiveConfigurationError, match="no configured known-answer workflow adapter"):
         live_runner.run_live_suite(configuration)
 
 
-def test_live_orchestration_scores_terminal_adapter_runs(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_live_mode_requires_private_bindings_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    token_file = tmp_path / "splunk-token"
+    model_key_file = tmp_path / "model-key"
+    token_file.write_text("splunk-secret", encoding="utf-8")
+    model_key_file.write_text("model-secret", encoding="utf-8")
+    monkeypatch.setenv("THREAT_HUNTING_SPLUNK_URL", "https://splunk.test:8089")
+    monkeypatch.setenv("THREAT_HUNTING_SPLUNK_TOKEN_FILE", str(token_file))
+    monkeypatch.setenv("THREAT_HUNTING_MODEL_PROVIDER", "openai")
+    monkeypatch.setenv("THREAT_HUNTING_MODEL_NAME", "gpt-test")
+    monkeypatch.setenv("THREAT_HUNTING_MODEL_API_KEY_FILE", str(model_key_file))
+    monkeypatch.setenv("THREAT_HUNTING_KNOWN_ANSWER_FIXTURE_ID", "fixture-test")
+    monkeypatch.setenv("THREAT_HUNTING_KNOWN_ANSWER_LIVE_ADAPTER", "known_answer.live_stub:run")
+    monkeypatch.delenv("THREAT_HUNTING_KNOWN_ANSWER_BINDINGS_FILE", raising=False)
+
+    configuration = live_runner._require_live_configuration()
+    with pytest.raises(live_runner.LiveConfigurationError, match="private scenario bindings are required"):
+        live_runner.run_live_suite(configuration)
+
+
+def test_live_mode_rejects_pre_scored_runs_instead_of_exports(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from known_answer.test_bindings import build_valid_bindings, write_bindings
+
+    bindings_path = write_bindings(tmp_path, build_valid_bindings(fault_injector="deterministic-v1"))
     cases = load_cases()
     expected_runs = [run_synthetic_case(case).to_dict() for case in cases]
+
+    def callback(**kwargs: object) -> dict[str, object]:
+        return {"fixture_id": "fixture-test", "runs": expected_runs}
+
+    monkeypatch.setenv("THREAT_HUNTING_KNOWN_ANSWER_BINDINGS_FILE", str(bindings_path))
+    monkeypatch.setattr(
+        live_runner, "_IMPLEMENTED_FAULT_INJECTORS", frozenset({"deterministic-v1"})
+    )
+    monkeypatch.setattr(live_runner, "_load_live_adapter", lambda _spec: callback)
+    monkeypatch.setattr(
+        live_runner,
+        "_build_live_adapters",
+        lambda _configuration: (
+            SimpleNamespace(healthcheck=lambda: SimpleNamespace(available=True, error_category=None)),
+            object(),
+        ),
+    )
+
+    with pytest.raises(live_runner.LiveConfigurationError, match="pre-scored runs"):
+        live_runner.run_live_suite(
+            {
+                "live_adapter": "known_answer.live_stub:run",
+                "fixture_id": "fixture-test",
+                "model_provider": "openai",
+                "model_name": "gpt-test",
+            }
+        )
+
+
+@pytest.mark.parametrize("fault_injector", [None, "deterministic-v1"])
+def test_live_mode_blocks_fault_scenarios_without_implemented_fault_injector(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault_injector: str | None
+) -> None:
+    from known_answer.test_bindings import build_valid_bindings, write_bindings
+
+    bindings_path = write_bindings(
+        tmp_path, build_valid_bindings(fault_injector=fault_injector)
+    )
+    token_file = tmp_path / "splunk-token"
+    model_key_file = tmp_path / "model-key"
+    token_file.write_text("splunk-secret", encoding="utf-8")
+    model_key_file.write_text("model-secret", encoding="utf-8")
+    monkeypatch.setenv("THREAT_HUNTING_KNOWN_ANSWER_BINDINGS_FILE", str(bindings_path))
+    monkeypatch.setenv("THREAT_HUNTING_SPLUNK_URL", "https://splunk.test:8089")
+    monkeypatch.setenv("THREAT_HUNTING_SPLUNK_TOKEN_FILE", str(token_file))
+    monkeypatch.setenv("THREAT_HUNTING_MODEL_PROVIDER", "openai")
+    monkeypatch.setenv("THREAT_HUNTING_MODEL_NAME", "gpt-test")
+    monkeypatch.setenv("THREAT_HUNTING_MODEL_API_KEY_FILE", str(model_key_file))
+    monkeypatch.setenv("THREAT_HUNTING_KNOWN_ANSWER_FIXTURE_ID", "fixture-test")
+    monkeypatch.setenv("THREAT_HUNTING_KNOWN_ANSWER_LIVE_ADAPTER", "known_answer.live_stub:run")
+
+    configuration = live_runner._require_live_configuration()
+    with pytest.raises(live_runner.LiveConfigurationError, match="deterministic fault injection is required"):
+        live_runner.run_live_suite(configuration)
+
+
+def _category_export(case: dict[str, object], binding: dict[str, object]) -> dict[str, object]:
+    scenario_id = str(case["scenario_id"])
+    category = str(case["category"])
+    events = [event for event in case["events"] if isinstance(event, dict)]
+    retained_count = int(case.get("retained_event_count", len(events)))
+    retained_count = max(0, min(retained_count, len(events)))
+    retained_events = events[:retained_count]
+    query_id = "00000000-0000-4000-8000-000000000001"
+    duplicate_query_id = "00000000-0000-4000-8000-000000000099"
+    queries = [{"query_id": query_id, "status": "completed"}]
+    if category == "restart_recovery":
+        queries.append({"query_id": duplicate_query_id, "status": "completed"})
+    evidence = []
+    findings = []
+    for index, event in enumerate(retained_events):
+        evidence_id = f"00000000-0000-4000-8000-{index + 2:012d}"
+        abstract = str(event["evidence_id"])
+        real_id = binding["evidence_id_map"][abstract]
+        evidence.append({
+            "evidence_id": evidence_id,
+            "query_id": query_id,
+            "selected_result": {"event_id": real_id},
+        })
+        findings.append({
+            "finding_id": f"00000000-0000-4000-8000-{index + 20:012d}",
+            "classification": "supported_observation",
+            "evidence_ids": [evidence_id],
+            "query_ids": [query_id],
+        })
+    limitation = str(case.get("coverage_limitation", ""))
+    terminal_state = "report_draft"
+    usage: dict[str, object] = {
+        "model_calls": int(case.get("model_calls", 0)),
+        "model_repair_attempts": int(case.get("model_repair_attempts", 0)),
+        "model_input_tokens": int(case.get("model_input_tokens", 0)),
+        "model_output_tokens": int(case.get("model_output_tokens", 0)),
+    }
+    if category in {"not_supported"}:
+        evidence = []
+        findings = [{
+            "finding_id": "00000000-0000-4000-8000-000000000020",
+            "classification": "not_supported_within_scope",
+            "evidence_ids": [],
+            "query_ids": [query_id],
+        }]
+        limitation = "No matching evidence was observed."
+    elif category == "timeout":
+        terminal_state = "failed"
+        limitation = str(case.get("failure_code", "hard_timeout"))
+        evidence = []
+        findings = []
+    elif category == "hard_budget":
+        terminal_state = "failed"
+        limitation = str(case.get("failure_code", "budget_exhausted"))
+        evidence = []
+        findings = []
+    elif category == "cancellation":
+        terminal_state = "cancelled"
+        limitation = str(case.get("failure_code", "cancelled"))
+    return {
+        "scenario_id": scenario_id,
+        "terminal_state": terminal_state,
+        "limitation": limitation,
+        "results": {"queries": queries, "evidence": evidence, "findings": findings, "usage": usage},
+    }
+
+
+def test_live_orchestration_extracts_exports_without_binding_leakage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from known_answer.test_bindings import build_valid_bindings, write_bindings
+
+    binding_payload = build_valid_bindings(fault_injector="deterministic-v1")
+    bindings_path = write_bindings(tmp_path, binding_payload)
+    cases = load_cases()
     seen: dict[str, object] = {}
 
     def callback(**kwargs: object) -> dict[str, object]:
         seen.update(kwargs)
-        return {"fixture_id": "fixture-test", "runs": expected_runs}
+        exports = [
+            _category_export(case, binding_payload["scenarios"][str(case["scenario_id"])])
+            for case in cases
+        ]
+        return {"fixture_id": "fixture-test", "exports": exports}
 
+    monkeypatch.setenv("THREAT_HUNTING_KNOWN_ANSWER_BINDINGS_FILE", str(bindings_path))
+    monkeypatch.setattr(
+        live_runner, "_IMPLEMENTED_FAULT_INJECTORS", frozenset({"deterministic-v1"})
+    )
     monkeypatch.setattr(live_runner, "_load_live_adapter", lambda _spec: callback)
     monkeypatch.setattr(
         live_runner,
@@ -161,4 +335,7 @@ def test_live_orchestration_scores_terminal_adapter_runs(monkeypatch: pytest.Mon
     assert result["qualification_mode"] == "live"
     assert result["passed"] is True
     assert seen["cases"] == cases
-    assert seen["configuration"]["fixture_id"] == "fixture-test"  # type: ignore[index]
+    configuration_payload = json.dumps(seen["configuration"])
+    assert "evidence_id_map" not in configuration_payload
+    assert "binding_version" not in configuration_payload
+    assert "expected_evidence_ids" not in configuration_payload

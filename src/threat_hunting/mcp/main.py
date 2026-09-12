@@ -20,6 +20,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from threat_hunting.config import ConfigurationError, RuntimeSettings, load_database_url, read_secret_file
 from threat_hunting.db import Database, DatabaseUnavailable
+from threat_hunting.domain.common import is_absolute_config_path
 
 
 LOGGER = logging.getLogger(__name__)
@@ -64,7 +65,7 @@ def _required_path(env_name: str, *, label: str, configured: Path | None = None)
     if not raw_path:
         raise MCPStartupError(f"{env_name} must name the {label} secret file")
     path = Path(raw_path)
-    if not path.is_absolute():
+    if not is_absolute_config_path(path):
         raise MCPStartupError(f"{env_name} must use an absolute {label} path")
     if configured is not None and path != configured:
         raise MCPStartupError(f"{env_name} does not match the configured {label} path")

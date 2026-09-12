@@ -1,6 +1,36 @@
 # Pause and resume checkpoint
 
-## Latest pause: September 10, 2026, 18:45 EDT
+## Latest checkpoint: September 11, 2026
+
+The bounded September 11 implementation block is complete and locally verified. The application is running at `http://127.0.0.1:8080` on immutable backend/worker and frontend v20 images tagged `local-20260911-quality-v20-200800`. Runtime uses prompt contract **1.34**, SPL policy **1.5**, OpenAI `gpt-5.6-terra`, medium reasoning, and migration `0013_hunt_listing_index`. V19 images and pre-v20 database backups are retained for rollback.
+
+The authoritative database contains **45 hunts**, **39 jobs**, and **zero active jobs** after trial 17. Hunt fingerprint: `0274e62b392a5ac7e72d97e7936f179e`. Job fingerprint: `42393bd30143f739ff5b2a4d9b62c538`. The added hunt/job rows are the expected trial 17 execution; migration and prior data remained intact.
+
+Prompt 1.34 and v20 add application-owned chronology guidance and deterministic all-lead widening for explicit authentication, network, and spread follow-ups. The widening reuses the existing model decision and Splunk query; it does not add an unconditional call or copy a larger raw evidence payload. Trial 17 reached `report_draft` and covered all five retained lead sessions in the endpoint chronology, authentication, DNS, and network answers. The observed scorer found 100% expected-event retrieval and citation, 41 distinct cited records, no citation failures, and complete execution of all four approved questions. It used six Splunk searches, nine model calls, 962,458 input tokens, 15,228 output tokens, and one repair. Analytical quality remains unassessed because no independent analyst judgment was supplied.
+
+The safe known-answer adapter slice is implemented. It loads strict private bindings only from a protected path, validates exact twelve-scenario coverage, converts real terminal exports to evaluator IDs, rejects pre-scored live runs, prevents evaluator-only fields from reaching application/model configuration, and blocks the paid matrix until fault injection is actually implemented. Merely declaring `deterministic-v1` does not unlock it. The offline twelve-scenario scorer passes, but that is not live qualification.
+
+Final local verification:
+
+- backend: **819 passed**, eight database-sensitive skips in the host run;
+- disposable PostgreSQL: **13 passed** for the skipped database-sensitive group;
+- typing: **56 files** clean;
+- adapter/leakage gate: **28 focused tests passed**;
+- frontend: **21 unit tests**, type check, production build, and **one Playwright E2E smoke test** passed;
+- synthetic known-answer suite: **12/12 passed**, 100% scripted recovery, no fabricated evidence or citation failures;
+- Compose config, immutable image build/deploy, health checks, database preservation, and diff whitespace checks passed.
+
+Do not run the paid twelve-case live matrix yet. It still requires real protected abstract-to-fixture mappings, real scenario execution/export bindings, and deterministic timeout, repair, restart, hard-budget, and cancellation injection. Do not simulate those outcomes or treat the offline scorer as provider qualification.
+
+Remaining work is external or deferred:
+
+1. publish the verified commit and confirm remote CI;
+2. obtain independent analyst acceptance;
+3. verify production HTTPS/certificates, a real least-privilege account, and the external approval reference in the target environment;
+4. qualify rollback when a future release changes schema;
+5. optimize cost/cache behavior only after accuracy acceptance, using trial 17 as a measured baseline.
+
+## Historical pause: September 10, 2026, 18:45 EDT
 
 **Stopped at the user's explicit request. Do not resume implementation, tests, provider calls, hunts or deployment until the user asks. The checkpoint goal is unfinished; this pause supersedes the active-work and older restart instructions below.**
 

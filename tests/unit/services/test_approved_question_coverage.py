@@ -12,6 +12,7 @@ from threat_hunting.domain.budgets import BudgetCounters, BudgetLimits
 from threat_hunting.domain.contracts import PlanQuestion
 from threat_hunting.domain.spl_policy import SPLPolicy
 from threat_hunting.integrations.models.fake import FakeModelAdapter
+from threat_hunting.services.evidence import spl_covers_all_lead_sessions
 from threat_hunting.services.investigation import _pending_investigation_questions
 from threat_hunting.services.workflow import WorkflowService
 
@@ -119,6 +120,159 @@ def test_duplicate_pivot_does_not_consume_repair_or_block_distinct_approved_work
     assert all(d["proposal"] is None and "not separately searched" in d["skip_reason"] for d in skips)
     assert counters.model_repair_attempts == 0
     assert len(requests) == 1
+
+
+def _five_lead_evidence(query_id):
+    evidence = []
+    for index in range(5):
+        evidence.append({
+            "query_id": query_id, "evidence_id": str(uuid4()), "evidence_kind": "raw_event",
+            "event_time_utc": f"2026-01-0{index + 1}T12:00:00Z",
+            "selected_result": {
+                "host": f"host-{index}", "user": f"user-{index}",
+                "session_id": f"session-{index}", "process_guid": f"guid-{index}",
+                "file_name": "observed.exe",
+            },
+            "advisory_ioc_comparison": {"matched_file_name_literals": ["observed.exe"]},
+        })
+    return evidence
+
+
+def test_ws17_only_auth_follow_up_widens_to_all_five_sessions_without_extra_calls():
+    now = datetime.now(timezone.utc)
+    start, end = now - timedelta(hours=1), now
+    plan = SimpleNamespace(
+        questions=[
+            question("q1"),
+            PlanQuestion(
+                question_id="q3",
+                question="What authentication activity is associated with related hosts and users?",
+                rationale="Auth coverage",
+                expected_information_gain="Session context",
+            ),
+        ],
+        hypothesis="h", objective="o",
+        scope=SimpleNamespace(model_dump=lambda **_: {}), model_dump=lambda **_: {},
+    )
+    query_id = str(uuid4())
+    row = {
+        "threat_intelligence": "[file:name = 'observed.exe']",
+        "results": {
+            "queries": [{"query_id": query_id, "question_id": "q1", "status": "completed", "result_count": 5}],
+            "evidence": _five_lead_evidence(query_id),
+            "query_ledger": [],
+        },
+    }
+    model_calls = {"count": 0}
+
+    def response(request):
+        model_calls["count"] += 1
+        context = json.loads(request.messages[0]["content"])
+        if "QueryAssessment[]" in request.system:
+            group = context["completed_queries"][0]
+            return json.dumps([{
+                "query_id": group["query_id"], "question_id": "q1", "answered_question": True,
+                "material_progress": True, "summary": "Observed five leads", "new_entities": [],
+                "evidence_candidate_row_refs": group["allowed_evidence_ids"][:1], "coverage_changes": [],
+                "limitations": [], "proposed_next_question": None,
+            }])
+        return json.dumps([{"question_id": "q3", "skip_reason": None, "proposal": {
+            "question_id": "q3", "purpose": "Auth for related hosts", "expected_information_gain": "Sessions",
+            "spl": (
+                'search index=auth sourcetype=auth '
+                '(host="host-0" OR user="user-0" OR session_id="session-0") | table host user session_id'
+            ),
+            "earliest_utc": start.isoformat(), "latest_utc": end.isoformat(),
+            "indexes": ["auth"], "sourcetypes": ["auth"], "requested_fields": ["host", "user", "session_id"],
+            "result_mode": "representative", "max_results": 10,
+        }}])
+
+    model = FakeModelAdapter(responses=[response, response])
+    limits = BudgetLimits(max_model_calls=8)
+    service = SimpleNamespace(model_adapter=model, budget_limits=limits, _owned_row=lambda *_: deepcopy(row),
+                              _update=lambda *_, **values: row.update(values),
+                              _persist_policy_rejections=lambda *_, **__: None)
+    policy = SPLPolicy(
+        discovered_indexes={"auth"}, discovered_sourcetypes={"auth"},
+        discovered_fields={"host", "user", "session_id"},
+        approved_indexes={"auth"}, approved_sourcetypes={"auth"},
+        approved_earliest_utc=start, approved_latest_utc=end,
+        connection_id="test", execution_config_snapshot_id=str(uuid4()),
+    )
+    counters = BudgetCounters(model_calls=1, splunk_queries=1)
+    assert WorkflowService._assess_execution_round(
+        service, lease=SimpleNamespace(owner_id="owner", hunt_id="hunt"), plan=plan, policy=policy,
+        discovery_scope={}, counters=counters, token=SimpleNamespace(is_cancelled=lambda: False),
+        deadline=now + timedelta(minutes=1), require_lease=lambda: None,
+    )
+    planned = next(entry for entry in row["results"]["query_ledger"] if entry["status"] == "planned")
+    spl = planned["proposal"]["spl"]
+    sessions = [
+        {"host": f"host-{index}", "user": f"user-{index}", "session_id": f"session-{index}"}
+        for index in range(5)
+    ]
+    assert spl_covers_all_lead_sessions(spl, sessions)
+    assert model_calls["count"] == 2
+    assert counters.model_repair_attempts == 0
+
+
+def test_unrelated_follow_up_proposal_is_not_widened_for_all_lead_sessions():
+    now = datetime.now(timezone.utc)
+    start, end = now - timedelta(hours=1), now
+    plan = SimpleNamespace(questions=[question("q1")], hypothesis="h", objective="o",
+                           scope=SimpleNamespace(model_dump=lambda **_: {}), model_dump=lambda **_: {})
+    query_id = str(uuid4())
+    evidence = _five_lead_evidence(query_id)
+    narrow_spl = 'search index=endpoint sourcetype=endpoint host="host-0" | table host'
+    row = {
+        "threat_intelligence": "[file:name = 'observed.exe']",
+        "results": {
+            "queries": [{"query_id": query_id, "question_id": "q1", "status": "completed", "result_count": 5}],
+            "evidence": evidence,
+            "query_ledger": [],
+            "follow_up_questions": [{
+                "question_id": "pivot", "question": "Inspect one host pivot only",
+                "source_query_id": query_id, "source_evidence_ids": [evidence[0]["evidence_id"]],
+                "grounded_entities": [{"value": "host-0"}],
+            }],
+        },
+    }
+
+    def response(request):
+        context = json.loads(request.messages[0]["content"])
+        if "QueryAssessment[]" in request.system:
+            group = context["completed_queries"][0]
+            return json.dumps([{
+                "query_id": group["query_id"], "question_id": "q1", "answered_question": True,
+                "material_progress": True, "summary": "Observed host-0", "new_entities": [],
+                "evidence_candidate_row_refs": group["allowed_evidence_ids"][:1], "coverage_changes": [],
+                "limitations": [], "proposed_next_question": None,
+            }])
+        return json.dumps([{"question_id": "pivot", "skip_reason": None, "proposal": {
+            "question_id": "pivot", "purpose": "Single host pivot", "expected_information_gain": "Local activity",
+            "spl": narrow_spl, "earliest_utc": start.isoformat(), "latest_utc": end.isoformat(),
+            "indexes": ["endpoint"], "sourcetypes": ["endpoint"], "requested_fields": ["host"],
+            "result_mode": "representative", "max_results": 10,
+        }}])
+
+    model = FakeModelAdapter(responses=[response, response])
+    service = SimpleNamespace(model_adapter=model, budget_limits=BudgetLimits(max_model_calls=8),
+                              _owned_row=lambda *_: deepcopy(row), _update=lambda *_, **values: row.update(values),
+                              _persist_policy_rejections=lambda *_, **__: None)
+    policy = SPLPolicy(
+        discovered_indexes={"endpoint"}, discovered_sourcetypes={"endpoint"}, discovered_fields={"host"},
+        approved_indexes={"endpoint"}, approved_sourcetypes={"endpoint"},
+        approved_earliest_utc=start, approved_latest_utc=end,
+        connection_id="test", execution_config_snapshot_id=str(uuid4()),
+    )
+    counters = BudgetCounters(model_calls=1, splunk_queries=1)
+    WorkflowService._assess_execution_round(
+        service, lease=SimpleNamespace(owner_id="owner", hunt_id="hunt"), plan=plan, policy=policy,
+        discovery_scope={}, counters=counters, token=SimpleNamespace(is_cancelled=lambda: False),
+        deadline=now + timedelta(minutes=1), require_lease=lambda: None,
+    )
+    planned = next(entry for entry in row["results"]["query_ledger"] if entry["status"] == "planned")
+    assert planned["proposal"]["spl"] == narrow_spl
 
 
 def _run_round(*, max_model_calls, skip_first=False):

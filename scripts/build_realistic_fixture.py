@@ -244,8 +244,8 @@ def write_fixture(output: Path) -> dict[str, Any]:
                 "outage_excluded_count": len(rows) - len(incomplete),
                 "advisory_indicator": {"file_name": "HRsword.exe", "sha256": ADVISORY_HASH,
                     "source_url": "https://www.cisa.gov/news-events/cybersecurity-advisories/aa23-352a"}}
-    (output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
-    (output / "expectations.json").write_text(json.dumps(expectations, indent=2) + "\n")
+    (output / "manifest.json").write_bytes((json.dumps(manifest, indent=2) + "\n").encode())
+    (output / "expectations.json").write_bytes((json.dumps(expectations, indent=2) + "\n").encode())
     return manifest
 
 

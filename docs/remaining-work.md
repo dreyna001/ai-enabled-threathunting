@@ -1,22 +1,29 @@
 # Remaining work and resume handoff
 
-## Paused September 10, 2026, 18:45 EDT
+## Latest checkpoint: September 11, 2026
 
-**The user requested a stop. Resume only when asked, starting with [the latest checkpoint](resume-checkpoint.md#latest-pause-september-10-2026-1845-edt). Work remains unfinished.** Everything is together on desktop `main`; the pause documentation is committed/pushed there. V38 source is verified but undeployed and lacks a returned live-model answer because the provider reported exhausted credits/quota. V39's eight offline budget/recovery cases passed. Remote CI for pre-pause `3912744` passed.
+The local implementation and release checks requested on September 11 are complete on desktop `main`. The deployed backend, worker, and frontend use immutable v20 images (`local-20260911-quality-v20-200800`) with prompt contract **1.34**, SPL policy **1.5**, and OpenAI `gpt-5.6-terra` at medium reasoning. The app is healthy at `http://127.0.0.1:8080`; migration remains `0013_hunt_listing_index`.
 
-Resume todo, in order:
+Latest verification: **819 backend tests passed** with eight PostgreSQL tests skipped in the host run; the same database-sensitive group passed **13 tests** against a disposable PostgreSQL instance. Mypy passed across **56 files**. The frontend passed **21 unit tests**, type checking, a production build, and one Playwright workflow smoke test. The synthetic twelve-scenario scorer passed with 100% scripted recovery and no fabricated evidence. Base images are pinned by digest, both immutable application images built successfully, Compose validation passed, and the prior v19 image plus database backups remain available.
 
-- [ ] Review current source/runtime/job state and preserved v38/v39 artifacts without restarting completed diagnostics. Keep the frozen advisory/example set, trial 14, all history and the sole desktop checkout.
-- [ ] Finish large-input qualification for planning, query generation and adaptive steps, plus remaining whole-hunt budget/time/resource checks. V39 covers final synthesis and recovery from saved evidence with scripted prior usage only.
-- [ ] After API capacity is restored, run one bounded, clearly labeled prompt-1.33 replay on the unchanged four-question trial-13 evidence; review factual claims, inference premises, chronology, all material leads, exact relationship support, inventory scope and complete-query negatives. Fix demonstrated failures before promotion. Do not retry while quota is unavailable.
-- [ ] Qualify and roll out backend, worker and frontend together; verify exact source/prompt/policy/config, health, unchanged state and rollback availability.
-- [ ] Generate and review fresh plans, then run full hunts on unchanged fixtures. Preserve unapproved trial 14 and prior trials.
-- [ ] Complete repeated positive, negative, incomplete-telemetry and outage cases, the application-owned fixture adapter and full twelve-scenario live matrix.
-- [ ] Obtain independent analyst acceptance; assistant reviews and scripted tests do not satisfy it.
-- [ ] Finish production TLS/HTTPS, least-privilege external accounts, approval-reference validation, pinned base images, migration/rollback qualification, dependency/CI warning maintenance and the frontend E2E placeholder. See the detailed release gates below.
-- [ ] Only after the preceding tasks, perform the [deferred cost improvements](#deferred-cost-improvements-after-the-existing-checkpoint-work): cost/cache telemetry, stable prompt reuse, supported caching, cheaper step settings and offline batch evaluation.
+Trial 17 completed through the deployed v20 application to `report_draft`. It retained and cited the expected fixture event, reported all five lead sessions across the endpoint, authentication, DNS, and network questions, and recorded no citation failures. It used **six Splunk searches**, **nine model calls**, **962,458 input tokens**, **15,228 output tokens**, and one repair. These are measured run facts, not proof of general model quality. The observed scorer reports retrieval/citation recovery only; independent analytical judgments remain absent.
 
-## Active September 10 work
+Remaining external or intentionally blocked work:
+
+- [ ] Supply real protected bindings for all twelve live scenarios and implement deterministic timeout, repair, restart, budget, and cancellation fault injection. The new adapter validates private bindings, extracts actual terminal exports, prevents evaluator data from reaching application/model payloads, and fails closed while the injector is absent. The offline scorer is not live qualification.
+- [ ] Obtain independent analyst acceptance of plans, evidence, findings, limitations, and rendered reports. Assistant review and automated checks do not satisfy this gate.
+- [ ] Verify production HTTPS/edge certificates, a real least-privilege external account, and the external approval reference in the target environment.
+- [ ] Qualify schema rollback when a future release introduces a migration; v20 remains on migration 0013, so no downgrade occurred here.
+- [ ] Run remote CI for the September 11 commit after publication.
+- [ ] Only after accuracy gates, perform the [deferred cost improvements](#deferred-cost-improvements-after-the-existing-checkpoint-work). Trial 17's adaptive path is the current performance baseline; do not reduce evidence or reasoning merely to lower its call count.
+
+## Active September 11 work
+
+Prompt 1.34 adds compact application-owned chronology obligations and per-lead inventory summaries without copying more raw evidence or adding unconditional model calls. Trial 16 exposed narrow adaptive authentication and communications searches: four of five lead sessions were explicitly marked unanswered. V20 therefore widens the same affected follow-up searches to all retained lead sessions before policy validation, without adding a model call or a Splunk query. Trial 17 exercised that path and restored five-session question coverage. This is deterministic workflow progress, not independent analytical acceptance.
+
+Large-input planning, query, assessment, follow-up, synthesis reservation, and reject-before-provider paths now have self-contained regression coverage. Oversized requests fail with `BUDGET_EXHAUSTED` before a provider call. Cost/cache work stays deferred because removing context or reasoning before accuracy acceptance could hide evidence or weaken findings.
+
+## Historical September 10 work
 
 V39 verified eight offline remaining-budget/recovery cases on the unchanged trial-13 checkpoint with the expanded profile. Cases cover one final call with full evidence, a reduced input allowance, insufficient input, exhausted calls/output, final-time reservation, retained-page recovery after worker loss, and repeated-page termination. All preserve 447 representations, 12 queries, the 439-row timeline, five scoped lead groups and four explicit answer slots. A replacement worker resumes only q2 after the three other answers are checkpointed; the old lease generation is rejected, the original hunt start is preserved and saved answers are unchanged. Individual requests fit their remaining allowance, and retrieval steps retain half the remaining tokens plus a final call. Prior usage/time and per-call usage are scripted boundary conditions, not measurements of the historical hunt or live provider behavior. No provider calls, application DB writes, searches, fixture edits or deployment occurred. See `runtime/qualification/quality-fixes-20260910/v39-budget-qualification/verification.json`. Large-input behavior in planning/query/adaptive steps, actual whole-hunt qualification, analytical acceptance and every remaining release gate stay open.
 
@@ -427,12 +434,12 @@ The September 9 user instruction is explicit: getting the app working must not r
 
 ## Other acceptance/release work still open
 
-- Representative independent analyst acceptance and the full twelve-scenario live qualification; today's one full hunt is not that matrix.
-- The standard twelve-scenario runner still requires an application-owned fixture adapter. The new single-trial API runner provides repeatable execution/capture through existing gates; scenario loading and the full live matrix remain open.
+- Representative independent analyst acceptance and the full twelve-scenario live qualification; trial 17 is one application hunt, not that matrix.
+- The standard runner now has the bounded private-binding/export extraction slice. Real protected fixture identities, scenario execution and deterministic fault injection remain required before the paid matrix can run.
 - Remote CI execution after an authorized commit/push; CI was configured and equivalent local checks passed, but remote CI has not run.
 - Application rollback to the September 8 hardening image and return to the candidate passed on September 9 with health and all 28 existing hunts preserved. Both releases use migration 0013, so no schema downgrade was required. Future schema-changing releases still require their own rollback qualification.
-- Production TLS/HTTPS, least-privilege external accounts, approval-reference validation, and pinned base-image digests. Backend package dependencies are already locked.
+- Production TLS/HTTPS, least-privilege external accounts, and approval-reference validation. Backend dependencies and container base images are pinned.
 - MCP/refactor work remains separate from this immediate quality-fix block; see the [prior refactor plan](agentic-threat-hunting-refactor-plan.md).
-- Routine upstream deprecation-warning maintenance. The generic frontend E2E command is still a placeholder; today's browser run was a separate live verification script.
+- Routine upstream deprecation-warning maintenance. The frontend E2E command now runs the Playwright workflow smoke test locally and in CI.
 
 Docker engine recovery is verified for this session. Check the engine, container health, and exact Splunk endpoint before a live trial; a stale runtime socket is an environment failure, not a hunt-quality result.

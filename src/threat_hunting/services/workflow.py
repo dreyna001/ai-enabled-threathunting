@@ -64,6 +64,7 @@ from threat_hunting.services.investigation import (
     _synthesis_context,
     _pending_investigation_questions,
     _follow_up_proposal_errors,
+    _widen_follow_up_decisions_for_lead_coverage,
 )
 
 workflow_metadata = MetaData()
@@ -1327,6 +1328,12 @@ class WorkflowService:
                     )
                     by_question = {decision.question_id: decision for decision in decisions}
                     decisions = [by_question[identifier] for identifier in follow_up_ids]
+                    decisions = _widen_follow_up_decisions_for_lead_coverage(
+                        decisions, questions_for_decision,
+                        evidence=assessment_results.get("evidence", []),
+                        completed_query_ids={str(query["query_id"]) for query in completed_queries},
+                        threat_intelligence=str(current["threat_intelligence"] or ""),
+                    )
                     follow_up_proposals = [d.proposal for d in decisions if d.proposal is not None]
                     proposal_errors = _follow_up_proposal_errors(
                         follow_up_proposals, questions_for_decision,
@@ -1383,6 +1390,12 @@ class WorkflowService:
                         )
                         merged_decisions = {d.question_id: d for d in [*accepted_decisions, *repaired_decisions]}
                         decisions = [merged_decisions[identifier] for identifier in follow_up_ids]
+                        decisions = _widen_follow_up_decisions_for_lead_coverage(
+                            decisions, questions_for_decision,
+                            evidence=assessment_results.get("evidence", []),
+                            completed_query_ids={str(query["query_id"]) for query in completed_queries},
+                            threat_intelligence=str(current["threat_intelligence"] or ""),
+                        )
                         follow_up_proposals = [d.proposal for d in decisions if d.proposal is not None]
                         proposal_errors = _follow_up_proposal_errors(
                             follow_up_proposals, questions_for_decision,

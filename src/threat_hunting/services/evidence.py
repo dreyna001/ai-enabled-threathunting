@@ -14,6 +14,8 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import math
+import re
+from itertools import permutations
 from types import MappingProxyType
 from typing import Any, Literal
 from uuid import UUID, uuid4
@@ -31,6 +33,7 @@ from pydantic import (
 from sqlalchemy import Engine, insert, select
 from sqlalchemy.exc import IntegrityError
 
+from threat_hunting.domain.contracts import RetainedEvidenceFilter, RetainedEvidenceScope
 from threat_hunting.domain.common import (
     DomainModel,
     UTCDateTime,
@@ -738,6 +741,185 @@ def advisory_lead_groups(records: Sequence[Mapping[str, Any]]) -> list[dict[str,
         identifiers = [str(row["evidence_id"]), *(str(origin["evidence_id"]) for origin in row.get("duplicate_references", []))]
         group["evidence_ids"] = list(dict.fromkeys([*group["evidence_ids"], *identifiers]))
     return list(groups.values())
+
+
+def question_requests_inventories(question: str) -> bool:
+    """True when the approved question explicitly asks for counts or spread."""
+    normalized = question.casefold()
+    count_signals = ("how many", "distinct", "count", "number of")
+    entity_signals = ("host", "user", "ip", "process", "session", "spread", "entity", "scope")
+    return any(signal in normalized for signal in count_signals) and any(signal in normalized for signal in entity_signals)
+
+
+_LEAD_SESSION_FIELDS = ("host", "user", "session_id")
+_LEAD_IDENTITY_FIELDS = (*_LEAD_SESSION_FIELDS, "process_guid")
+_IDENTITY_EQ = re.compile(
+    r'\b(?:host|user|session_id|process_guid)\s*=\s*"(?:\\.|[^"\\])*"',
+    re.IGNORECASE,
+)
+_IDENTITY_GROUP = re.compile(
+    r'\(\s*(?:(?:host|user|session_id|process_guid)\s*=\s*"(?:\\.|[^"\\])*"\s*)'
+    r'(?:(?:AND|OR)\s+(?:host|user|session_id|process_guid)\s*=\s*"(?:\\.|[^"\\])*"\s*)+\)',
+    re.IGNORECASE,
+)
+
+
+def question_requires_all_lead_coverage(question: str) -> bool:
+    """True when the question explicitly requires every retained advisory lead session."""
+    normalized = question.casefold()
+    if any(signal in normalized for signal in ("each lead", "all leads", "every lead", "for each endpoint lead")):
+        return True
+    if "related" not in normalized:
+        return False
+    entity_signals = ("host", "user", "session", "process", "ip")
+    if not any(signal in normalized for signal in entity_signals):
+        return False
+    context_signals = (
+        "authentication", "auth", "logon", "logoff",
+        "dns", "network", "connection", "communicat", "spread",
+    )
+    return any(signal in normalized for signal in context_signals)
+
+
+def retained_lead_session_filters(leads: Sequence[Mapping[str, Any]]) -> list[dict[str, str]]:
+    """Distinct host/user/session_id tuples from advisory leads."""
+    sessions: list[dict[str, str]] = []
+    seen: set[tuple[tuple[str, str], ...]] = set()
+    for lead in leads:
+        identity = lead.get("identity_fields", {})
+        if not isinstance(identity, Mapping) or "session_id" not in identity:
+            continue
+        session_filter = {
+            field: identity[field]
+            for field in _LEAD_SESSION_FIELDS
+            if field in identity and isinstance(identity[field], str) and identity[field].strip()
+        }
+        if "session_id" not in session_filter:
+            continue
+        key = tuple(sorted(session_filter.items()))
+        if key not in seen:
+            seen.add(key)
+            sessions.append(session_filter)
+    return sessions
+
+
+def spl_literal(value: str) -> str:
+    """Policy-safe double-quoted SPL literal."""
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def lead_session_spl_disjunction(sessions: Sequence[Mapping[str, str]]) -> str:
+    """Escaped OR disjunction covering each distinct retained lead session."""
+    branches = [_lead_session_and_branch(session) for session in sessions if "session_id" in session]
+    if not branches:
+        raise ValueError("no session-scoped advisory leads")
+    if len(branches) > 64:
+        raise ValueError("too many lead sessions for one bounded query")
+    return branches[0] if len(branches) == 1 else f"({' OR '.join(branches)})"
+
+
+def _lead_session_and_branch(session: Mapping[str, str]) -> str:
+    fields = [field for field in _LEAD_SESSION_FIELDS if field in session]
+    return f"({' AND '.join(f'{field}={spl_literal(session[field])}' for field in fields)})"
+
+
+def spl_covers_lead_session(spl: str, session: Mapping[str, str]) -> bool:
+    """True when SPL AND-conjoins every supplied session identity field."""
+    if "session_id" not in session:
+        return False
+    branch = _lead_session_and_branch(session)
+    normalized = re.sub(r"\s+", " ", spl).strip()
+    if branch in normalized:
+        return True
+    for ordering in permutations([
+        f"{field}={spl_literal(session[field])}"
+        for field in _LEAD_SESSION_FIELDS
+        if field in session
+    ]):
+        alternate = f"({' AND '.join(ordering)})"
+        if alternate in normalized:
+            return True
+    return False
+
+
+def spl_covers_all_lead_sessions(spl: str, sessions: Sequence[Mapping[str, str]]) -> bool:
+    """True when each retained lead session has an explicit AND branch in SPL."""
+    if not sessions:
+        return True
+    return all(spl_covers_lead_session(spl, session) for session in sessions)
+
+
+def _strip_lead_identity_predicates(search_args: str) -> str:
+    """Remove lead identity equality predicates from a search expression."""
+    cleaned = _IDENTITY_GROUP.sub(" ", search_args)
+    cleaned = _IDENTITY_EQ.sub(" ", cleaned)
+    cleaned = re.sub(r"\(\s*\)", " ", cleaned)
+    cleaned = re.sub(r"\s+AND\s+AND\s+", " AND ", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+OR\s+OR\s+", " OR ", cleaned, flags=re.IGNORECASE)
+    return re.sub(r"\s{2,}", " ", cleaned).strip()
+
+
+def widen_spl_for_lead_sessions(spl: str, sessions: Sequence[Mapping[str, str]]) -> str:
+    """Replace narrow lead identity filters with a bounded all-session disjunction."""
+    parsed = parse_spl(spl)
+    disjunction = lead_session_spl_disjunction(sessions)
+    stripped = _strip_lead_identity_predicates(parsed.command_segments[0][1])
+    search_args = f"{stripped} AND {disjunction}".strip() if stripped else disjunction
+    segments = [f"search {search_args}".rstrip()]
+    segments.extend(f"{command} {args}".rstrip() for command, args in parsed.command_segments[1:])
+    return " | ".join(segments)
+
+
+def question_completed_query_ids(results: Mapping[str, Any], question_id: str) -> set[str]:
+    """Completed queries explicitly linked to one approved question."""
+    return {
+        str(query["query_id"])
+        for query in results.get("queries", [])
+        if isinstance(query, Mapping) and query.get("status") == "completed"
+        and str(query.get("question_id")) == str(question_id)
+    }
+
+
+def lead_session_inventory_scopes(
+    leads: Sequence[Mapping[str, Any]],
+    *,
+    query_ids: set[str],
+) -> list[RetainedEvidenceScope]:
+    """One retained lookup scope per distinct advisory lead session."""
+    scopes: list[RetainedEvidenceScope] = []
+    seen: set[str] = set()
+    for lead in leads:
+        identity = lead.get("identity_fields", {})
+        if not isinstance(identity, Mapping) or "session_id" not in identity:
+            continue
+        session_filter = {
+            field: identity[field]
+            for field in ("host", "user", "session_id")
+            if field in identity and isinstance(identity[field], str) and identity[field].strip()
+        }
+        if "session_id" not in session_filter:
+            continue
+        scope = RetainedEvidenceScope(
+            query_ids=sorted(query_ids),
+            filters=[RetainedEvidenceFilter(field=field, value=session_filter[field])
+                     for field in ("host", "user", "session_id") if field in session_filter],
+        )
+        key = scope.model_dump_json()
+        if key not in seen:
+            seen.add(key)
+            scopes.append(scope)
+    return scopes
+
+
+def compact_inventory_summary(scope: RetainedEvidenceScope, measured: Mapping[str, Any]) -> dict[str, Any]:
+    """Compact measured counts for synthesis context without raw rows."""
+    return {
+        "scope": scope.model_dump(mode="json"),
+        "raw_record_count": measured["matching_raw_record_count"],
+        "fields": measured["distinct_fields"],
+        "limitations": [measured["limitation"]],
+    }
 
 
 def _retained_scalar_key(value: Any) -> tuple[str, str] | None:

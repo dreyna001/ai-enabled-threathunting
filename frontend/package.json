@@ -9,7 +9,8 @@
     "typecheck": "tsc -b --pretty false",
     "test": "npm run test:unit",
     "test:unit": "vitest run",
-    "test:e2e": "node scripts/e2e-placeholder.mjs",
+    "test:e2e": "playwright test",
+    "test:e2e:install": "playwright install chromium",
     "preview": "vite preview"
   },
   "dependencies": {
@@ -17,6 +18,8 @@
     "react-dom": "^18.3.1"
   },
   "devDependencies": {
+    "@playwright/test": "1.51.1",
+    "@types/node": "^22.10.2",
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",
     "@vitejs/plugin-react": "^4.3.4",

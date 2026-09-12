@@ -9,14 +9,45 @@ from datetime import datetime, timezone
 from types import MappingProxyType
 from typing import Any, Mapping
 
-from threat_hunting.domain.contracts import FINDING_GROUNDING_FIELDS
+from threat_hunting.domain.contracts import FINDING_GROUNDING_FIELDS, MAX_MODEL_INVENTORY_SCOPES
 from threat_hunting.services.evidence import _flatten_scalar_values, advisory_lead_groups, compact_evidence_records, query_results_incomplete, raw_event_time
 
 
 _EVIDENCE_FIELDS = {"evidence_id", "evidence_ids", "lead_evidence_id", "allowed_evidence_ids", "result_row_refs", "evidence_candidate_row_refs",
-                    "returned_evidence_ids", "supplied_evidence_ids"}
+                    "returned_evidence_ids", "supplied_evidence_ids", "representative_evidence_id"}
 _QUERY_FIELDS = {"query_id", "query_ids", "source_query_id"}
 _SCHEMA_KEYS = {"type", "properties", "items", "$ref", "$defs", "anyOf", "enum", "format", "description", "title"}
+
+
+def _session_scope_filters(filters: Mapping[str, Any]) -> bool:
+    return {"host", "user", "session_id"}.issubset(filters)
+
+
+def _compact_chronology_obligations(record_index: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Flatten non-empty record_index groups into compact answer obligations."""
+    obligations: list[dict[str, Any]] = []
+    for entry in record_index:
+        filters = entry["filters"]
+        scope = "session" if _session_scope_filters(filters) else "process"
+        for period_entry in entry.get("periods", []):
+            period = period_entry["relative_to_lead"]
+            for action_entry in period_entry.get("actions", []):
+                evidence_ids = action_entry.get("evidence_ids", [])
+                if not evidence_ids:
+                    continue
+                action_entry["raw_record_count"] = len(evidence_ids)
+                action_entry["representative_evidence_id"] = evidence_ids[0]
+                obligations.append({
+                    "scope": scope,
+                    "filters": dict(filters),
+                    "period": period,
+                    "action": action_entry.get("action"),
+                    "count": len(evidence_ids),
+                    "representative_evidence_id": evidence_ids[0],
+                    "first_event_time_utc": action_entry.get("first_event_time_utc"),
+                    "last_event_time_utc": action_entry.get("last_event_time_utc"),
+                })
+    return obligations
 
 
 @dataclass(frozen=True)
@@ -265,7 +296,7 @@ def structured_response_format(contract: Any, name: str, references: ReferenceLa
         if answer_name not in schema.get("$defs", {}):
             continue
         definition = schema["$defs"][answer_name]
-        definition["properties"]["inventory_scopes"]["maxItems"] = 3
+        definition["properties"]["inventory_scopes"]["maxItems"] = MAX_MODEL_INVENTORY_SCOPES
         variants = []
         for required_field in ("findings", "limitations"):
             variant = deepcopy(definition)
@@ -363,11 +394,14 @@ def prepare_model_context(payload: Any, name: str) -> tuple[Any, ReferenceLabels
                     {"relative_to_lead": period, "actions": list(actions.values())}
                     for period, actions in periods.items() if actions
                 ]})
+            lead["chronology_obligations"] = _compact_chronology_obligations(lead["record_index"])
         payload["lead_index_rule"] = (
             "lead_evidence_id selects the earliest known-time advisory match in the supplied review group; "
             "it is not the group's only observation or proof of a process start. Review all its evidence_ids. "
             "record_index lists supplied raw representation groups matching every literal filter, grouped "
-            "before, at, or after anchor_event_time_utc, then by observed action. The unknown period means "
+            "before, at, or after anchor_event_time_utc, then by observed action. chronology_obligations "
+            "flatten each non-empty action/period group with count and one representative_evidence_id; use "
+            "those checklists instead of re-scanning long evidence_ids lists. The unknown period means "
             "the anchor or record timestamp is unavailable. Review each supplied period and action relevant "
             "to the approved question, including surrounding process starts, module loads, process ends and "
             "communications. References within each action are ordered by event time, with unknown times last. "

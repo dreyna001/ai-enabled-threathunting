@@ -7,16 +7,26 @@ no external calls or database writes; the workflow owns those effects.
 from __future__ import annotations
 
 from collections import deque
+from collections.abc import Sequence
 from typing import Annotated, Any, Mapping
 from uuid import uuid4
 
 from pydantic import AfterValidator, BaseModel, TypeAdapter, create_model
 
 from threat_hunting.domain.common import DomainModel
-from threat_hunting.domain.contracts import FindingProposal, FollowUpDecision, HuntPlan, QuestionAnswer, QuestionAnswerStep, QueryAssessment, QueryProposal, RetainedEvidenceScope, RetainedInventory
+from threat_hunting.domain.contracts import (
+    FindingProposal, FollowUpDecision, HuntPlan, MAX_STORED_QUESTION_INVENTORIES, QuestionAnswer,
+    QuestionAnswerStep, QueryAssessment, QueryProposal, RetainedEvidenceScope, RetainedInventory,
+)
 from threat_hunting.domain.errors import Validation
 from threat_hunting.domain.spl_policy import source_pairs
-from threat_hunting.services.evidence import _flatten_scalar_values, advisory_lead_groups, evidence_time_bounds, lookup_retained_evidence, query_results_incomplete, query_source_coverage, raw_event_time, result_source
+from threat_hunting.services.evidence import (
+    _flatten_scalar_values, advisory_lead_groups, compact_inventory_summary, evidence_time_bounds,
+    lead_session_inventory_scopes, lookup_retained_evidence, question_completed_query_ids,
+    question_requires_all_lead_coverage, query_results_incomplete, query_source_coverage, raw_event_time,
+    retained_lead_session_filters, result_source, spl_covers_all_lead_sessions, widen_spl_for_lead_sessions,
+    question_requests_inventories,
+)
 from threat_hunting.services.reports import _derive_report_limitations
 from threat_hunting.services.threat_intel import compare_advisory_iocs, query_ioc_context
 
@@ -509,6 +519,48 @@ def _follow_up_decision_contract(question_ids: list[str]) -> TypeAdapter[list[Fo
     return TypeAdapter(Annotated[list[FollowUpDecision], AfterValidator(validate_coverage)])
 
 
+def _widen_follow_up_decisions_for_lead_coverage(
+    decisions: list[FollowUpDecision],
+    follow_up_questions: list[dict[str, Any]],
+    *,
+    evidence: Sequence[Mapping[str, Any]],
+    completed_query_ids: set[str],
+    threat_intelligence: str,
+) -> list[FollowUpDecision]:
+    """Deterministically widen narrow follow-up SPL to cover all retained lead sessions."""
+    questions = {str(item["question_id"]): item for item in follow_up_questions}
+    leads = advisory_lead_groups([
+        {**dict(row), "advisory_ioc_comparison": compare_advisory_iocs(row.get("selected_result"), query_ioc_context(threat_intelligence))}
+        for row in evidence
+        if isinstance(row, Mapping) and str(row.get("query_id")) in completed_query_ids
+    ])
+    sessions = retained_lead_session_filters(leads)
+    if len(sessions) < 2:
+        return decisions
+    widened: list[FollowUpDecision] = []
+    for decision in decisions:
+        if decision.proposal is None:
+            widened.append(decision)
+            continue
+        question = questions.get(decision.question_id, {})
+        if not question_requires_all_lead_coverage(str(question.get("question", ""))):
+            widened.append(decision)
+            continue
+        if spl_covers_all_lead_sessions(decision.proposal.spl, sessions):
+            widened.append(decision)
+            continue
+        try:
+            spl = widen_spl_for_lead_sessions(decision.proposal.spl, sessions)
+        except ValueError as exc:
+            raise Validation(
+                "follow-up query cannot cover all retained advisory lead sessions: " + str(exc)
+            ) from exc
+        widened.append(decision.model_copy(update={
+            "proposal": decision.proposal.model_copy(update={"spl": spl}),
+        }))
+    return widened
+
+
 def _follow_up_proposal_errors(
     proposals: list[QueryProposal],
     follow_up_questions: list[dict[str, Any]],
@@ -543,6 +595,48 @@ def _follow_up_proposal_errors(
             continue
         seen_questions.add(proposal.question_id)
     return errors
+
+
+def _dedupe_inventory_scopes(scopes: list[RetainedEvidenceScope]) -> list[RetainedEvidenceScope]:
+    seen: set[str] = set()
+    unique: list[RetainedEvidenceScope] = []
+    for scope in scopes:
+        key = scope.model_dump_json()
+        if key not in seen:
+            seen.add(key)
+            unique.append(scope)
+    return unique
+
+
+def _question_inventory_scopes(
+    question: Any,
+    item: QuestionAnswer,
+    leads: list[dict[str, Any]],
+    results: Mapping[str, Any],
+) -> list[RetainedEvidenceScope]:
+    scopes = list(item.inventory_scopes)
+    if question_requests_inventories(question.question):
+        query_ids = question_completed_query_ids(results, question.question_id)
+        if query_ids:
+            scopes.extend(lead_session_inventory_scopes(leads, query_ids=query_ids))
+    return _dedupe_inventory_scopes(scopes)
+
+
+def _measure_inventory(scope: RetainedEvidenceScope, plan: HuntPlan, results: Mapping[str, Any]) -> dict[str, Any]:
+    _validate_retained_scope(scope, plan)
+    measured = lookup_retained_evidence(
+        results, query_ids=set(scope.query_ids), filters={item.field: item.value for item in scope.filters},
+        earliest_utc=scope.earliest_utc, latest_utc=scope.latest_utc, include_records=False,
+    )
+    limitations = [measured["limitation"]]
+    if any(query_results_incomplete(query) for query in results.get("queries", []) if str(query.get("query_id")) in scope.query_ids):
+        limitations.append("Selected source-query retrieval is incomplete; these counts describe only retained raw rows.")
+    if measured["unknown_time_rows_excluded_by_window"]:
+        limitations.append(f"The selected time window excluded {measured['unknown_time_rows_excluded_by_window']} rows with unknown timestamps.")
+    return RetainedInventory(
+        scope=scope, raw_record_count=measured["matching_raw_record_count"],
+        fields=measured["distinct_fields"], limitations=limitations,
+    ).model_dump(mode="json")
 
 
 def _validate_retained_scope(request: RetainedEvidenceScope, plan: HuntPlan) -> None:
@@ -591,24 +685,11 @@ def _materialize_question_answers(answer: BaseModel, plan: HuntPlan, results: Ma
             "finding_ids": [finding["finding_id"] for finding in materialized],
             "limitations": list(item.limitations),
         }
-        if item.inventory_scopes:
-            inventories = []
-            for scope in item.inventory_scopes:
-                _validate_retained_scope(scope, plan)
-                measured = lookup_retained_evidence(
-                    results, query_ids=set(scope.query_ids), filters={item.field: item.value for item in scope.filters},
-                    earliest_utc=scope.earliest_utc, latest_utc=scope.latest_utc, include_records=False,
-                )
-                limitations = [measured["limitation"]]
-                if any(query_results_incomplete(query) for query in results.get("queries", []) if str(query.get("query_id")) in scope.query_ids):
-                    limitations.append("Selected source-query retrieval is incomplete; these counts describe only retained raw rows.")
-                if measured["unknown_time_rows_excluded_by_window"]:
-                    limitations.append(f"The selected time window excluded {measured['unknown_time_rows_excluded_by_window']} rows with unknown timestamps.")
-                inventories.append(RetainedInventory(
-                    scope=scope, raw_record_count=measured["matching_raw_record_count"],
-                    fields=measured["distinct_fields"], limitations=limitations,
-                ).model_dump(mode="json"))
-            stored["inventories"] = inventories
+        inventory_scopes = _question_inventory_scopes(question, item, leads, results)
+        if inventory_scopes:
+            if len(inventory_scopes) > MAX_STORED_QUESTION_INVENTORIES:
+                raise Validation("question inventories exceed the supported application-owned limit")
+            stored["inventories"] = [_measure_inventory(scope, plan, results) for scope in inventory_scopes]
         if leads:
             covered = set()
             coverage = []
@@ -728,6 +809,27 @@ def _synthesis_context(
         for item in queries
         if isinstance(item, Mapping) and item.get("status") == "completed"
     ] if isinstance(queries, list) else []
+    leads = advisory_lead_groups([
+        {**row, "advisory_ioc_comparison": compare_advisory_iocs(row.get("selected_result"), advisory_iocs)}
+        for row in evidence if isinstance(row, Mapping) and str(row.get("query_id")) in completed_ids
+    ])
+    question_inventory_summaries: dict[str, list[dict[str, Any]]] = {}
+    for index, question in enumerate(plan.questions, 1):
+        if not question_requests_inventories(getattr(question, "question", "")):
+            continue
+        query_ids = question_completed_query_ids(results, question.question_id)
+        if not query_ids:
+            continue
+        summaries = []
+        for scope in lead_session_inventory_scopes(leads, query_ids=query_ids):
+            _validate_retained_scope(scope, plan)
+            measured = lookup_retained_evidence(
+                results, query_ids=set(scope.query_ids), filters={item.field: item.value for item in scope.filters},
+                earliest_utc=scope.earliest_utc, latest_utc=scope.latest_utc, include_records=False,
+            )
+            summaries.append(compact_inventory_summary(scope, measured))
+        if summaries:
+            question_inventory_summaries[f"question_{index}"] = summaries
     return {
         "approved_plan": {
             "hypothesis": plan.hypothesis,
@@ -753,14 +855,15 @@ def _synthesis_context(
             item["evidence_id"] for item in sampled_evidence if str(item["evidence_id"]) in page["returned_evidence_ids"]],
             "sample_omitted": any(identifier not in {str(item["evidence_id"]) for item in sampled_evidence}
                                   for identifier in page["returned_evidence_ids"])} for page in lookup_pages],
+        **({"question_inventory_summaries": question_inventory_summaries} if question_inventory_summaries else {}),
         "synthesis_rules": [
             "If the response schema permits retained_evidence_requests, each question may either give a final answer or request up to three local pages first. For a request, give findings=[] and explain the missing support in limitations. The application checkpoints completed answers and resolves pages from this hunt only; requests cannot submit searches or expand the approved scope.",
             "Use exact typed field filters, optional half-open UTC time bounds within the approved scope, completed query labels and the returned next_offset for paging. Original query coverage, matching subset counts, page size and supplied sample coverage are different. An empty local subset is not proof of absence from Splunk. Do not repeat an identical page request. If requests are unavailable or a needed page remains omitted, give an explicitly limited answer.",
             "Answer every approved question in its application-assigned answer_slot. Each slot requires findings responsive to that question or an explicit limitation explaining why it cannot be answered. Repeating an indicator finding does not answer a different chronology, authentication, or communications question. Use original indicator records as supporting evidence for related observations when needed.",
             "For every advisory_leads entry, include one lead_coverage disposition in every final question answer. Select its lead_evidence_id and the one-based positions of findings responsive to that question for that lead, or state the missing answer explicitly. Each linked positive finding must cite a record from that lead plus any records supporting the related activity. Shared identity_fields define literal review groups, not proof of one process lifetime or causation. Do not treat a valid disposition as proof of a complete answer. Native identifiers belong in observed facts; citation fields use supplied labels.",
-            "The application presents retained timelines and scoped lead activity/counts alongside these answers. Explain what the observations establish for each question, what remains unknown, and which relationships are only hypotheses. Group related observations instead of transcribing the full event list. A table reference alone does not answer a question. Give a concise summary of the supported findings and limits; keep all responsive findings independently of summary length.",
-            "When the question asks for entity or field-value counts, select inventory_scopes using completed query labels, exact typed field filters and optional approved UTC bounds. The application measures all matching retained raw rows and presents the counts with their scope and missing/multivalue limitations. Do not estimate or state inventory quantities in summaries, findings or limitations; refer to the measured table instead. Whole-query counts do not describe a narrower lead or session, and overlapping scopes cannot be added. These are literal-value counts, not confirmed affected entities or unique process instances. Truncation limits completeness but does not erase positive observations.",
-            "For chronology questions, explain the supplied surrounding activity before and after every material lead, including related process/module observations. State the actual process or session relationship and cite the records establishing the sequence you describe. An indicator start/end alone does not answer surrounding chronology; neither an empty index nor missing model citations establishes that no surrounding activity occurred.",
+            "Use supplied question_inventory_summaries and chronology_obligations as application-owned checklists during answering. Explain what those summaries establish for each question, what remains unknown, and which relationships are only hypotheses. Group related observations instead of transcribing full event lists. A table reference alone does not answer a question. Measured inventory tables are materialized into stored results after synthesis; refer to supplied summaries and later tables without transcribing quantities into prose.",
+            "When the question asks for entity or field-value counts, review question_inventory_summaries and optionally select up to three additional inventory_scopes using completed query labels, exact typed field filters and optional approved UTC bounds. The application merges and measures all matching retained raw rows and stores scoped tables with missing/multivalue limitations. Do not estimate or state inventory quantities in summaries, findings or limitations; refer to the measured tables instead. Whole-query counts do not describe a narrower lead or session, and overlapping scopes cannot be added. These are literal-value counts, not confirmed affected entities or unique process instances. Truncation limits completeness but does not erase positive observations.",
+            "For chronology questions, address every non-empty session-scoped chronology_obligations group relevant to the question, including image_load module loads and dns_query or connection groups before and after each lead. Citing only before-lead communications without reviewing after-lead groups of the same actions is incomplete. Session-scoped module loads on related process GUIDs satisfy endpoint timeline questions; lead-process GUID absence is not a valid omission when session-scoped image_load obligations exist. State the actual process or session relationship and cite representative records establishing the sequence you describe. An indicator start/end alone does not answer surrounding chronology; neither an empty index nor missing model citations establishes that no surrounding activity occurred.",
             "Use only the supplied evidence_ids and query_ids.",
             "Every factual claim in a finding's title, statement, inference or limitations must be established by that finding's own citations. A fact supplied elsewhere in context is insufficient without its citation here. Temporal and cross-source relationships require the records establishing both endpoints. Separate supported observations from a tentative hypothesis about their meaning; labeling a claim inference does not excuse an unsupported factual premise. Question summaries and limitations may only summarize facts established by their findings or explicitly supplied coverage metadata.",
             "Apply the same evidence standard to titles and statements. An observed field value and a conventional interpretation are different: a port number does not establish an application protocol, and a familiar file or domain name does not establish identity or ownership. State the observed value; put a tentative interpretation in inference and identify the missing verification.",
