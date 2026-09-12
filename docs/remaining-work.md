@@ -448,6 +448,6 @@ The September 9 user instruction is explicit: getting the app working must not r
 - Application rollback to the September 8 hardening image and return to the candidate passed on September 9 with health and all 28 existing hunts preserved. Both releases use migration 0013, so no schema downgrade was required. Future schema-changing releases still require their own rollback qualification.
 - Production TLS/HTTPS, least-privilege external accounts, and approval-reference validation. Backend dependencies and container base images are pinned.
 - MCP/refactor work remains separate from this immediate quality-fix block; see the [prior refactor plan](agentic-threat-hunting-refactor-plan.md).
-- Routine upstream deprecation-warning maintenance. The frontend E2E command now runs the Playwright workflow smoke test locally and in CI.
+- Current dependency warnings are addressed: Starlette tests use `httpx2`, and GitHub Actions use Node 24-based checkout/setup releases. One exact AnyIO alias warning from Starlette 1.6.0 is filtered until the upstream `starlette#3497` fix is released; remove that narrow filter after upgrading Starlette. The frontend E2E command runs the Playwright workflow smoke test locally and in CI.
 
 Docker engine recovery is verified for this session. Check the engine, container health, and exact Splunk endpoint before a live trial; a stale runtime socket is an environment failure, not a hunt-quality result.

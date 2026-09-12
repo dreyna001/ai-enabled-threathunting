@@ -25,6 +25,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
   "httpx>=0.28,<1",
+  "httpx2>=2.12,<3",
   "jsonschema>=4.23,<5",
   "mypy>=1.19,<2",
   "types-PyYAML>=6,<7",
@@ -44,6 +45,11 @@ where = ["src"]
 addopts = "-ra"
 testpaths = ["tests"]
 pythonpath = ["."]
+# Starlette 1.6.0 still imports AnyIO 4.15's deprecated compatibility alias.
+# Remove this exact filter after the upstream starlette#3497 fix is released.
+filterwarnings = [
+  "ignore:The anyio\\.abc\\.BlockingPortal alias is deprecated.*:DeprecationWarning:starlette\\.testclient",
+]
 
 
 [tool.mypy]
