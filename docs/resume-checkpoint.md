@@ -18,17 +18,17 @@ Final local verification:
 - adapter/leakage gate: **28 focused tests passed**;
 - frontend: **21 unit tests**, type check, production build, and **one Playwright E2E smoke test** passed;
 - synthetic known-answer suite: **12/12 passed**, 100% scripted recovery, no fabricated evidence or citation failures;
-- Compose config, immutable image build/deploy, health checks, database preservation, and diff whitespace checks passed.
+- Compose config, immutable image build/deploy, health checks, database preservation, and diff whitespace checks passed;
+- remote [CI for implementation commit `325795e`](https://github.com/dreyna001/ai-enabled-threathunting/actions/runs/34661799196) passed both backend and frontend jobs.
 
 Do not run the paid twelve-case live matrix yet. It still requires real protected abstract-to-fixture mappings, real scenario execution/export bindings, and deterministic timeout, repair, restart, hard-budget, and cancellation injection. Do not simulate those outcomes or treat the offline scorer as provider qualification.
 
 Remaining work is external or deferred:
 
-1. publish the verified commit and confirm remote CI;
-2. obtain independent analyst acceptance;
-3. verify production HTTPS/certificates, a real least-privilege account, and the external approval reference in the target environment;
-4. qualify rollback when a future release changes schema;
-5. optimize cost/cache behavior only after accuracy acceptance, using trial 17 as a measured baseline.
+1. obtain independent analyst acceptance;
+2. verify production HTTPS/certificates, a real least-privilege account, and the external approval reference in the target environment;
+3. qualify rollback when a future release changes schema;
+4. optimize cost/cache behavior only after accuracy acceptance, using trial 17 as a measured baseline.
 
 ## Historical pause: September 10, 2026, 18:45 EDT
 

@@ -4,7 +4,7 @@
 
 The local implementation and release checks requested on September 11 are complete on desktop `main`. The deployed backend, worker, and frontend use immutable v20 images (`local-20260911-quality-v20-200800`) with prompt contract **1.34**, SPL policy **1.5**, and OpenAI `gpt-5.6-terra` at medium reasoning. The app is healthy at `http://127.0.0.1:8080`; migration remains `0013_hunt_listing_index`.
 
-Latest verification: **819 backend tests passed** with eight PostgreSQL tests skipped in the host run; the same database-sensitive group passed **13 tests** against a disposable PostgreSQL instance. Mypy passed across **56 files**. The frontend passed **21 unit tests**, type checking, a production build, and one Playwright workflow smoke test. The synthetic twelve-scenario scorer passed with 100% scripted recovery and no fabricated evidence. Base images are pinned by digest, both immutable application images built successfully, Compose validation passed, and the prior v19 image plus database backups remain available.
+Latest verification: **819 backend tests passed** with eight PostgreSQL tests skipped in the host run; the same database-sensitive group passed **13 tests** against a disposable PostgreSQL instance. Mypy passed across **56 files**. The frontend passed **21 unit tests**, type checking, a production build, and one Playwright workflow smoke test. The synthetic twelve-scenario scorer passed with 100% scripted recovery and no fabricated evidence. Base images are pinned by digest, both immutable application images built successfully, Compose validation passed, and the prior v19 image plus database backups remain available. Remote [CI for `325795e`](https://github.com/dreyna001/ai-enabled-threathunting/actions/runs/34661799196) passed both backend and frontend jobs.
 
 Trial 17 completed through the deployed v20 application to `report_draft`. It retained and cited the expected fixture event, reported all five lead sessions across the endpoint, authentication, DNS, and network questions, and recorded no citation failures. It used **six Splunk searches**, **nine model calls**, **962,458 input tokens**, **15,228 output tokens**, and one repair. These are measured run facts, not proof of general model quality. The observed scorer reports retrieval/citation recovery only; independent analytical judgments remain absent.
 
@@ -14,7 +14,6 @@ Remaining external or intentionally blocked work:
 - [ ] Obtain independent analyst acceptance of plans, evidence, findings, limitations, and rendered reports. Assistant review and automated checks do not satisfy this gate.
 - [ ] Verify production HTTPS/edge certificates, a real least-privilege external account, and the external approval reference in the target environment.
 - [ ] Qualify schema rollback when a future release introduces a migration; v20 remains on migration 0013, so no downgrade occurred here.
-- [ ] Run remote CI for the September 11 commit after publication.
 - [ ] Only after accuracy gates, perform the [deferred cost improvements](#deferred-cost-improvements-after-the-existing-checkpoint-work). Trial 17's adaptive path is the current performance baseline; do not reduce evidence or reasoning merely to lower its call count.
 
 ## Active September 11 work
@@ -436,7 +435,7 @@ The September 9 user instruction is explicit: getting the app working must not r
 
 - Representative independent analyst acceptance and the full twelve-scenario live qualification; trial 17 is one application hunt, not that matrix.
 - The standard runner now has the bounded private-binding/export extraction slice. Real protected fixture identities, scenario execution and deterministic fault injection remain required before the paid matrix can run.
-- Remote CI execution after an authorized commit/push; CI was configured and equivalent local checks passed, but remote CI has not run.
+- Remote [CI for the September 11 implementation commit](https://github.com/dreyna001/ai-enabled-threathunting/actions/runs/34661799196) passed.
 - Application rollback to the September 8 hardening image and return to the candidate passed on September 9 with health and all 28 existing hunts preserved. Both releases use migration 0013, so no schema downgrade was required. Future schema-changing releases still require their own rollback qualification.
 - Production TLS/HTTPS, least-privilege external accounts, and approval-reference validation. Backend dependencies and container base images are pinned.
 - MCP/refactor work remains separate from this immediate quality-fix block; see the [prior refactor plan](agentic-threat-hunting-refactor-plan.md).
