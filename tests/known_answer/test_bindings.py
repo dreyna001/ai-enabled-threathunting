@@ -15,6 +15,7 @@ from known_answer.bindings import (
     SUPPORTED_FAULT_INJECTOR,
     adapter_configuration_without_bindings,
     assert_no_evaluator_leakage,
+    build_execution_plan,
     extract_synthetic_run,
     load_bindings,
 )
@@ -196,6 +197,48 @@ def test_assert_no_evaluator_leakage_rejects_binding_and_abstract_ids() -> None:
         assert_no_evaluator_leakage({"query": "find ka01-e1"})
     with pytest.raises(BindingsError, match="evaluator-only key"):
         assert_no_evaluator_leakage({"evidence_id_map": {"ka01-e1": "x"}})
+
+
+def test_build_execution_plan_contains_only_adapter_safe_fields() -> None:
+    bindings = KnownAnswerBindings.model_validate(build_valid_bindings())
+    plan = build_execution_plan(bindings)
+    assert len(plan) == 12
+    assert [entry["scenario_id"] for entry in plan] == sorted(bindings.scenarios)
+    for entry in plan:
+        assert set(entry) == {
+            "scenario_id",
+            "fault_mode",
+            "execution_source",
+            "export_source",
+        }
+        binding = bindings.scenarios[entry["scenario_id"]]
+        assert entry["fault_mode"] == binding.fault_mode
+        assert entry["execution_source"] == binding.execution_source
+        assert entry["export_source"] == binding.export_source
+        assert "evidence_id_map" not in entry
+        assert "identity_field" not in entry
+        assert "category" not in entry
+        serialized = json.dumps(entry)
+        assert "ka01-e1" not in serialized
+        assert "binding_version" not in serialized
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("execution_source", "synthetic:ka01-e1"),
+        ("export_source", "hunt_results/ka02-e3"),
+    ],
+)
+def test_build_execution_plan_rejects_leaking_adapter_sources(
+    field: str,
+    value: str,
+) -> None:
+    payload = build_valid_bindings()
+    payload["scenarios"]["ka-01-supported-process"][field] = value
+    bindings = KnownAnswerBindings.model_validate(payload)
+    with pytest.raises(BindingsError, match="execution_plan leaks"):
+        build_execution_plan(bindings)
 
 
 def test_adapter_configuration_excludes_binding_material(tmp_path: Path) -> None:

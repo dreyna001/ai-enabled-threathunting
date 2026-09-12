@@ -4,17 +4,26 @@
 
 The local implementation and release checks requested on September 11 are complete on desktop `main`. The deployed backend, worker, and frontend use immutable v20 images (`local-20260911-quality-v20-200800`) with prompt contract **1.34**, SPL policy **1.5**, and OpenAI `gpt-5.6-terra` at medium reasoning. The app is healthy at `http://127.0.0.1:8080`; migration remains `0013_hunt_listing_index`.
 
-Latest verification: **819 backend tests passed** with eight PostgreSQL tests skipped in the host run; the same database-sensitive group passed **13 tests** against a disposable PostgreSQL instance. Mypy passed across **56 files**. The frontend passed **21 unit tests**, type checking, a production build, and one Playwright workflow smoke test. The synthetic twelve-scenario scorer passed with 100% scripted recovery and no fabricated evidence. Base images are pinned by digest, both immutable application images built successfully, Compose validation passed, and the prior v19 image plus database backups remain available. Remote [CI for `325795e`](https://github.com/dreyna001/ai-enabled-threathunting/actions/runs/34661799196) passed both backend and frontend jobs.
+Latest verification: **835 backend tests passed** with eight PostgreSQL tests skipped in the host run; the same database-sensitive group passed **13 tests** against a disposable PostgreSQL instance. Mypy passed across **58 application and qualification files**. The frontend passed **21 unit tests**, type checking, a production build, and one Playwright workflow smoke test. The synthetic twelve-scenario scorer passed with 100% scripted recovery and no fabricated evidence. Base images are pinned by digest, both immutable application images built successfully, Compose validation passed, and the prior v19 image plus database backups remain available. Remote [CI for `325795e`](https://github.com/dreyna001/ai-enabled-threathunting/actions/runs/34661799196) passed both backend and frontend jobs; CI for the new local-qualification commit remains pending until publication.
 
 Trial 17 completed through the deployed v20 application to `report_draft`. It retained and cited the expected fixture event, reported all five lead sessions across the endpoint, authentication, DNS, and network questions, and recorded no citation failures. It used **six Splunk searches**, **nine model calls**, **962,458 input tokens**, **15,228 output tokens**, and one repair. These are measured run facts, not proof of general model quality. The observed scorer reports retrieval/citation recovery only; independent analytical judgments remain absent.
 
-Remaining external or intentionally blocked work:
+Work completed locally after this checkpoint:
 
-- [ ] Supply real protected bindings for all twelve live scenarios and implement deterministic timeout, repair, restart, budget, and cancellation fault injection. The new adapter validates private bindings, extracts actual terminal exports, prevents evaluator data from reaching application/model payloads, and fails closed while the injector is absent. The offline scorer is not live qualification.
+- [x] Replace the unsafe live-adapter callback input with a twelve-entry execution plan containing only scenario ID, fault mode, execution source, and export source. Categories, abstract evidence IDs, expected counts, answer limitations, identity mappings, and answer keys remain evaluator-side. Leaking source values stop execution before adapter, Splunk, or model work.
+- [x] Exercise deterministic timeout, one-repair, expired-lease restart, hard-budget, and cancellation behavior through real local `WorkflowService` execution and terminal exports using test adapters. Cancellation correctly preserves evidence without pretending that an interrupted hunt produced a citation.
+- [x] Keep `deterministic-v1` unregistered in the live runner. The local workflow tests prove fault behavior, but they do not use the deployed HTTP/worker/provider stack and therefore are not mislabeled as live qualification.
+
+Work intentionally deferred to avoid production-only test hooks or misleading qualification:
+
+- [ ] Build and approve protected playbooks/bindings, a separate outage-fixture lab, and deployed-stack fault controls before running the full twelve-scenario live matrix. The deployed application currently has no safe per-hunt way to force a model repair, worker restart, query timeout, or other test fault. Adding global runtime switches or mixing in-process fake results with live hunts would weaken isolation and would not be an honest live matrix.
+- [ ] Only after accuracy gates, perform the [deferred cost improvements](#deferred-cost-improvements-after-the-existing-checkpoint-work). Trial 17's adaptive path is the current performance baseline; do not reduce evidence or reasoning merely to lower its call count.
+
+Work that cannot be completed in this local workspace:
+
 - [ ] Obtain independent analyst acceptance of plans, evidence, findings, limitations, and rendered reports. Assistant review and automated checks do not satisfy this gate.
 - [ ] Verify production HTTPS/edge certificates, a real least-privilege external account, and the external approval reference in the target environment.
 - [ ] Qualify schema rollback when a future release introduces a migration; v20 remains on migration 0013, so no downgrade occurred here.
-- [ ] Only after accuracy gates, perform the [deferred cost improvements](#deferred-cost-improvements-after-the-existing-checkpoint-work). Trial 17's adaptive path is the current performance baseline; do not reduce evidence or reasoning merely to lower its call count.
 
 ## Active September 11 work
 

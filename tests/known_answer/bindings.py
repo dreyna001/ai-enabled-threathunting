@@ -12,7 +12,7 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, Mapping
+from typing import Any, Literal, Mapping, TypedDict
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
@@ -42,6 +42,9 @@ _EVALUATOR_LEAKAGE_KEYS = frozenset(
     }
 )
 _EVALUATOR_LEAKAGE_VALUE_RE = re.compile(r"ka\d{2}-e\d+")
+_EXECUTION_PLAN_ENTRY_KEYS = frozenset(
+    {"scenario_id", "fault_mode", "execution_source", "export_source"}
+)
 
 
 class BindingsError(KnownAnswerError):
@@ -158,6 +161,23 @@ def load_bindings_from_env(env_name: str = BINDINGS_ENV) -> KnownAnswerBindings:
             f"private scenario bindings are required; set {env_name} to a protected file outside version control"
         )
     return load_bindings(path_value)
+
+
+class LiveExecutionPlanEntry(TypedDict):
+    scenario_id: str
+    fault_mode: Literal[
+        "none",
+        "timeout",
+        "model_repair",
+        "restart_recovery",
+        "hard_budget",
+        "cancellation",
+    ]
+    execution_source: str
+    export_source: str
+
+
+LiveExecutionPlan = tuple[LiveExecutionPlanEntry, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -340,6 +360,28 @@ def assert_no_evaluator_leakage(payload: Any, *, label: str = "payload") -> None
     walk(payload, label)
 
 
+def build_execution_plan(bindings: KnownAnswerBindings) -> LiveExecutionPlan:
+    """Build the adapter-safe live execution plan in deterministic scenario-id order."""
+
+    plan: LiveExecutionPlan = tuple(
+        LiveExecutionPlanEntry(
+            scenario_id=scenario_id,
+            fault_mode=binding.fault_mode,
+            execution_source=binding.execution_source,
+            export_source=binding.export_source,
+        )
+        for scenario_id, binding in sorted(bindings.scenarios.items())
+    )
+    for index, entry in enumerate(plan):
+        if set(entry) != _EXECUTION_PLAN_ENTRY_KEYS:
+            raise BindingsError(
+                f"execution_plan entry at index {index} must contain exactly "
+                f"{sorted(_EXECUTION_PLAN_ENTRY_KEYS)}"
+            )
+    assert_no_evaluator_leakage(list(plan), label="execution_plan")
+    return plan
+
+
 def adapter_configuration_without_bindings(
     configuration: Mapping[str, str],
     bindings: KnownAnswerBindings,
@@ -359,10 +401,13 @@ __all__ = [
     "FAULT_CATEGORIES",
     "HuntResultExport",
     "KnownAnswerBindings",
+    "LiveExecutionPlan",
+    "LiveExecutionPlanEntry",
     "ScenarioBinding",
     "SUPPORTED_FAULT_INJECTOR",
     "adapter_configuration_without_bindings",
     "assert_no_evaluator_leakage",
+    "build_execution_plan",
     "extract_synthetic_run",
     "extract_synthetic_runs",
     "load_bindings",

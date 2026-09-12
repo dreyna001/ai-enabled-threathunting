@@ -8,14 +8,17 @@ The authoritative database contains **45 hunts**, **39 jobs**, and **zero active
 
 Prompt 1.34 and v20 add application-owned chronology guidance and deterministic all-lead widening for explicit authentication, network, and spread follow-ups. The widening reuses the existing model decision and Splunk query; it does not add an unconditional call or copy a larger raw evidence payload. Trial 17 reached `report_draft` and covered all five retained lead sessions in the endpoint chronology, authentication, DNS, and network answers. The observed scorer found 100% expected-event retrieval and citation, 41 distinct cited records, no citation failures, and complete execution of all four approved questions. It used six Splunk searches, nine model calls, 962,458 input tokens, 15,228 output tokens, and one repair. Analytical quality remains unassessed because no independent analyst judgment was supplied.
 
-The safe known-answer adapter slice is implemented. It loads strict private bindings only from a protected path, validates exact twelve-scenario coverage, converts real terminal exports to evaluator IDs, rejects pre-scored live runs, prevents evaluator-only fields from reaching application/model configuration, and blocks the paid matrix until fault injection is actually implemented. Merely declaring `deterministic-v1` does not unlock it. The offline twelve-scenario scorer passes, but that is not live qualification.
+The safe known-answer adapter slice is implemented. It loads strict private bindings only from a protected path, validates exact twelve-scenario coverage, converts real terminal exports to evaluator IDs, and rejects pre-scored live runs. Its callback now receives only scenario ID, fault mode, execution source, and export source; categories, expected evidence, scripted counts, answer limitations, identity mappings, and answer keys stay evaluator-side. Leaking source values are rejected before adapter, Splunk, or model work.
+
+Local deterministic tests now exercise timeout, exactly one model repair, expired-lease restart and fencing, hard-budget enforcement, and cancellation through real `WorkflowService` execution with test adapters. Cancellation preserves already retrieved evidence but does not fabricate a citation when synthesis never ran. These tests prove local workflow behavior, not deployed provider qualification. `deterministic-v1` remains unregistered, so merely declaring it still cannot unlock the live matrix.
 
 Final local verification:
 
-- backend: **819 passed**, eight database-sensitive skips in the host run;
+- backend: **835 passed**, eight database-sensitive skips in the host run;
 - disposable PostgreSQL: **13 passed** for the skipped database-sensitive group;
-- typing: **56 files** clean;
-- adapter/leakage gate: **28 focused tests passed**;
+- typing: **58 application and qualification files** clean;
+- adapter/leakage gate: **32 focused tests passed**;
+- local workflow-fault qualification: **12 tests passed**; the combined known-answer focus run passed **44 tests**;
 - frontend: **21 unit tests**, type check, production build, and **one Playwright E2E smoke test** passed;
 - synthetic known-answer suite: **12/12 passed**, 100% scripted recovery, no fabricated evidence or citation failures;
 - Compose config, immutable image build/deploy, health checks, database preservation, and diff whitespace checks passed;

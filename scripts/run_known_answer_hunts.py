@@ -33,6 +33,7 @@ from known_answer.bindings import (  # noqa: E402
     HuntResultExport,
     KnownAnswerBindings,
     adapter_configuration_without_bindings,
+    build_execution_plan,
     extract_synthetic_runs,
     load_bindings_from_env,
 )
@@ -40,7 +41,6 @@ from known_answer.harness import (  # noqa: E402
     KnownAnswerError,
     SyntheticRun,
     load_answers,
-    load_cases,
     run_suite,
     score_runs,
 )
@@ -261,6 +261,11 @@ def run_live_suite(configuration: Mapping[str, str]) -> dict[str, Any]:
     _assert_live_matrix_ready(bindings)
     if bindings.fixture_id != configuration["fixture_id"]:
         raise LiveConfigurationError("configured fixture identifier does not match private scenario bindings")
+    try:
+        execution_plan = build_execution_plan(bindings)
+    except BindingsError as exc:
+        raise LiveConfigurationError(str(exc)) from exc
+    adapter_configuration = adapter_configuration_without_bindings(configuration, bindings)
     callback = _load_live_adapter(configuration.get("live_adapter", ""))
     splunk, model = _build_live_adapters(configuration)
     health = splunk.healthcheck()
@@ -270,11 +275,9 @@ def run_live_suite(configuration: Mapping[str, str]) -> dict[str, Any]:
             f"live qualification blocked: Splunk fixture preflight failed ({category}); "
             "verify the dedicated non-production endpoint, token, and TLS trust"
         )
-    cases = load_cases()
-    adapter_configuration = adapter_configuration_without_bindings(configuration, bindings)
     try:
         adapter_result = callback(
-            cases=cases,
+            execution_plan=execution_plan,
             splunk=splunk,
             model=model,
             configuration=adapter_configuration,

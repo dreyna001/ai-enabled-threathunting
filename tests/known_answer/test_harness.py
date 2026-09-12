@@ -334,8 +334,63 @@ def test_live_orchestration_extracts_exports_without_binding_leakage(
 
     assert result["qualification_mode"] == "live"
     assert result["passed"] is True
-    assert seen["cases"] == cases
+    assert "cases" not in seen
+    execution_plan = seen["execution_plan"]
+    assert len(execution_plan) == 12
+    for entry in execution_plan:
+        assert set(entry) == {
+            "scenario_id",
+            "fault_mode",
+            "execution_source",
+            "export_source",
+        }
+        scenario_id = str(entry["scenario_id"])
+        binding = binding_payload["scenarios"][scenario_id]
+        assert entry["fault_mode"] == binding["fault_mode"]
+        assert entry["execution_source"] == binding["execution_source"]
+        assert entry["export_source"] == binding["export_source"]
+        serialized = json.dumps(entry)
+        assert "evidence_id_map" not in serialized
+        assert "identity_field" not in serialized
+        assert "ka01-e1" not in serialized
     configuration_payload = json.dumps(seen["configuration"])
     assert "evidence_id_map" not in configuration_payload
     assert "binding_version" not in configuration_payload
     assert "expected_evidence_ids" not in configuration_payload
+
+
+def test_live_mode_rejects_leaking_execution_plan_before_adapter_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from known_answer.test_bindings import build_valid_bindings, write_bindings
+
+    payload = build_valid_bindings(fault_injector="deterministic-v1")
+    payload["scenarios"]["ka-01-supported-process"]["execution_source"] = "synthetic:ka01-e1"
+    bindings_path = write_bindings(tmp_path, payload)
+    adapter_calls: list[str] = []
+
+    def _fail_if_called(*_args: object, **_kwargs: object) -> tuple[object, object]:
+        adapter_calls.append("build_live_adapters")
+        raise AssertionError("live adapters must not be constructed for leaking execution_plan")
+
+    def _fail_callback(*_args: object, **_kwargs: object) -> dict[str, object]:
+        adapter_calls.append("callback")
+        return {"fixture_id": "fixture-test", "exports": []}
+
+    monkeypatch.setenv("THREAT_HUNTING_KNOWN_ANSWER_BINDINGS_FILE", str(bindings_path))
+    monkeypatch.setattr(
+        live_runner, "_IMPLEMENTED_FAULT_INJECTORS", frozenset({"deterministic-v1"})
+    )
+    monkeypatch.setattr(live_runner, "_load_live_adapter", lambda _spec: _fail_callback)
+    monkeypatch.setattr(live_runner, "_build_live_adapters", _fail_if_called)
+
+    with pytest.raises(live_runner.LiveConfigurationError, match="execution_plan leaks"):
+        live_runner.run_live_suite(
+            {
+                "live_adapter": "known_answer.live_stub:run",
+                "fixture_id": "fixture-test",
+                "model_provider": "openai",
+                "model_name": "gpt-test",
+            }
+        )
+    assert adapter_calls == []
