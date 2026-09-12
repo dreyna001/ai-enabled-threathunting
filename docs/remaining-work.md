@@ -53,7 +53,7 @@ The candidate remains undeployed. At the user's request, existing v18 API/worker
 
 ## Deferred cost improvements after the existing checkpoint work
 
-The user requested these improvements on September 10 and explicitly placed them after the previous tasks. Finish the existing correctness, qualification, deployment and release work first. Preserve the frozen advisory/fixture set and quality requirements when measuring savings.
+The user requested these improvements on September 10, placed them after the previous tasks, and confirmed on September 11 that safe provider caching remains deferred. Finish the existing correctness, qualification, deployment and release work first. Preserve the frozen advisory/fixture set and quality requirements when measuring savings.
 
 - [ ] Record cache reads, cache writes, ordinary input, output and repair usage, with cost by hunt and model step. Account for each provider's usage-field semantics and pricing; do not infer cache savings from total input alone.
 - [ ] Measure the cost effect of the application-owned timelines/counts and focused reasoning after that existing work is qualified. Keep factual calculation and report assembly in application code.
